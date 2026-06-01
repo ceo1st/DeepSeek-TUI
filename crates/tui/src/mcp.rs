@@ -203,7 +203,7 @@ fn invalid_json_preview(bytes: &[u8]) -> String {
     }
 
     let trimmed: String = body_text.chars().take(ERROR_BODY_PREVIEW_BYTES).collect();
-    let suffix = if body_text.len() > trimmed.len() {
+    let suffix = if body_text.chars().count() > ERROR_BODY_PREVIEW_BYTES {
         "…"
     } else {
         ""
@@ -4010,6 +4010,26 @@ mod tests {
         assert!(
             redacted.contains("other=val"),
             "non-secret preserved: {redacted}"
+        );
+    }
+
+    #[test]
+    fn invalid_json_preview_collapses_lines_and_redacts_secrets() {
+        let preview = invalid_json_preview(
+            b"Authorization: Bearer PLACEHOLDER_TOKEN\nAllow connection? api_key=PLACEHOLDER_KEY",
+        );
+
+        assert!(
+            preview.contains("Authorization: Bearer *** Allow connection? api_key=***"),
+            "preview: {preview}"
+        );
+        assert!(
+            !preview.contains('\n'),
+            "preview should be single-line: {preview}"
+        );
+        assert!(
+            !preview.contains("PLACEHOLDER_TOKEN") && !preview.contains("PLACEHOLDER_KEY"),
+            "secret leaked: {preview}"
         );
     }
 
