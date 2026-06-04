@@ -42,6 +42,7 @@ harvest/stewardship commits:
 | #2636 project-context mtime cache | Defer direct merge; harvest only after cache key/signature is widened. | Must include constitution changes, auto-generated context deletion, canonical path equivalence, and overwrite detection before landing. |
 | #2634 HarmonyOS port | Defer direct merge; draft has broad platform and TLS/runtime blast radius. | Harvest at most the unused `rustyline` cleanup after local verification; full port needs OHOS target checks and sandbox/security review. |
 | #2687 append-only mode/approval prompt | Defer direct merge; draft has compile failures and Plan-mode prompt correctness risks. | Any future harvest must keep stable `message[0]` genuinely mode-agnostic, preserve mode/approval suffixes after capacity replans, and distinguish external overrides from persisted generated prompts. |
+| #2581 provider fallback chain design doc | Manually harvested as `docs/rfcs/2574-provider-fallback-chain.md` because the current PR head has no net file changes. | Keep issue #2574 open for implementation; close/comment on #2581 after the integration branch is public, crediting @idling11 and reporter @hsdbeebou. |
 
 ## PR Harvest Queue
 
@@ -85,7 +86,7 @@ harvest/stewardship commits:
 | #2576 PrefixCacheChange events | Mergeable | Review after current prefix-cache commits. |
 | #2578 turn_end observer hook | Conflicting | Defer to hook lifecycle lane. |
 | #2579 AppendLog session messages | Conflicting | Defer; large architectural change. |
-| #2581 provider fallback chain design doc | Mergeable | Docs-only; review for current provider direction. |
+| #2581 provider fallback chain design doc | Mergeable / empty diff | Manually harvested into `docs/rfcs/2574-provider-fallback-chain.md`; close original PR after branch is public, keep #2574 open for implementation. |
 | #2623 plan prompt modal scroll support | Mergeable | Already harvested into the 22-commit stack. Comment/close original after integration branch is public. |
 | #2627 Xiaomi MiMo Token Plan mode | Conflicting | Partially harvested; leave original open or comment with remaining mode/env scope once branch is public. |
 | #2631 estimated_input_tokens cache | Mergeable | Already harvested into the 22-commit stack. |
@@ -120,7 +121,7 @@ Issue count should drop through evidence-backed consolidation, not bulk closing.
 
 ## Immediate Next Actions
 
-1. Review #2048, #2502, #2509, #2513, #2530, #2576, and #2581 as the next small
+1. Review #2048, #2502, #2509, #2513, #2530, and #2576 as the next small
    mergeable candidates.
 2. Prepare public comments for #2708, #2627, #2634, #2636, #2687, and already-harvested performance
    PRs once this integration branch has a remote review surface.

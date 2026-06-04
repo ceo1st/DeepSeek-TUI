@@ -551,6 +551,7 @@ without recreating skills the user deliberately deleted.
 | [LOCALIZATION.md](docs/LOCALIZATION.md) | UI locale matrix & switching |
 | [OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md) | Ops & recovery |
 | [V0_9_0_EXECUTION_MAP.md](docs/V0_9_0_EXECUTION_MAP.md) | v0.9.0 issue lanes, PR harvest state, and release gates |
+| [2574-provider-fallback-chain.md](docs/rfcs/2574-provider-fallback-chain.md) | Provider fallback chain RFC |
 
 Full Changelog: [CHANGELOG.md](CHANGELOG.md).
 
