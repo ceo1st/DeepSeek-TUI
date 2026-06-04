@@ -43,6 +43,7 @@ harvest/stewardship commits:
 | #2634 HarmonyOS port | Defer direct merge; draft has broad platform and TLS/runtime blast radius. | Harvest at most the unused `rustyline` cleanup after local verification; full port needs OHOS target checks and sandbox/security review. |
 | #2687 append-only mode/approval prompt | Defer direct merge; draft has compile failures and Plan-mode prompt correctness risks. | Any future harvest must keep stable `message[0]` genuinely mode-agnostic, preserve mode/approval suffixes after capacity replans, and distinguish external overrides from persisted generated prompts. |
 | #2581 provider fallback chain design doc | Manually harvested as `docs/rfcs/2574-provider-fallback-chain.md` because the current PR head has no net file changes. | Keep issue #2574 open for implementation; close/comment on #2581 after the integration branch is public, crediting @idling11 and reporter @hsdbeebou. |
+| #2530 mention depth-cap hint | Already present in the current v0.9 stack as `a97675824` and `29f57665e`. | `cargo test -p codewhale-tui --locked try_autocomplete_file_mention_no_match` passed. |
 
 ## PR Harvest Queue
 
@@ -82,7 +83,7 @@ harvest/stewardship commits:
 | #2526 shell tool availability docs | Draft/conflicting | Likely superseded by tool-surface docs; verify before closing. |
 | #2528 background completion wait | Draft/conflicting | Defer unless failing tests prove need. |
 | #2529 workspace shell opt-in | Draft/conflicting | Review with permissions/sandbox stabilization. |
-| #2530 mention depth cap hint | Draft/mergeable | Small UX candidate. |
+| #2530 mention depth cap hint | Draft/mergeable | Already present locally as `a97675824` and `29f57665e`; close/comment after branch is public. |
 | #2576 PrefixCacheChange events | Mergeable | Review after current prefix-cache commits. |
 | #2578 turn_end observer hook | Conflicting | Defer to hook lifecycle lane. |
 | #2579 AppendLog session messages | Conflicting | Defer; large architectural change. |
@@ -121,7 +122,7 @@ Issue count should drop through evidence-backed consolidation, not bulk closing.
 
 ## Immediate Next Actions
 
-1. Review #2048, #2502, #2509, #2513, #2530, and #2576 as the next small
+1. Review #2048, #2502, #2509, #2513, and #2576 as the next small
    mergeable candidates.
 2. Prepare public comments for #2708, #2627, #2634, #2636, #2687, and already-harvested performance
    PRs once this integration branch has a remote review surface.
