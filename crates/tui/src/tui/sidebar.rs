@@ -1970,16 +1970,16 @@ pub fn subagent_panel_lines(
         if row.steps_taken > 0 {
             detail_parts.push(format!("{} step(s)", row.steps_taken));
         }
+        if let Some(progress) = row.progress.as_deref()
+            && !progress.trim().is_empty()
+        {
+            detail_parts.push(summarize_tool_output(progress));
+        }
         if let Some(branch) = row.git_branch.as_deref() {
             detail_parts.push(format!("branch {branch}"));
         }
         if let Some(duration) = row.duration_ms {
             detail_parts.push(format_duration_ms(duration));
-        }
-        if let Some(progress) = row.progress.as_deref()
-            && !progress.trim().is_empty()
-        {
-            detail_parts.push(summarize_tool_output(progress));
         }
         lines.push(Line::from(Span::styled(
             format!(
@@ -2066,16 +2066,16 @@ fn subagent_panel_hover_texts(
         if row.steps_taken > 0 {
             detail_parts.push(format!("{} step(s)", row.steps_taken));
         }
+        if let Some(progress) = row.progress.as_deref()
+            && !progress.trim().is_empty()
+        {
+            detail_parts.push(summarize_tool_output(progress));
+        }
         if let Some(branch) = row.git_branch.as_deref() {
             detail_parts.push(format!("branch {branch}"));
         }
         if let Some(duration) = row.duration_ms {
             detail_parts.push(format_duration_ms(duration));
-        }
-        if let Some(progress) = row.progress.as_deref()
-            && !progress.trim().is_empty()
-        {
-            detail_parts.push(summarize_tool_output(progress));
         }
         texts.push(format!("  {}", detail_parts.join(" · ")));
     }
@@ -3263,6 +3263,17 @@ mod tests {
         assert!(
             text.iter().any(|l| l.contains("step 2/3")),
             "progress detail missing: {text:?}",
+        );
+        let wide_text = lines_to_text(&subagent_panel_lines(
+            &summary,
+            &rows,
+            96,
+            12,
+            &palette::UI_THEME,
+        ));
+        assert!(
+            wide_text.iter().any(|l| l.contains("branch feature/docs")),
+            "branch detail missing at wide width: {wide_text:?}",
         );
     }
 
