@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/config` now reports the canonical `~/.codewhale/settings.toml` path for TUI
   settings while still reading legacy DeepSeek-branded settings fallbacks and
   migrating them into the CodeWhale home on load.
+- Provider switches now roll back transactionally when the first request to a
+  newly selected provider fails authentication: CodeWhale restores the previous
+  provider/model, model-ID passthrough, onboarding/API-key state, runtime
+  config, persisted provider selection, and engine handle so users can return
+  to DeepSeek after a failed Moonshot/Kimi switch (#2754, #2755). Thanks
+  @Dr3259 for the Windows repro and @cyq1017 for the draft fix.
 - `PATCH /v1/threads/{id}` can now update a thread's persisted workspace for
   GUI/runtime clients. Workspace changes reject active turns and evict idle
   cached engines so the next turn starts in the new workspace.

@@ -1216,6 +1216,17 @@ pub struct ToolEvidence {
     pub summary: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingProviderSwitch {
+    pub previous_provider: ApiProvider,
+    pub previous_model: String,
+    pub previous_model_ids_passthrough: bool,
+    pub previous_config: Config,
+    pub previous_onboarding: OnboardingState,
+    pub previous_onboarding_needs_api_key: bool,
+    pub previous_api_key_env_only: bool,
+}
+
 /// Global UI state for the TUI.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
@@ -1272,6 +1283,9 @@ pub struct App {
     /// True when the active provider/base URL accepts arbitrary model IDs
     /// verbatim rather than DeepSeek-only aliases.
     pub model_ids_passthrough: bool,
+    /// Pending provider transition for transactional rollback when the next
+    /// auth failure indicates the new provider cannot be used.
+    pub pending_provider_switch: Option<PendingProviderSwitch>,
     /// Current reasoning-effort tier for DeepSeek thinking mode.
     /// Cycled via Shift+Tab; initialized from config at startup.
     pub reasoning_effort: ReasoningEffort,
@@ -2067,6 +2081,7 @@ impl App {
             last_effective_model: None,
             api_provider: provider,
             model_ids_passthrough,
+            pending_provider_switch: None,
             reasoning_effort,
             last_effective_reasoning_effort: None,
             workspace,
