@@ -52,8 +52,6 @@
         node scripts/release/npm-wrapper-smoke.js
         ./target/release/codewhale --version
         ./target/release/codewhale-tui --version
-        ./target/release/deepseek --version
-        ./target/release/deepseek-tui --version
 
 .linux_release_preflight: &linux_release_preflight
   name: linux release preflight
@@ -95,8 +93,6 @@
         node scripts/release/npm-wrapper-smoke.js
         ./target/release/codewhale --version
         ./target/release/codewhale-tui --version
-        ./target/release/deepseek --version
-        ./target/release/deepseek-tui --version
 
 main:
   push:
@@ -131,13 +127,9 @@ $:
             mkdir -p target/cnb-release
             cp target/release/codewhale target/cnb-release/codewhale-linux-x64
             cp target/release/codewhale-tui target/cnb-release/codewhale-tui-linux-x64
-            cp target/release/deepseek target/cnb-release/deepseek-linux-x64
-            cp target/release/deepseek-tui target/cnb-release/deepseek-tui-linux-x64
             strip \
               target/cnb-release/codewhale-linux-x64 \
               target/cnb-release/codewhale-tui-linux-x64 \
-              target/cnb-release/deepseek-linux-x64 \
-              target/cnb-release/deepseek-tui-linux-x64 \
               || true
 
             (
@@ -145,10 +137,7 @@ $:
               sha256sum \
                 codewhale-linux-x64 \
                 codewhale-tui-linux-x64 \
-                deepseek-linux-x64 \
-                deepseek-tui-linux-x64 \
                 > codewhale-artifacts-sha256.txt
-              cp codewhale-artifacts-sha256.txt deepseek-artifacts-sha256.txt
             )
 
             tag_name="${CNB_BRANCH:-}"
@@ -172,9 +161,6 @@ $:
               echo "- codewhale-linux-x64"
               echo "- codewhale-tui-linux-x64"
               echo "- codewhale-artifacts-sha256.txt"
-              echo "- deepseek-linux-x64"
-              echo "- deepseek-tui-linux-x64"
-              echo "- deepseek-artifacts-sha256.txt"
             } > target/cnb-release/CNB_RELEASE.md
 
         - name: create cnb release
@@ -190,6 +176,3 @@ $:
               - target/cnb-release/codewhale-linux-x64
               - target/cnb-release/codewhale-tui-linux-x64
               - target/cnb-release/codewhale-artifacts-sha256.txt
-              - target/cnb-release/deepseek-linux-x64
-              - target/cnb-release/deepseek-tui-linux-x64
-              - target/cnb-release/deepseek-artifacts-sha256.txt
