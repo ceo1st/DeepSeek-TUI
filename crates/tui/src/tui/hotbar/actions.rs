@@ -181,7 +181,7 @@ impl HotbarAction for AppHotbarAction {
 
     fn is_active(&self, app: &App) -> bool {
         match self.kind {
-            AppHotbarKind::VoiceToggle => false,
+            AppHotbarKind::VoiceToggle => app.voice_enabled,
             AppHotbarKind::SessionCompact => app.is_compacting,
             AppHotbarKind::Mode(mode) => app.mode == mode,
             AppHotbarKind::ReasoningCycle => {
@@ -197,9 +197,12 @@ impl HotbarAction for AppHotbarAction {
     fn dispatch(&self, app: &mut App) -> Result<HotbarDispatch> {
         match self.kind {
             AppHotbarKind::VoiceToggle => {
-                app.status_message =
-                    Some("Voice input is not available in this terminal session yet.".to_string());
-                Ok(HotbarDispatch::Handled)
+                let result = crate::commands::voice::voice(app);
+                app.status_message = result.message;
+                match result.action {
+                    Some(action) => Ok(HotbarDispatch::AppAction(action)),
+                    None => Ok(HotbarDispatch::Handled),
+                }
             }
             AppHotbarKind::SessionCompact => {
                 if app.is_compacting {
@@ -539,19 +542,36 @@ mod tests {
     }
 
     #[test]
-    fn voice_toggle_is_safe_until_voice_input_lands() {
+    fn voice_toggle_dispatches_the_voice_command() {
         let registry = HotbarActionRegistry::with_builtins();
         let voice = registry.get("voice.toggle").expect("voice action");
         let mut app = test_app();
 
         assert!(!voice.is_active(&app));
-        assert_eq!(
-            voice.dispatch(&mut app).expect("dispatch voice"),
-            HotbarDispatch::Handled
-        );
-        assert_eq!(
+        // The toggle is wired to the /voice command. With a recorder on the
+        // host it arms voice input and defers capture to the UI event loop;
+        // without one it fails gracefully with a localized error. No audio
+        // is recorded in either case.
+        let result = voice.dispatch(&mut app).expect("dispatch voice");
+        assert!(app.status_message.is_some());
+        // The old placeholder message must be gone — voice is implemented.
+        assert_ne!(
             app.status_message.as_deref(),
             Some("Voice input is not available in this terminal session yet.")
         );
+        if app.voice_enabled {
+            assert_eq!(
+                result,
+                HotbarDispatch::AppAction(crate::tui::app::AppAction::VoiceCapture)
+            );
+            assert!(voice.is_active(&app));
+            // A second press toggles voice input back off.
+            let off = voice.dispatch(&mut app).expect("dispatch voice off");
+            assert_eq!(off, HotbarDispatch::Handled);
+            assert!(!app.voice_enabled);
+            assert!(!voice.is_active(&app));
+        } else {
+            assert_eq!(result, HotbarDispatch::Handled);
+        }
     }
 }

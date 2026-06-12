@@ -6431,6 +6431,28 @@ async fn apply_command_result(
                 let queued = build_queued_message(app, content);
                 submit_or_steer_message(app, config, engine_handle, queued).await?;
             }
+            AppAction::VoiceCapture => {
+                use commands::voice::VoiceCaptureOutcome;
+                match commands::voice::capture_and_transcribe(app, config).await {
+                    Ok(VoiceCaptureOutcome::Insert(text)) => {
+                        app.insert_str(&text);
+                        app.status_message = Some(format!(
+                            "{}: {text}",
+                            tr(app.ui_locale, MessageId::VoiceTranscribed)
+                        ));
+                    }
+                    Ok(VoiceCaptureOutcome::Send(content)) => {
+                        app.status_message =
+                            Some(tr(app.ui_locale, MessageId::VoiceTranscribed).to_string());
+                        let queued = build_queued_message(app, content);
+                        submit_or_steer_message(app, config, engine_handle, queued).await?;
+                    }
+                    Err(err) => {
+                        app.voice_enabled = false;
+                        app.status_message = Some(err);
+                    }
+                }
+            }
             AppAction::ListSubAgents => {
                 let _ = engine_handle.send(Op::ListSubAgents).await;
             }

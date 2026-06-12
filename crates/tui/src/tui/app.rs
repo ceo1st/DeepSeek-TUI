@@ -1481,6 +1481,14 @@ pub struct App {
     pub cost_currency: CostCurrency,
     pub composer_density: ComposerDensity,
     pub composer_border: bool,
+    /// Voice input state — toggled by `/voice` and the voice hotbar action.
+    pub voice_enabled: bool,
+    /// Auto-send after transcription when the transcript ends with an
+    /// explicit send instruction ("send it" / "发送"). Toggled by `/voice-send`.
+    pub voice_send_enabled: bool,
+    /// AI-assisted dictation that sees the current composer text.
+    /// Toggled by `/voice-control`.
+    pub voice_control_enabled: bool,
     pub transcript_spacing: TranscriptSpacing,
     pub sidebar_width_percent: u16,
     pub sidebar_focus: SidebarFocus,
@@ -2275,6 +2283,9 @@ impl App {
             cost_currency,
             composer_density,
             composer_border,
+            voice_enabled: false,
+            voice_send_enabled: false,
+            voice_control_enabled: false,
             transcript_spacing,
             sidebar_width_percent,
             sidebar_focus,
@@ -5323,6 +5334,11 @@ pub enum AppAction {
     SwitchWorkspace {
         workspace: PathBuf,
     },
+    /// Record from the microphone and route the transcription into the
+    /// composer (or auto-send it). Emitted by `/voice` and the voice hotbar
+    /// action; handled in the UI event loop where the live `Config` supplies
+    /// provider credentials.
+    VoiceCapture,
     /// Export and share the current session as a web URL.
     ShareSession {
         history_len: usize,

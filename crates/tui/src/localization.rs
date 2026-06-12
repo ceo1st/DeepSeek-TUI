@@ -636,6 +636,24 @@ pub enum MessageId {
     ToolFamilyVerify,
     ToolFamilyThink,
     ToolFamilyGeneric,
+    // Voice commands (/voice, /voice-send, /voice-control)
+    CmdVoiceDescription,
+    CmdVoiceSendDescription,
+    CmdVoiceControlDescription,
+    VoiceEnabled,
+    VoiceDisabled,
+    VoiceSendEnabled,
+    VoiceSendDisabled,
+    VoiceControlEnabled,
+    VoiceControlDisabled,
+    VoiceErrNoAuth,
+    VoiceErrNoRecorder,
+    VoiceErrNetwork,
+    VoiceErrEmptySend,
+    VoiceErrTooShort,
+    VoiceRecording,
+    VoiceProcessing,
+    VoiceTranscribed,
 }
 
 #[allow(dead_code)]
@@ -1041,6 +1059,23 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ToolFamilyVerify,
     MessageId::ToolFamilyThink,
     MessageId::ToolFamilyGeneric,
+    MessageId::CmdVoiceDescription,
+    MessageId::CmdVoiceSendDescription,
+    MessageId::CmdVoiceControlDescription,
+    MessageId::VoiceEnabled,
+    MessageId::VoiceDisabled,
+    MessageId::VoiceSendEnabled,
+    MessageId::VoiceSendDisabled,
+    MessageId::VoiceControlEnabled,
+    MessageId::VoiceControlDisabled,
+    MessageId::VoiceErrNoAuth,
+    MessageId::VoiceErrNoRecorder,
+    MessageId::VoiceErrNetwork,
+    MessageId::VoiceErrEmptySend,
+    MessageId::VoiceErrTooShort,
+    MessageId::VoiceRecording,
+    MessageId::VoiceProcessing,
+    MessageId::VoiceTranscribed,
 ];
 
 pub fn tr(locale: Locale, id: MessageId) -> &'static str {
@@ -1774,6 +1809,32 @@ fn english(id: MessageId) -> &'static str {
         MessageId::ToolFamilyVerify => "verify",
         MessageId::ToolFamilyThink => "think",
         MessageId::ToolFamilyGeneric => "tool",
+        // Voice commands
+        MessageId::CmdVoiceDescription => {
+            "Toggle voice input: record speech and transcribe into the composer"
+        }
+        MessageId::CmdVoiceSendDescription => {
+            "Toggle voice auto-send: submit when the transcript ends with \"send it\""
+        }
+        MessageId::CmdVoiceControlDescription => {
+            "Toggle voice control: AI-assisted dictation aware of the composer text"
+        }
+        MessageId::VoiceEnabled => "Voice input enabled. Speak to record.",
+        MessageId::VoiceDisabled => "Voice input disabled.",
+        MessageId::VoiceSendEnabled => "Voice auto-send enabled.",
+        MessageId::VoiceSendDisabled => "Voice auto-send disabled.",
+        MessageId::VoiceControlEnabled => "Voice control enabled.",
+        MessageId::VoiceControlDisabled => "Voice control disabled.",
+        MessageId::VoiceErrNoAuth => "Voice: no API key configured for the active provider",
+        MessageId::VoiceErrNoRecorder => {
+            "Voice: no recording tool found. Install sox, arecord, or rec."
+        }
+        MessageId::VoiceErrNetwork => "Voice: transcription request failed",
+        MessageId::VoiceErrEmptySend => "Voice: nothing to send",
+        MessageId::VoiceErrTooShort => "Voice: no speech detected, recording too short",
+        MessageId::VoiceRecording => "🎙 Recording... speak now",
+        MessageId::VoiceProcessing => "🎙 Transcribing...",
+        MessageId::VoiceTranscribed => "🎙 Transcribed",
     }
 }
 
@@ -2375,6 +2436,32 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         MessageId::ToolFamilyVerify => "xác minh",
         MessageId::ToolFamilyThink => "suy nghĩ",
         MessageId::ToolFamilyGeneric => "công cụ",
+        // Voice commands
+        MessageId::CmdVoiceDescription => {
+            "Bật/tắt nhập liệu bằng giọng nói: ghi âm và chuyển thành văn bản"
+        }
+        MessageId::CmdVoiceSendDescription => {
+            "Bật/tắt tự gửi bằng giọng nói: gửi khi bản ghi kết thúc bằng \"send it\""
+        }
+        MessageId::CmdVoiceControlDescription => {
+            "Bật/tắt điều khiển giọng nói: đọc chính tả có AI hỗ trợ"
+        }
+        MessageId::VoiceEnabled => "Đã bật nhập liệu bằng giọng nói. Hãy nói để ghi âm.",
+        MessageId::VoiceDisabled => "Đã tắt nhập liệu bằng giọng nói.",
+        MessageId::VoiceSendEnabled => "Đã bật tự gửi bằng giọng nói.",
+        MessageId::VoiceSendDisabled => "Đã tắt tự gửi bằng giọng nói.",
+        MessageId::VoiceControlEnabled => "Đã bật điều khiển giọng nói.",
+        MessageId::VoiceControlDisabled => "Đã tắt điều khiển giọng nói.",
+        MessageId::VoiceErrNoAuth => "Giọng nói: nhà cung cấp hiện tại chưa có khóa API",
+        MessageId::VoiceErrNoRecorder => {
+            "Giọng nói: không tìm thấy công cụ ghi âm. Hãy cài sox, arecord hoặc rec."
+        }
+        MessageId::VoiceErrNetwork => "Giọng nói: yêu cầu chuyển giọng nói thất bại",
+        MessageId::VoiceErrEmptySend => "Giọng nói: không có nội dung để gửi",
+        MessageId::VoiceErrTooShort => "Giọng nói: không phát hiện giọng nói, bản ghi quá ngắn",
+        MessageId::VoiceRecording => "🎙 Đang ghi âm... hãy nói",
+        MessageId::VoiceProcessing => "🎙 Đang chuyển thành văn bản...",
+        MessageId::VoiceTranscribed => "🎙 Đã chuyển xong",
     })
 }
 
@@ -2530,6 +2617,28 @@ fn traditional_chinese(id: MessageId) -> Option<&'static str> {
         MessageId::ToolFamilyVerify => "驗證",
         MessageId::ToolFamilyThink => "思考",
         MessageId::ToolFamilyGeneric => "工具",
+        // Voice commands
+        MessageId::CmdVoiceDescription => "切換語音輸入：錄製語音並轉錄為文字",
+        MessageId::CmdVoiceSendDescription => {
+            "切換語音自動傳送：轉錄以「發送」或「send it」結尾時自動提交"
+        }
+        MessageId::CmdVoiceControlDescription => {
+            "切換語音控制：AI 輔助的語音聽寫（結合當前輸入內容）"
+        }
+        MessageId::VoiceEnabled => "語音輸入已開啟，開始說話即可錄製",
+        MessageId::VoiceDisabled => "語音輸入已關閉",
+        MessageId::VoiceSendEnabled => "語音自動傳送已開啟",
+        MessageId::VoiceSendDisabled => "語音自動傳送已關閉",
+        MessageId::VoiceControlEnabled => "語音控制已開啟",
+        MessageId::VoiceControlDisabled => "語音控制已關閉",
+        MessageId::VoiceErrNoAuth => "語音：目前供應商未設定 API 金鑰",
+        MessageId::VoiceErrNoRecorder => "語音：未找到錄音工具，請安裝 sox、arecord 或 rec",
+        MessageId::VoiceErrNetwork => "語音：轉錄請求失敗",
+        MessageId::VoiceErrEmptySend => "語音：沒有可傳送的內容",
+        MessageId::VoiceErrTooShort => "語音：未偵測到有效語音，錄製時間過短",
+        MessageId::VoiceRecording => "🎙 正在錄音...請說話",
+        MessageId::VoiceProcessing => "🎙 正在轉錄...",
+        MessageId::VoiceTranscribed => "🎙 轉錄完成",
         other => chinese_simplified(other)?,
     })
 }
@@ -3090,6 +3199,32 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::ToolFamilyVerify => "検証",
         MessageId::ToolFamilyThink => "思考",
         MessageId::ToolFamilyGeneric => "ツール",
+        // Voice commands
+        MessageId::CmdVoiceDescription => "音声入力の切替：音声を録音してテキストに変換",
+        MessageId::CmdVoiceSendDescription => {
+            "音声自動送信の切替：転写が「send it」で終わると自動送信"
+        }
+        MessageId::CmdVoiceControlDescription => {
+            "音声コントロールの切替：入力欄を考慮した AI 音声ディクテーション"
+        }
+        MessageId::VoiceEnabled => "音声入力を有効にしました。話すと録音されます。",
+        MessageId::VoiceDisabled => "音声入力を無効にしました。",
+        MessageId::VoiceSendEnabled => "音声自動送信を有効にしました。",
+        MessageId::VoiceSendDisabled => "音声自動送信を無効にしました。",
+        MessageId::VoiceControlEnabled => "音声コントロールを有効にしました。",
+        MessageId::VoiceControlDisabled => "音声コントロールを無効にしました。",
+        MessageId::VoiceErrNoAuth => {
+            "音声：アクティブなプロバイダーに API キーが設定されていません"
+        }
+        MessageId::VoiceErrNoRecorder => {
+            "音声：録音ツールが見つかりません。sox、arecord、rec のいずれかをインストールしてください"
+        }
+        MessageId::VoiceErrNetwork => "音声：文字起こしリクエストに失敗しました",
+        MessageId::VoiceErrEmptySend => "音声：送信する内容がありません",
+        MessageId::VoiceErrTooShort => "音声：音声が検出されませんでした。録音が短すぎます",
+        MessageId::VoiceRecording => "🎙 録音中...お話しください",
+        MessageId::VoiceProcessing => "🎙 文字起こし中...",
+        MessageId::VoiceTranscribed => "🎙 文字起こし完了",
     })
 }
 
@@ -3585,6 +3720,28 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::ToolFamilyVerify => "验证",
         MessageId::ToolFamilyThink => "思考",
         MessageId::ToolFamilyGeneric => "工具",
+        // Voice commands
+        MessageId::CmdVoiceDescription => "切换语音输入：录制语音并转录为文字",
+        MessageId::CmdVoiceSendDescription => {
+            "切换语音自动发送：转录以「发送」或「send it」结尾时自动提交"
+        }
+        MessageId::CmdVoiceControlDescription => {
+            "切换语音控制：AI 辅助的语音听写（结合当前输入内容）"
+        }
+        MessageId::VoiceEnabled => "语音输入已开启，开始说话即可录制",
+        MessageId::VoiceDisabled => "语音输入已关闭",
+        MessageId::VoiceSendEnabled => "语音自动发送已开启",
+        MessageId::VoiceSendDisabled => "语音自动发送已关闭",
+        MessageId::VoiceControlEnabled => "语音控制已开启",
+        MessageId::VoiceControlDisabled => "语音控制已关闭",
+        MessageId::VoiceErrNoAuth => "语音：当前提供商未配置 API 密钥",
+        MessageId::VoiceErrNoRecorder => "语音：未找到录音工具，请安装 sox、arecord 或 rec",
+        MessageId::VoiceErrNetwork => "语音：转录请求失败",
+        MessageId::VoiceErrEmptySend => "语音：没有可发送的内容",
+        MessageId::VoiceErrTooShort => "语音：未检测到有效语音，录制时间过短",
+        MessageId::VoiceRecording => "🎙 正在录音...请说话",
+        MessageId::VoiceProcessing => "🎙 正在转录...",
+        MessageId::VoiceTranscribed => "🎙 转录完成",
     })
 }
 
@@ -4170,6 +4327,32 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::ToolFamilyVerify => "verificar",
         MessageId::ToolFamilyThink => "pensar",
         MessageId::ToolFamilyGeneric => "ferramenta",
+        // Voice commands
+        MessageId::CmdVoiceDescription => {
+            "Alternar entrada de voz: gravar fala e transcrever para texto"
+        }
+        MessageId::CmdVoiceSendDescription => {
+            "Alternar envio automático por voz: envia quando a transcrição termina com \"send it\""
+        }
+        MessageId::CmdVoiceControlDescription => {
+            "Alternar controle por voz: ditado assistido por IA"
+        }
+        MessageId::VoiceEnabled => "Entrada de voz ativada. Fale para gravar.",
+        MessageId::VoiceDisabled => "Entrada de voz desativada.",
+        MessageId::VoiceSendEnabled => "Envio automático por voz ativado.",
+        MessageId::VoiceSendDisabled => "Envio automático por voz desativado.",
+        MessageId::VoiceControlEnabled => "Controle por voz ativado.",
+        MessageId::VoiceControlDisabled => "Controle por voz desativado.",
+        MessageId::VoiceErrNoAuth => "Voz: nenhuma chave de API configurada para o provedor ativo",
+        MessageId::VoiceErrNoRecorder => {
+            "Voz: nenhuma ferramenta de gravação encontrada. Instale sox, arecord ou rec."
+        }
+        MessageId::VoiceErrNetwork => "Voz: falha na solicitação de transcrição",
+        MessageId::VoiceErrEmptySend => "Voz: nada para enviar",
+        MessageId::VoiceErrTooShort => "Voz: nenhuma fala detectada, gravação muito curta",
+        MessageId::VoiceRecording => "🎙 Gravando... fale agora",
+        MessageId::VoiceProcessing => "🎙 Transcrevendo...",
+        MessageId::VoiceTranscribed => "🎙 Transcrito",
     })
 }
 
@@ -4765,6 +4948,34 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         MessageId::ToolFamilyVerify => "verificar",
         MessageId::ToolFamilyThink => "pensar",
         MessageId::ToolFamilyGeneric => "herramienta",
+        // Voice commands
+        MessageId::CmdVoiceDescription => {
+            "Alternar entrada de voz: grabar voz y transcribir a texto"
+        }
+        MessageId::CmdVoiceSendDescription => {
+            "Alternar envío automático por voz: envía cuando la transcripción termina con \"send it\""
+        }
+        MessageId::CmdVoiceControlDescription => {
+            "Alternar control por voz: dictado asistido por IA"
+        }
+        MessageId::VoiceEnabled => "Entrada de voz activada. Habla para grabar.",
+        MessageId::VoiceDisabled => "Entrada de voz desactivada.",
+        MessageId::VoiceSendEnabled => "Envío automático por voz activado.",
+        MessageId::VoiceSendDisabled => "Envío automático por voz desactivado.",
+        MessageId::VoiceControlEnabled => "Control por voz activado.",
+        MessageId::VoiceControlDisabled => "Control por voz desactivado.",
+        MessageId::VoiceErrNoAuth => {
+            "Voz: no hay clave de API configurada para el proveedor activo"
+        }
+        MessageId::VoiceErrNoRecorder => {
+            "Voz: no se encontró herramienta de grabación. Instala sox, arecord o rec."
+        }
+        MessageId::VoiceErrNetwork => "Voz: falló la solicitud de transcripción",
+        MessageId::VoiceErrEmptySend => "Voz: nada que enviar",
+        MessageId::VoiceErrTooShort => "Voz: no se detectó voz, grabación demasiado corta",
+        MessageId::VoiceRecording => "🎙 Grabando... habla ahora",
+        MessageId::VoiceProcessing => "🎙 Transcribiendo...",
+        MessageId::VoiceTranscribed => "🎙 Transcrito",
     })
 }
 

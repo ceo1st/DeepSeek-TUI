@@ -17,6 +17,9 @@ pub use traits::CommandInfo;
 // Long-standing public paths that predate the group layout.
 pub use groups::project::share;
 
+// Voice capture plumbing shared with the hotbar and the UI event loop.
+pub use groups::core::voice;
+
 use crate::tui::app::{App, AppAction};
 
 /// Result of executing a command
@@ -662,6 +665,49 @@ mod tests {
         assert!(!result.is_error);
         assert!(!app.verbose_transcript);
         assert!(result.message.unwrap().contains("off"));
+    }
+
+    #[test]
+    fn voice_send_and_voice_control_commands_toggle_state() {
+        let mut app = create_test_app();
+        assert!(!app.voice_send_enabled);
+        assert!(!app.voice_control_enabled);
+
+        for invocation in ["/voicesend", "/voice-send", "/yuyinsend", "/语音发送"] {
+            let result = execute(invocation, &mut app);
+            assert!(!result.is_error, "{invocation} should toggle cleanly");
+            assert!(result.action.is_none());
+            assert!(result.message.is_some());
+        }
+        // Four toggles land back at disabled.
+        assert!(!app.voice_send_enabled);
+
+        let result = execute("/voicecontrol", &mut app);
+        assert!(!result.is_error);
+        assert!(app.voice_control_enabled);
+        let result = execute("/voice-control", &mut app);
+        assert!(!result.is_error);
+        assert!(!app.voice_control_enabled);
+    }
+
+    /// `/voice` defers the actual capture to the UI event loop via
+    /// `AppAction::VoiceCapture`, so executing it never records audio.
+    /// On hosts without a recorder it must fail gracefully instead.
+    #[test]
+    fn voice_command_toggles_on_and_off_or_fails_gracefully() {
+        let mut app = create_test_app();
+        let result = execute("/voice", &mut app);
+        if app.voice_enabled {
+            assert!(!result.is_error);
+            assert!(matches!(result.action, Some(AppAction::VoiceCapture)));
+            let off = execute("/voice", &mut app);
+            assert!(!off.is_error);
+            assert!(off.action.is_none());
+            assert!(!app.voice_enabled);
+        } else {
+            assert!(result.is_error);
+            assert!(result.action.is_none());
+        }
     }
 
     #[test]

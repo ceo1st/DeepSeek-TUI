@@ -10,6 +10,7 @@ mod hooks;
 mod provider;
 mod queue;
 mod stash;
+pub mod voice;
 
 pub(in crate::commands) use self::core::reset_conversation_state;
 
@@ -43,6 +44,9 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(&PROFILE_INFO, run_profile)),
             Box::new(FunctionCommand::new(&RLM_INFO, run_rlm)),
             Box::new(FunctionCommand::new(&TRANSLATE_INFO, run_translate)),
+            Box::new(FunctionCommand::new(&VOICE_INFO, run_voice)),
+            Box::new(FunctionCommand::new(&VOICE_SEND_INFO, run_voice_send)),
+            Box::new(FunctionCommand::new(&VOICE_CONTROL_INFO, run_voice_control)),
         ]
     }
 }
@@ -167,6 +171,24 @@ static TRANSLATE_INFO: CommandInfo = CommandInfo {
     usage: "/translate",
     description_id: MessageId::CmdTranslateDescription,
 };
+static VOICE_INFO: CommandInfo = CommandInfo {
+    name: "voice",
+    aliases: &["yuyin", "语音"],
+    usage: "/voice",
+    description_id: MessageId::CmdVoiceDescription,
+};
+static VOICE_SEND_INFO: CommandInfo = CommandInfo {
+    name: "voicesend",
+    aliases: &["voice-send", "yuyinsend", "语音发送"],
+    usage: "/voicesend",
+    description_id: MessageId::CmdVoiceSendDescription,
+};
+static VOICE_CONTROL_INFO: CommandInfo = CommandInfo {
+    name: "voicecontrol",
+    aliases: &["voice-control", "yuyincontrol", "语音控制"],
+    usage: "/voicecontrol",
+    description_id: MessageId::CmdVoiceControlDescription,
+};
 
 fn run_registered(app: &mut App, name: &str, arg: Option<&str>) -> CommandResult {
     dispatch(app, name, arg).expect("registered core command should dispatch")
@@ -232,6 +254,15 @@ fn run_rlm(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_translate(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "translate", arg)
 }
+fn run_voice(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "voice", arg)
+}
+fn run_voice_send(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "voicesend", arg)
+}
+fn run_voice_control(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "voicecontrol", arg)
+}
 
 pub(in crate::commands) fn dispatch(
     app: &mut App,
@@ -259,6 +290,11 @@ pub(in crate::commands) fn dispatch(
         "profile" | "dangan" => core::profile_switch(app, arg),
         "rlm" | "recursive" | "digui" => rlm(app, arg),
         "translate" | "translation" | "transale" => core::translate(app),
+        "voice" | "yuyin" | "语音" => voice::voice(app),
+        "voicesend" | "voice-send" | "yuyinsend" | "语音发送" => voice::voice_send(app),
+        "voicecontrol" | "voice-control" | "yuyincontrol" | "语音控制" => {
+            voice::voice_control(app)
+        }
         _ => return None,
     };
     Some(result)
