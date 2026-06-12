@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 
 use crate::config::{ApiProvider, Config};
+use crate::features::{FEATURES, Stage};
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::settings::Settings;
@@ -406,6 +407,7 @@ enum ConfigSection {
     Sidebar,
     History,
     Mcp,
+    Experimental,
 }
 
 impl ConfigSection {
@@ -422,6 +424,7 @@ impl ConfigSection {
                 ConfigSection::Sidebar => MessageId::ConfigSectionSidebar,
                 ConfigSection::History => MessageId::ConfigSectionHistory,
                 ConfigSection::Mcp => MessageId::ConfigSectionMcp,
+                ConfigSection::Experimental => MessageId::ConfigSectionExperimental,
             },
         )
     }
@@ -466,7 +469,9 @@ const CONFIG_COLUMN_GAPS_WIDTH: usize = 2;
 impl ConfigView {
     pub fn new_for_app(app: &App) -> Self {
         let settings = Settings::load().unwrap_or_else(|_| Settings::default());
-        let rows = vec![
+        let config = Config::load(app.config_path.clone(), app.config_profile.as_deref())
+            .unwrap_or_default();
+        let mut rows = vec![
             ConfigRow {
                 section: ConfigSection::Provider,
                 key: "provider".to_string(),
@@ -750,6 +755,7 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
         ];
+        rows.extend(experimental_config_rows(&config));
 
         Self {
             rows,
@@ -1131,6 +1137,64 @@ fn cost_currency_config_value(app: &App) -> String {
         crate::pricing::CostCurrency::Cny => "cny",
     }
     .to_string()
+}
+
+fn experimental_config_rows(config: &Config) -> Vec<ConfigRow> {
+    let features = config.features();
+    let configured = config.features.as_ref().map(|table| &table.entries);
+    let mut rows = Vec::new();
+
+    for spec in FEATURES
+        .iter()
+        .filter(|spec| spec.stage == Stage::Experimental)
+    {
+        let effective = features.enabled(spec.id);
+        let configured_value = configured
+            .and_then(|entries| entries.get(spec.key))
+            .copied();
+        rows.push(ConfigRow {
+            section: ConfigSection::Experimental,
+            key: format!("features.{}", spec.key),
+            value: experimental_feature_value(
+                effective,
+                spec.default_enabled,
+                configured_value.is_some(),
+            ),
+            editable: false,
+            scope: ConfigScope::Saved,
+        });
+    }
+
+    rows.push(ConfigRow {
+        section: ConfigSection::Experimental,
+        key: "goal_command".to_string(),
+        value: "preview placeholder (not stable; see #1976/#891)".to_string(),
+        editable: false,
+        scope: ConfigScope::Saved,
+    });
+    rows.push(ConfigRow {
+        section: ConfigSection::Experimental,
+        key: "whaleflow".to_string(),
+        value: "preview placeholder (not stable; see #2981/#2974)".to_string(),
+        editable: false,
+        scope: ConfigScope::Saved,
+    });
+
+    rows
+}
+
+fn experimental_feature_value(effective: bool, default_enabled: bool, configured: bool) -> String {
+    let state = if effective { "enabled" } else { "disabled" };
+    let default_state = if default_enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    if configured {
+        format!("{state} (configured; default {default_state})")
+    } else {
+        format!("{state} (default {default_state})")
+    }
 }
 
 fn config_hint_for_key(key: &str) -> &'static str {
@@ -2324,6 +2388,7 @@ mod tests {
                 "Sidebar",
                 "History",
                 "MCP",
+                "Experimental",
             ]
         );
     }
@@ -2359,7 +2424,96 @@ mod tests {
         assert!(keys.contains(&"cost_currency"));
         assert!(keys.contains(&"prefer_external_pdftotext"));
         assert!(keys.contains(&"mcp_config_path"));
-        assert!(view.rows.iter().all(|row| row.editable));
+        assert!(keys.contains(&"features.subagents"));
+        assert!(keys.contains(&"features.web_search"));
+        assert!(keys.contains(&"features.apply_patch"));
+        assert!(keys.contains(&"features.mcp"));
+        assert!(keys.contains(&"features.exec_policy"));
+        assert!(keys.contains(&"features.vision_model"));
+        assert!(keys.contains(&"goal_command"));
+        assert!(keys.contains(&"whaleflow"));
+        assert!(
+            view.rows
+                .iter()
+                .filter(|row| row.section != super::ConfigSection::Experimental)
+                .all(|row| row.editable)
+        );
+        assert!(
+            view.rows
+                .iter()
+                .filter(|row| row.section == super::ConfigSection::Experimental)
+                .all(|row| !row.editable)
+        );
+    }
+
+    #[test]
+    fn config_view_experimental_features_show_effective_state_and_overrides() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "codewhale-experimental-config-view-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).unwrap();
+        let config_path = temp_root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[features]
+web_search = false
+vision_model = true
+"#,
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+        let view = ConfigView::new_for_app(&app);
+
+        let web_search = view
+            .rows
+            .iter()
+            .find(|row| row.key == "features.web_search")
+            .expect("web_search feature row");
+        assert_eq!(web_search.value, "disabled (configured; default enabled)");
+        assert!(!web_search.editable);
+
+        let vision = view
+            .rows
+            .iter()
+            .find(|row| row.key == "features.vision_model")
+            .expect("vision feature row");
+        assert_eq!(vision.value, "enabled (configured; default disabled)");
+        assert!(!vision.editable);
+
+        let subagents = view
+            .rows
+            .iter()
+            .find(|row| row.key == "features.subagents")
+            .expect("subagents feature row");
+        assert_eq!(subagents.value, "enabled (default enabled)");
+    }
+
+    #[test]
+    fn config_view_experimental_section_is_searchable() {
+        let mut view = create_config_view(Locale::En);
+
+        view.update_filter(|filter| filter.push_str("experimental"));
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert!(visible_row_keys(&view).contains(&"features.subagents"));
+
+        view.clear_filter();
+        type_filter(&mut view, "feature vision");
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_row_keys(&view), vec!["features.vision_model"]);
+
+        view.clear_filter();
+        type_filter(&mut view, "goal");
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_row_keys(&view), vec!["goal_command"]);
+
+        view.clear_filter();
+        type_filter(&mut view, "whaleflow");
+        assert_eq!(visible_section_labels(&view), vec!["Experimental"]);
+        assert_eq!(visible_row_keys(&view), vec!["whaleflow"]);
     }
 
     #[test]
