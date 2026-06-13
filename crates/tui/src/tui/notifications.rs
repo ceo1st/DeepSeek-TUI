@@ -860,8 +860,8 @@ mod tests {
 
     use super::*;
 
-    /// Serialise all tests that mutate `TERM_PROGRAM` to prevent data races
-    /// when the test harness runs them in parallel threads.
+    /// Serialise tests that mutate process-global environment or notification
+    /// sound state while the test harness runs them in parallel threads.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1331,6 +1331,7 @@ mod tests {
 
     #[test]
     fn settings_installs_custom_completion_sound_file() {
+        let _lock = env_lock();
         let config: crate::config::Config = toml::from_str(
             r#"
             [notifications]
