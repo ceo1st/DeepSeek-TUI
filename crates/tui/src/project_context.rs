@@ -54,7 +54,8 @@ const SUPPORTED_CONSTITUTION_SCHEMA: u32 = 1;
 
 /// User-level project instructions loaded as a fallback when the workspace and
 /// its parents do not define project context. Any global AGENTS.md takes
-/// priority over any deprecated global WHALE.md; within each file name,
+/// priority over a global instructions.md (#3012), which takes priority over
+/// any deprecated global WHALE.md; within each file name,
 /// `.codewhale/` takes priority over vendor-neutral `.agents/`, which takes
 /// priority over legacy `.deepseek/`.
 const GLOBAL_AGENTS_RELATIVE_PATH: &[&str] = &[".codewhale", "AGENTS.md"];
@@ -63,6 +64,12 @@ const GLOBAL_AGENTS_LEGACY_PATH: &[&str] = &[".deepseek", "AGENTS.md"];
 const GLOBAL_WHALE_RELATIVE_PATH: &[&str] = &[".codewhale", "WHALE.md"];
 const GLOBAL_WHALE_VENDOR_NEUTRAL_PATH: &[&str] = &[".agents", "WHALE.md"];
 const GLOBAL_WHALE_LEGACY_PATH: &[&str] = &[".deepseek", "WHALE.md"];
+/// Global `instructions.md` (#3012): auto-loaded as a fallback context layer,
+/// ranked between AGENTS.md (higher priority) and the deprecated WHALE.md
+/// (lower), mirroring the project-level precedence.
+const GLOBAL_INSTRUCTIONS_RELATIVE_PATH: &[&str] = &[".codewhale", "instructions.md"];
+const GLOBAL_INSTRUCTIONS_VENDOR_NEUTRAL_PATH: &[&str] = &[".agents", "instructions.md"];
+const GLOBAL_INSTRUCTIONS_LEGACY_PATH: &[&str] = &[".deepseek", "instructions.md"];
 
 /// Maximum size for project context files (to prevent loading huge files)
 const MAX_CONTEXT_SIZE: usize = 100 * 1024; // 100KB
@@ -822,11 +829,14 @@ fn repo_constitution_candidate_paths(workspace: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn global_context_relative_paths() -> [&'static [&'static str]; 6] {
+fn global_context_relative_paths() -> [&'static [&'static str]; 9] {
     [
         GLOBAL_AGENTS_RELATIVE_PATH,
         GLOBAL_AGENTS_VENDOR_NEUTRAL_PATH,
         GLOBAL_AGENTS_LEGACY_PATH,
+        GLOBAL_INSTRUCTIONS_RELATIVE_PATH,
+        GLOBAL_INSTRUCTIONS_VENDOR_NEUTRAL_PATH,
+        GLOBAL_INSTRUCTIONS_LEGACY_PATH,
         GLOBAL_WHALE_RELATIVE_PATH,
         GLOBAL_WHALE_VENDOR_NEUTRAL_PATH,
         GLOBAL_WHALE_LEGACY_PATH,
@@ -872,13 +882,17 @@ fn merge_global_and_project_instructions(
 fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Option<ProjectContext> {
     let home = home_dir?;
 
-    // Priority order (AGENTS.md preferred over the now-deprecated WHALE.md):
-    // 1. ~/.codewhale/AGENTS.md     (canonical)
-    // 2. ~/.agents/AGENTS.md        (vendor-neutral fallback)
-    // 3. ~/.deepseek/AGENTS.md      (legacy fallback)
-    // 4. ~/.codewhale/WHALE.md      (deprecated, legacy fallback)
-    // 5. ~/.agents/WHALE.md         (deprecated, vendor-neutral legacy)
-    // 6. ~/.deepseek/WHALE.md       (deprecated, legacy)
+    // Priority order (AGENTS.md preferred; instructions.md next, #3012;
+    // WHALE.md deprecated and last):
+    // 1. ~/.codewhale/AGENTS.md       (canonical)
+    // 2. ~/.agents/AGENTS.md          (vendor-neutral fallback)
+    // 3. ~/.deepseek/AGENTS.md        (legacy fallback)
+    // 4. ~/.codewhale/instructions.md (canonical)
+    // 5. ~/.agents/instructions.md    (vendor-neutral fallback)
+    // 6. ~/.deepseek/instructions.md  (legacy fallback)
+    // 7. ~/.codewhale/WHALE.md        (deprecated, legacy fallback)
+    // 8. ~/.agents/WHALE.md           (deprecated, vendor-neutral legacy)
+    // 9. ~/.deepseek/WHALE.md         (deprecated, legacy)
     let mut warnings = Vec::new();
 
     for candidate in global_context_relative_paths() {
@@ -1817,6 +1831,74 @@ mod tests {
             ctx.warnings
         );
         assert_eq!(ctx.source_path, Some(global_whale));
+    }
+
+    #[test]
+    fn test_global_instructions_md_is_autoloaded_and_outranks_whale() {
+        // #3012: a global ~/.codewhale/instructions.md should be auto-loaded as
+        // a fallback context layer, ahead of the deprecated WHALE.md.
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+
+        let codewhale_dir = home.path().join(".codewhale");
+        fs::create_dir(&codewhale_dir).expect("mkdir .codewhale");
+        fs::write(codewhale_dir.join("WHALE.md"), "Global WHALE legacy")
+            .expect("write codewhale whale");
+        let global_instructions = codewhale_dir.join("instructions.md");
+        fs::write(&global_instructions, "Global instructions body")
+            .expect("write global instructions");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(ctx.has_instructions());
+        let instructions = ctx.instructions.as_ref().unwrap();
+        assert!(
+            instructions.contains("Global instructions body"),
+            "global instructions.md should be auto-loaded:\n{instructions}"
+        );
+        assert!(
+            !instructions.contains("Global WHALE legacy"),
+            "instructions.md should outrank the deprecated WHALE.md:\n{instructions}"
+        );
+        assert!(
+            !ctx.warnings
+                .iter()
+                .any(|warning| warning.contains("WHALE.md is deprecated")),
+            "loading instructions.md should not emit a WHALE deprecation warning: {:?}",
+            ctx.warnings
+        );
+        assert_eq!(ctx.source_path, Some(global_instructions));
+    }
+
+    #[test]
+    fn test_global_agents_outranks_global_instructions() {
+        // #3012 precedence: AGENTS.md > instructions.md.
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+
+        let codewhale_dir = home.path().join(".codewhale");
+        fs::create_dir(&codewhale_dir).expect("mkdir .codewhale");
+        let global_agents = codewhale_dir.join("AGENTS.md");
+        fs::write(&global_agents, "Global AGENTS canonical").expect("write global agents");
+        fs::write(
+            codewhale_dir.join("instructions.md"),
+            "Global instructions body",
+        )
+        .expect("write global instructions");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(ctx.has_instructions());
+        let instructions = ctx.instructions.as_ref().unwrap();
+        assert!(
+            instructions.contains("Global AGENTS canonical"),
+            "global AGENTS.md should outrank instructions.md:\n{instructions}"
+        );
+        assert!(
+            !instructions.contains("Global instructions body"),
+            "instructions.md should be skipped when a global AGENTS.md exists:\n{instructions}"
+        );
+        assert_eq!(ctx.source_path, Some(global_agents));
     }
 
     #[test]
