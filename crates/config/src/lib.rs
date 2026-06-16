@@ -235,32 +235,7 @@ impl ProviderKind {
 
     #[must_use]
     pub fn all() -> &'static [Self] {
-        &[
-            Self::Deepseek,
-            Self::NvidiaNim,
-            Self::Openai,
-            Self::Atlascloud,
-            Self::WanjieArk,
-            Self::Volcengine,
-            Self::Openrouter,
-            Self::XiaomiMimo,
-            Self::Novita,
-            Self::Fireworks,
-            Self::Siliconflow,
-            Self::SiliconflowCN,
-            Self::Arcee,
-            Self::Moonshot,
-            Self::Sglang,
-            Self::Vllm,
-            Self::Ollama,
-            Self::Huggingface,
-            Self::Together,
-            Self::OpenaiCodex,
-            Self::Anthropic,
-            Self::Zai,
-            Self::Stepfun,
-            Self::Minimax,
-        ]
+        &Self::ALL
     }
 
     #[must_use]
@@ -1407,51 +1382,12 @@ impl ConfigToml {
         if project.tools.is_some() {
             self.tools = project.tools;
         }
-        merge_project_provider_config(&mut self.providers.deepseek, &project.providers.deepseek);
-        merge_project_provider_config(
-            &mut self.providers.nvidia_nim,
-            &project.providers.nvidia_nim,
-        );
-        merge_project_provider_config(&mut self.providers.openai, &project.providers.openai);
-        merge_project_provider_config(
-            &mut self.providers.atlascloud,
-            &project.providers.atlascloud,
-        );
-        merge_project_provider_config(
-            &mut self.providers.wanjie_ark,
-            &project.providers.wanjie_ark,
-        );
-        merge_project_provider_config(
-            &mut self.providers.volcengine,
-            &project.providers.volcengine,
-        );
-        merge_project_provider_config(
-            &mut self.providers.openrouter,
-            &project.providers.openrouter,
-        );
-        merge_project_provider_config(
-            &mut self.providers.xiaomi_mimo,
-            &project.providers.xiaomi_mimo,
-        );
-        merge_project_provider_config(&mut self.providers.novita, &project.providers.novita);
-        merge_project_provider_config(&mut self.providers.fireworks, &project.providers.fireworks);
-        merge_project_provider_config(
-            &mut self.providers.siliconflow,
-            &project.providers.siliconflow,
-        );
-        merge_project_provider_config(
-            &mut self.providers.siliconflow_cn,
-            &project.providers.siliconflow_cn,
-        );
-        merge_project_provider_config(&mut self.providers.arcee, &project.providers.arcee);
-        merge_project_provider_config(&mut self.providers.moonshot, &project.providers.moonshot);
-        merge_project_provider_config(&mut self.providers.sglang, &project.providers.sglang);
-        merge_project_provider_config(&mut self.providers.vllm, &project.providers.vllm);
-        merge_project_provider_config(&mut self.providers.ollama, &project.providers.ollama);
-        merge_project_provider_config(
-            &mut self.providers.huggingface,
-            &project.providers.huggingface,
-        );
+        for provider in ProviderKind::ALL {
+            merge_project_provider_config(
+                self.providers.for_provider_mut(provider),
+                project.providers.for_provider(provider),
+            );
+        }
     }
 
     #[must_use]
@@ -5794,6 +5730,33 @@ unix_socket_path = "/tmp/cw-hooks.sock"
             Some("DeepSeek-V4-Pro")
         );
         assert_eq!(base.providers.moonshot.model.as_deref(), Some("kimi-k2.6"));
+    }
+
+    #[test]
+    fn project_merge_forwards_all_provider_model_overrides() {
+        let mut project_toml = String::new();
+        for provider in ProviderKind::ALL {
+            let key = provider.provider().provider_config_key();
+            project_toml.push_str(&format!(
+                "[providers.{key}]\nmodel = \"project-{key}-model\"\n\n"
+            ));
+        }
+
+        let project: ConfigToml =
+            toml::from_str(&project_toml).expect("project provider overrides parse");
+        let mut base = ConfigToml::default();
+
+        base.merge_project_overrides(project);
+
+        for provider in ProviderKind::ALL {
+            let key = provider.provider().provider_config_key();
+            let expected = format!("project-{key}-model");
+            assert_eq!(
+                base.providers.for_provider(provider).model.as_deref(),
+                Some(expected.as_str()),
+                "provider {key} should merge repo-local model override"
+            );
+        }
     }
 
     #[test]
