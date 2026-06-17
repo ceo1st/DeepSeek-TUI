@@ -56,7 +56,9 @@ CLI/API surfaces are not implemented yet.
 historically reached through `serve --http` — no routes or behavior changed, so
 every endpoint documented below is identical across both entrypoints. The
 runtime API token is read from `--auth-token`, then `CODEWHALE_RUNTIME_TOKEN`,
-then `DEEPSEEK_RUNTIME_TOKEN`; pass `--insecure` only on a trusted loopback.
+then `DEEPSEEK_RUNTIME_TOKEN`; pass `--insecure-no-auth` to the app-server
+entrypoint only on a trusted loopback. The `serve` compatibility aliases keep
+their `--insecure` flag.
 
 The `--stdio` control transport is newline-delimited JSON-RPC 2.0. Probe it
 without spending model tokens:
@@ -212,12 +214,12 @@ codewhale doctor --json
 ## HTTP/SSE runtime API: `codewhale app-server --http`
 
 ```bash
-codewhale app-server --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN]
-codewhale app-server --mobile [--host 0.0.0.0] [--port 7878] [--auth-token TOKEN]
+codewhale app-server --http [--host 127.0.0.1] [--port 7878] [--workers 2] [--auth-token TOKEN] [--insecure-no-auth]
+codewhale app-server --mobile [--host 0.0.0.0] [--port 7878] [--auth-token TOKEN] [--insecure-no-auth]
 
-# Compatibility aliases — identical server, same flags:
-codewhale serve --http   [...]
-codewhale serve --mobile [...]
+# Compatibility aliases — identical server, serve flag names:
+codewhale serve --http   [...] [--insecure]
+codewhale serve --mobile [...] [--insecure]
 ```
 
 Defaults: host `127.0.0.1`, port `7878`, 2 workers (clamped 1–8).
@@ -225,7 +227,9 @@ Defaults: host `127.0.0.1`, port `7878`, 2 workers (clamped 1–8).
 The server binds to `localhost` by default. Configuration is via CLI flags —
 there is no `[app_server]` config section.
 
-`/v1/*` routes require a bearer token unless `--insecure` is explicitly set.
+`/v1/*` routes require a bearer token unless `codewhale app-server` is started
+with `--insecure-no-auth`. The `codewhale serve` compatibility aliases use
+`--insecure` for the same trusted-loopback escape hatch.
 Pass `--auth-token TOKEN` or set `DEEPSEEK_RUNTIME_TOKEN=TOKEN` before starting
 the server. If neither is set, the process generates a one-time token and prints
 it at startup. `/health` and `/v1/runtime/info` remain public for local
