@@ -718,7 +718,12 @@ fn request_has_runtime_token(req: &Request, expected: &str) -> bool {
             .get("x-deepseek-runtime-token")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|token| token == expected)
-        || token_from_query(req.uri().query()).is_some_and(|token| token == expected)
+        || token_from_cookie_header(
+            req.headers()
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .is_some_and(|token| token == expected)
 }
 
 fn runtime_token_required_response() -> Response {
@@ -734,12 +739,13 @@ fn runtime_token_required_response() -> Response {
         .into_response()
 }
 
-fn token_from_query(query: Option<&str>) -> Option<String> {
-    query.and_then(|query| {
-        query.split('&').find_map(|pair| {
+fn token_from_cookie_header(cookie: Option<&str>) -> Option<String> {
+    cookie.and_then(|cookie| {
+        cookie.split(';').find_map(|pair| {
+            let pair = pair.trim();
             let (key, value) = pair.split_once('=')?;
-            (key == "token")
-                .then(|| percent_decode_query_component(value))
+            (key == RUNTIME_TOKEN_COOKIE)
+                .then(|| percent_decode_query_component(value.trim()))
                 .flatten()
         })
     })
@@ -780,43 +786,32 @@ async fn mobile_page(State(state): State<RuntimeApiState>, req: Request) -> Resp
         )
             .into_response();
     }
-    if let Some(expected) = state.runtime_token.as_deref()
-        && !request_has_runtime_token(&req, expected)
-    {
-        return runtime_token_required_response();
-    }
+    let _ = req;
     Html(MOBILE_HTML).into_response()
 }
 
-fn print_mobile_urls(addr: SocketAddr, token: Option<&str>, auth_enabled: bool, show_qr: bool) {
+fn print_mobile_urls(addr: SocketAddr, _token: Option<&str>, auth_enabled: bool, show_qr: bool) {
     println!("Mobile control page enabled.");
-    let token_query = if auth_enabled {
-        token
-            .filter(|token| !token.trim().is_empty())
-            .map(|token| format!("?token={}", url_query_component(token)))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
 
     let port = addr.port();
     let qr_url = if addr.ip().is_unspecified() {
-        println!("  Local: http://127.0.0.1:{port}/mobile{token_query}");
+        println!("  Local: http://127.0.0.1:{port}/mobile");
         if let Some(ip) = detect_lan_ip() {
-            let lan_url = format!("http://{ip}:{port}/mobile{token_query}");
+            let lan_url = format!("http://{ip}:{port}/mobile");
             println!("  LAN:   {lan_url}");
             lan_url
         } else {
-            println!(
-                "  LAN:   bind is 0.0.0.0; open http://<this-machine-ip>:{port}/mobile{token_query}"
-            );
-            format!("http://127.0.0.1:{port}/mobile{token_query}")
+            println!("  LAN:   bind is 0.0.0.0; open http://<this-machine-ip>:{port}/mobile");
+            format!("http://127.0.0.1:{port}/mobile")
         }
     } else {
-        let url = format!("http://{addr}/mobile{token_query}");
+        let url = format!("http://{addr}/mobile");
         println!("  URL:   {url}");
         url
     };
+    if auth_enabled {
+        println!("  Enter the runtime token in the page connection field.");
+    }
     println!("Mobile security: use only on a trusted LAN/VPN; this server does not provide TLS.");
 
     if show_qr {
@@ -832,6 +827,7 @@ fn print_mobile_urls(addr: SocketAddr, token: Option<&str>, auth_enabled: bool, 
     }
 }
 
+#[cfg(test)]
 fn url_query_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -3289,6 +3285,7 @@ fn snapshot_entries_for_workspace(
 }
 
 const MOBILE_HTML: &str = include_str!("runtime_mobile.html");
+const RUNTIME_TOKEN_COOKIE: &str = "codewhale_runtime_token";
 
 /// Built-in dev origins always allowed by the runtime API (whalescale#255).
 const DEFAULT_CORS_ORIGINS: &[&str] = &[

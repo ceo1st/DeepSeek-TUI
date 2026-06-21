@@ -385,12 +385,17 @@ fn url_query_component_percent_encodes_token() {
 }
 
 #[test]
-fn token_from_query_decodes_percent_encoded_token() {
+fn token_from_cookie_header_decodes_percent_encoded_token() {
     assert_eq!(
-        token_from_query(Some("since_seq=0&token=abc%20ABC%2B%2F%3F%3A%3D%26%25")),
+        token_from_cookie_header(Some(
+            "theme=dark; codewhale_runtime_token=abc%20ABC%2B%2F%3F%3A%3D%26%25"
+        )),
         Some("abc ABC+/?:=&%".to_string())
     );
-    assert_eq!(token_from_query(Some("token=bad%ZZ")), None);
+    assert_eq!(
+        token_from_cookie_header(Some("codewhale_runtime_token=bad%ZZ")),
+        None
+    );
 }
 
 async fn spawn_test_server_with_root(
@@ -729,9 +734,19 @@ async fn runtime_token_guard_protects_v1_routes() -> Result<()> {
     let query_token = client
         .get(format!("http://{addr}/v1/threads/summary?token={token}"))
         .send()
+        .await?;
+    assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
+
+    let cookie_token = client
+        .get(format!("http://{addr}/v1/threads/summary"))
+        .header(
+            header::COOKIE,
+            format!("codewhale_runtime_token={}", url_query_component(&token)),
+        )
+        .send()
         .await?
         .error_for_status()?;
-    assert_eq!(query_token.status(), StatusCode::OK);
+    assert_eq!(cookie_token.status(), StatusCode::OK);
 
     let codewhale_header = client
         .get(format!("http://{addr}/v1/threads/summary"))
@@ -3108,7 +3123,7 @@ async fn mobile_page_is_available_only_when_enabled() -> Result<()> {
 }
 
 #[tokio::test]
-async fn mobile_page_requires_runtime_token_when_auth_enabled() -> Result<()> {
+async fn mobile_page_serves_shell_when_auth_enabled() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().to_path_buf();
     let sessions_dir = root.join("sessions");
@@ -3121,16 +3136,14 @@ async fn mobile_page_requires_runtime_token_when_auth_enabled() -> Result<()> {
     };
     let client = crate::tls::reqwest_client();
 
-    let unauthorized = client.get(format!("http://{addr}/mobile")).send().await?;
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-    let encoded = url_query_component(&token);
-    let query = client
-        .get(format!("http://{addr}/mobile?token={encoded}"))
+    let shell = client
+        .get(format!("http://{addr}/mobile"))
         .send()
         .await?
         .error_for_status()?;
-    assert!(query.text().await?.contains("CodeWhale Mobile"));
+    let html = shell.text().await?;
+    assert!(html.contains("CodeWhale Mobile"));
+    assert!(html.contains("TOKEN_COOKIE"));
 
     let bearer = client
         .get(format!("http://{addr}/mobile"))
