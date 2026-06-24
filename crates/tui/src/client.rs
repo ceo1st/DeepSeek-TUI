@@ -1119,6 +1119,10 @@ impl DeepSeekClient {
                 family: None,
                 limit: None,
                 cost: None,
+                // The chat-model listing endpoint does not state modalities; a
+                // future per-provider catalog adapter can fill this in. Left
+                // unknown rather than assumed text-only.
+                modalities: None,
                 reasoning: None,
                 reasoning_options: Vec::new(),
                 source: CatalogSource::Live {

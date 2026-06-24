@@ -104,6 +104,7 @@
   "CmdModeDescription": "切换运行模式或打开选择器：/mode [agent|plan|yolo|1|2|3]",
   "CmdModelDescription": "切换或查看当前模型",
   "CmdModelsDescription": "列出 API 中可用的模型",
+  "CmdModelDbDescription": "浏览内置的模型参考数据库",
   "CmdNetworkDescription": "管理网络允许和拒绝规则",
   "CmdNoteDescription": "添加、列出、编辑或删除工作区笔记",
   "CmdThemeDescription": "切换主题：深色、浅色、灰度或系统",

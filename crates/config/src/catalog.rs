@@ -34,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::models_dev::{ModelsDevCatalog, ModelsDevCost, ModelsDevLimit};
+use crate::models_dev::{ModelsDevCatalog, ModelsDevCost, ModelsDevLimit, ModelsDevModalities};
 use crate::route::{ModelId, ProviderId, ProviderModelOffering, RouteLimits, WireModelId};
 
 /// Provenance of a catalog row. Drives layer precedence and UI provenance.
@@ -84,6 +84,12 @@ pub struct CatalogOffering {
     /// Provider-scoped pricing, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelsDevCost>,
+    /// Input/output modalities for this offering, when known. Carried as the
+    /// raw Models.dev shape so a factual `text` vs `multimodal` label can be
+    /// derived without guessing; `None` means the layer did not state it (an
+    /// unknown, not "text-only").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<ModelsDevModalities>,
     /// Whether this offering supports reasoning, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
@@ -202,6 +208,7 @@ pub fn bundled_offerings_from_models_dev(catalog: &ModelsDevCatalog) -> Vec<Cata
                 family: model.family.clone(),
                 limit: model.limit.clone(),
                 cost: model.cost.clone(),
+                modalities: model.modalities.clone(),
                 reasoning: model.reasoning,
                 reasoning_options: model.reasoning_options.clone(),
                 source: CatalogSource::Bundled,

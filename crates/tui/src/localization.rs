@@ -325,6 +325,7 @@ pub enum MessageId {
     CmdModeDescription,
     CmdModelDescription,
     CmdModelsDescription,
+    CmdModelDbDescription,
     CmdNetworkDescription,
     CmdNoteDescription,
     CmdThemeDescription,
@@ -778,6 +779,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdModeDescription,
     MessageId::CmdModelDescription,
     MessageId::CmdModelsDescription,
+    MessageId::CmdModelDbDescription,
     MessageId::CmdNetworkDescription,
     MessageId::CmdNoteDescription,
     MessageId::CmdProviderDescription,
@@ -1435,6 +1437,7 @@ fn english(id: MessageId) -> &'static str {
         }
         MessageId::CmdModelDescription => "Switch or view current model",
         MessageId::CmdModelsDescription => "List available models from API",
+        MessageId::CmdModelDbDescription => "Browse the bundled model reference database",
         MessageId::CmdNetworkDescription => "Manage network allow and deny rules",
         MessageId::CmdNoteDescription => "Add, list, edit, or remove workspace notes",
         MessageId::CmdThemeDescription => "Switch theme or open the theme picker",
@@ -2062,6 +2065,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdModelDescription => "Chuyển đổi hoặc xem mô hình AI hiện tại",
         MessageId::CmdModelsDescription => "Liệt kê các mô hình khả dụng từ API",
+        MessageId::CmdModelDbDescription => "Duyệt cơ sở dữ liệu tham chiếu mô hình tích hợp",
         MessageId::CmdNetworkDescription => "Quản lý các quy tắc cho phép và từ chối mạng",
         MessageId::CmdNoteDescription => {
             "Thêm, liệt kê, sửa hoặc xóa ghi chú trong không gian làm việc"
@@ -2899,6 +2903,7 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdModelDescription => "現在のモデルを切り替え・確認",
         MessageId::CmdModelsDescription => "API から利用可能なモデルを一覧表示",
+        MessageId::CmdModelDbDescription => "内蔵のモデルリファレンスデータベースを閲覧",
         MessageId::CmdNetworkDescription => "ネットワーク許可・拒否ルールを管理",
         MessageId::CmdNoteDescription => "ワークスペースノートの追加、一覧、編集、削除",
         MessageId::CmdThemeDescription => {
@@ -3532,6 +3537,9 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdModelDescription => "Trocar ou exibir o modelo atual",
         MessageId::CmdModelsDescription => "Listar os modelos disponíveis pela API",
+        MessageId::CmdModelDbDescription => {
+            "Navegar pelo banco de dados de referência de modelos integrado"
+        }
         MessageId::CmdNetworkDescription => "Gerenciar regras de rede permitidas e bloqueadas",
         MessageId::CmdNoteDescription => "Adicionar, listar, editar ou remover notas do workspace",
         MessageId::CmdThemeDescription => "Alternar tema: escuro, claro, tons de cinza ou sistema",
@@ -4176,6 +4184,9 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdModelDescription => "Cambiar o mostrar el modelo actual",
         MessageId::CmdModelsDescription => "Listar los modelos disponibles por la API",
+        MessageId::CmdModelDbDescription => {
+            "Explorar la base de datos de referencia de modelos integrada"
+        }
         MessageId::CmdNetworkDescription => "Gestionar reglas de red permitidas y bloqueadas",
         MessageId::CmdNoteDescription => {
             "Agregar nota al archivo persistente (.codewhale/notes.md)"

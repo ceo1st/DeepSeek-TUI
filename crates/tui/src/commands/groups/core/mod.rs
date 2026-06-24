@@ -20,6 +20,7 @@ mod home;
 mod hooks;
 mod links;
 mod model;
+mod modeldb;
 mod models;
 mod profile;
 mod provider;
@@ -66,6 +67,10 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(
                 models::ModelsCmd::info(),
                 models::ModelsCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                modeldb::ModelDbCmd::info(),
+                modeldb::ModelDbCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 provider::ProviderCmd::info(),
