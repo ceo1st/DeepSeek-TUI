@@ -9169,6 +9169,88 @@ fn recoverable_provider_error_advances_fallback_chain() {
     );
 }
 
+/// #2574 acceptance: auth (401) errors must never trigger provider fallback,
+/// even when marked recoverable — the exclusion is by error *category*, not
+/// recoverability (the gate lives at this call site, not inside the chain
+/// walk). A bad key requires user intervention, not a silent rotation.
+#[test]
+fn auth_error_does_not_trigger_provider_fallback() {
+    use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
+
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    // Not env-only, so we exercise the category gate rather than the env-key
+    // onboarding early-return.
+    app.api_key_env_only = false;
+    app.provider_chain = Some(codewhale_config::ProviderChain::new(
+        codewhale_config::ProviderKind::Deepseek,
+        &[codewhale_config::ProviderKind::Openrouter],
+    ));
+
+    apply_engine_error_to_app(
+        &mut app,
+        ErrorEnvelope::new(
+            ErrorCategory::Authentication,
+            ErrorSeverity::Critical,
+            // Deliberately recoverable to prove the *category* is what excludes
+            // fallback, not the recoverable flag.
+            true,
+            "authentication",
+            "provider returned 401",
+        ),
+    );
+
+    assert_eq!(
+        app.api_provider,
+        ApiProvider::Deepseek,
+        "auth failure must not rotate providers"
+    );
+    assert!(!app.is_fallback_active());
+    assert_eq!(app.fallback_chain_position(), Some(0));
+    assert!(
+        app.last_fallback_reason.is_none(),
+        "no fallback should have been attempted on an auth error"
+    );
+}
+
+/// #2574 acceptance: the route switch is visible to the user with a 1-based
+/// position and the failure cause (regression guard against off-by-one position
+/// indexing in the fallback status).
+#[test]
+fn fallback_switch_status_shows_one_based_position_and_reason() {
+    use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
+
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.provider_chain = Some(codewhale_config::ProviderChain::new(
+        codewhale_config::ProviderKind::Deepseek,
+        &[codewhale_config::ProviderKind::Openrouter],
+    ));
+
+    apply_engine_error_to_app(
+        &mut app,
+        ErrorEnvelope::new(
+            ErrorCategory::RateLimit,
+            ErrorSeverity::Warning,
+            true,
+            "rate_limit",
+            "provider returned 429",
+        ),
+    );
+
+    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(
+        app.fallback_chain_position(),
+        Some(1),
+        "first fallback sits at 1-based position 1"
+    );
+    let status = app.status_message.as_deref().unwrap_or_default();
+    assert!(
+        status.contains("Switched to openrouter") && status.contains("(fallback 1/"),
+        "visible status must show the destination and 1-based position: {status}"
+    );
+}
+
 #[tokio::test]
 async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     use crate::error_taxonomy::ErrorEnvelope;
