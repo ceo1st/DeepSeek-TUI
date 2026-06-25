@@ -28,7 +28,7 @@ jobs:
             you can share the requested information.
           stale-issue-label: 'stale'
           only-labels: 'needs-info'
-          exempt-issue-labels: 'pinned,keep-open,bug,security'
+          exempt-issue-labels: 'pinned,keep-open,release-blocker,security'
           # Don't touch PRs — `actions/stale` defaults can be aggressive
           # there. We only want it for `needs-info` issues.
           days-before-pr-stale: -1
