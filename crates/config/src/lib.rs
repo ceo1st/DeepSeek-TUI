@@ -3224,8 +3224,8 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
         return Ok(());
     }
     // The primary's parent (the ~/.codewhale root) must exist for the rename.
-    if let Some(parent) = primary.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
+    if let Some(parent) = primary.parent()
+        && let Err(err) = std::fs::create_dir_all(parent) {
             tracing::warn!(
                 target: "config::migration",
                 "Could not create {} for state migration ({}); writing to primary anyway",
@@ -3233,7 +3233,6 @@ fn migrate_legacy_state_dir(primary: &Path, subdir: &str) -> Result<()> {
                 err
             );
         }
-    }
     match std::fs::rename(&legacy, primary) {
         Ok(()) => {
             tracing::info!(
