@@ -7379,6 +7379,12 @@ async fn apply_command_result(
                         ));
                 }
             }
+            AppAction::OpenHotbarSetup => {
+                if app.view_stack.top_kind() != Some(ModalKind::HotbarSetup) {
+                    app.view_stack
+                        .push(crate::tui::hotbar::setup::HotbarSetupView::new(app, config));
+                }
+            }
             AppAction::OpenExternalUrl { url, label } => match open_external_url(&url) {
                 Ok(()) => {
                     app.status_message = Some(format!("Opened {label} in your browser"));
@@ -9112,6 +9118,11 @@ async fn handle_view_events(
                         }
                     }
                 }
+            }
+            ViewEvent::HotbarSetupSaved { bindings } => {
+                config.hotbar = Some(bindings);
+                app.status_message = Some("Hotbar bindings updated for this session.".to_string());
+                app.needs_redraw = true;
             }
             ViewEvent::SubAgentsRefresh => {
                 app.status_message = Some("Refreshing sub-agents...".to_string());

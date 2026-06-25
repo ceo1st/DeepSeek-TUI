@@ -4,5 +4,6 @@
 //! the built-in actions defined here.
 
 pub mod actions;
+pub mod setup;
 
 pub use actions::HotbarActionRegistry;

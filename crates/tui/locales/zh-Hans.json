@@ -144,6 +144,7 @@
   "CmdStatusDescription": "显示当前运行状态",
   "CmdStatuslineDescription": "配置底栏要显示哪些条目",
   "CmdFleetDescription": "打开 Fleet 设置或工作器状态",
+  "CmdHotbarDescription": "打开 Hotbar 设置",
   "CmdSubagentsDescription": "/fleet status 的兼容快捷方式",
   "CmdSwarmDescription": "运行多代理扇出轮次（sequential | mixture | distill | deliberate）",
   "CmdSystemDescription": "显示当前系统提示词",

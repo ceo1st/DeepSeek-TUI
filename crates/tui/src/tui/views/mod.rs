@@ -36,6 +36,7 @@ pub enum ModalKind {
     ProviderPicker,
     ModePicker,
     FleetSetup,
+    HotbarSetup,
     FilePicker,
     StatusPicker,
     FeedbackPicker,
@@ -192,6 +193,12 @@ pub enum ViewEvent {
     StatusItemsUpdated {
         items: Vec<crate::config::StatusItem>,
         final_save: bool,
+    },
+    /// Emitted by the `/hotbar` setup wizard when the user saves the draft
+    /// bindings. The host updates live config state; disk persistence is
+    /// handled by the follow-up persistence slice.
+    HotbarSetupSaved {
+        bindings: Vec<codewhale_config::HotbarBindingToml>,
     },
     /// Emitted by the live-transcript overlay while in backtrack preview
     /// mode (#133) when the user steps the highlighted user message with

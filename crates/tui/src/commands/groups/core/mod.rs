@@ -18,6 +18,7 @@ mod help;
 mod hf;
 mod home;
 mod hooks;
+mod hotbar;
 mod links;
 mod model;
 mod modeldb;
@@ -94,6 +95,10 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(
                 fleet::FleetCmd::info(),
                 fleet::FleetCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                hotbar::HotbarCmd::info(),
+                hotbar::HotbarCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 agent::AgentCmd::info(),

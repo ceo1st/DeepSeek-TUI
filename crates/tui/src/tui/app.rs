@@ -5832,6 +5832,8 @@ pub enum AppAction {
     OpenThemePicker,
     /// Open the `/fleet` setup and loadout planner.
     OpenFleetSetup,
+    /// Open the `/hotbar` setup wizard.
+    OpenHotbarSetup,
     /// Open an external URL in the system browser.
     OpenExternalUrl {
         url: String,

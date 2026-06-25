@@ -365,6 +365,7 @@ pub enum MessageId {
     CmdStatusDescription,
     CmdStatuslineDescription,
     CmdFleetDescription,
+    CmdHotbarDescription,
     CmdSubagentsDescription,
     CmdSystemDescription,
     CmdTaskDescription,
@@ -816,6 +817,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdStatusDescription,
     MessageId::CmdStatuslineDescription,
     MessageId::CmdFleetDescription,
+    MessageId::CmdHotbarDescription,
     MessageId::CmdSubagentsDescription,
     MessageId::CmdSystemDescription,
     MessageId::CmdTaskDescription,
@@ -1489,6 +1491,7 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CmdStatusDescription => "Show runtime session status",
         MessageId::CmdStatuslineDescription => "Configure which items appear in the footer",
         MessageId::CmdFleetDescription => "Open Fleet setup or worker status",
+        MessageId::CmdHotbarDescription => "Open Hotbar setup",
         MessageId::CmdSubagentsDescription => "Compatibility shortcut for /fleet status",
         MessageId::CmdSystemDescription => "Show current system prompt",
         MessageId::CmdTaskDescription => "Manage background tasks",
@@ -2126,6 +2129,7 @@ fn vietnamese(id: MessageId) -> Option<&'static str> {
             "Cấu hình các mục hiển thị ở thanh trạng thái dưới cùng"
         }
         MessageId::CmdFleetDescription => "Mở thiết lập Fleet hoặc trạng thái worker",
+        MessageId::CmdHotbarDescription => "Mở thiết lập Hotbar",
         MessageId::CmdSubagentsDescription => "Lối tắt tương thích cho /fleet status",
         MessageId::CmdSystemDescription => "Hiển thị prompt hệ thống hiện tại",
         MessageId::CmdTaskDescription => "Quản lý các nhiệm vụ chạy ngầm",
@@ -2953,6 +2957,7 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::CmdStatusDescription => "実行中のセッション状態を表示",
         MessageId::CmdStatuslineDescription => "フッターに表示する項目を設定",
         MessageId::CmdFleetDescription => "Fleet設定またはワーカー状態を開く",
+        MessageId::CmdHotbarDescription => "Hotbar設定を開く",
         MessageId::CmdSubagentsDescription => "/fleet status の互換ショートカット",
         MessageId::CmdSystemDescription => "現在のシステムプロンプトを表示",
         MessageId::CmdTaskDescription => "バックグラウンドタスクを管理",
@@ -3590,6 +3595,7 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::CmdStatusDescription => "Exibir o status da sessão em execução",
         MessageId::CmdStatuslineDescription => "Configurar quais itens aparecem no rodapé",
         MessageId::CmdFleetDescription => "Abrir configuração Fleet ou status dos workers",
+        MessageId::CmdHotbarDescription => "Abrir configuração da Hotbar",
         MessageId::CmdSubagentsDescription => "Atalho compatível para /fleet status",
         MessageId::CmdSystemDescription => "Exibir o prompt de sistema atual",
         MessageId::CmdTaskDescription => "Gerenciar tarefas em segundo plano",
@@ -4238,6 +4244,7 @@ fn spanish_latin_america(id: MessageId) -> Option<&'static str> {
             "Configurar qué elementos aparecen en el pie de página"
         }
         MessageId::CmdFleetDescription => "Abrir configuración Fleet o estado de workers",
+        MessageId::CmdHotbarDescription => "Abrir configuración de Hotbar",
         MessageId::CmdSubagentsDescription => "Atajo compatible para /fleet status",
         MessageId::CmdSystemDescription => "Mostrar el prompt de sistema actual",
         MessageId::CmdTaskDescription => "Gestionar tareas en segundo plano",
