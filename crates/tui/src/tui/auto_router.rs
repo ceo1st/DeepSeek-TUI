@@ -33,10 +33,11 @@ pub(super) async fn resolve_auto_model_selection(
     } else {
         latest_content
     };
-    model_routing::resolve_auto_route_with_inventory(
+    model_routing::resolve_auto_route_with_inventory_for_session(
         config,
         latest_request,
         &recent_auto_router_context(&app.api_messages),
+        app.mode.as_setting(),
         if app.auto_model { "auto" } else { "fixed" },
         app.reasoning_effort
             .as_setting_for_provider(app.api_provider),

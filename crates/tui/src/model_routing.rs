@@ -393,6 +393,26 @@ pub(crate) async fn resolve_auto_route_with_flash(
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> AutoRouteSelection {
+    resolve_auto_route_with_flash_for_session(
+        config,
+        latest_request,
+        recent_context,
+        "agent",
+        selected_model_mode,
+        selected_thinking_mode,
+    )
+    .await
+}
+
+#[allow(dead_code)] // superseded by the route-effective inventory resolver (#3205).
+pub(crate) async fn resolve_auto_route_with_flash_for_session(
+    config: &Config,
+    latest_request: &str,
+    recent_context: &str,
+    session_mode: &str,
+    selected_model_mode: &str,
+    selected_thinking_mode: &str,
+) -> AutoRouteSelection {
     let cost_saving = config.auto_cost_saving();
     // #3018: derive the candidate pair from the active provider. The
     // config-resolved default model stands in for the session model — with
@@ -419,6 +439,7 @@ pub(crate) async fn resolve_auto_route_with_flash(
         &candidates,
         latest_request,
         recent_context,
+        session_mode,
         selected_model_mode,
         selected_thinking_mode,
     )
@@ -467,6 +488,25 @@ pub(crate) async fn resolve_auto_route_with_inventory(
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> Result<AutoRouteSelection> {
+    resolve_auto_route_with_inventory_for_session(
+        config,
+        latest_request,
+        recent_context,
+        "agent",
+        selected_model_mode,
+        selected_thinking_mode,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_auto_route_with_inventory_for_session(
+    config: &Config,
+    latest_request: &str,
+    recent_context: &str,
+    session_mode: &str,
+    selected_model_mode: &str,
+    selected_thinking_mode: &str,
+) -> Result<AutoRouteSelection> {
     let inventory = ModelInventory::from_config(config);
     if !inventory.router_available {
         // Fall back to heuristic-only auto routing when the flash router
@@ -488,6 +528,7 @@ pub(crate) async fn resolve_auto_route_with_inventory(
         &inventory,
         latest_request,
         recent_context,
+        session_mode,
         selected_model_mode,
         selected_thinking_mode,
     )
@@ -619,6 +660,7 @@ async fn auto_route_inventory_recommendation(
     inventory: &ModelInventory,
     latest_request: &str,
     recent_context: &str,
+    session_mode: &str,
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> Result<Option<InventoryAutoRouteRecommendation>> {
@@ -636,6 +678,7 @@ async fn auto_route_inventory_recommendation(
                 text: auto_route_prompt(
                     latest_request,
                     recent_context,
+                    session_mode,
                     selected_model_mode,
                     selected_thinking_mode,
                 ),
@@ -706,6 +749,7 @@ async fn auto_route_flash_recommendation(
     candidates: &RouterCandidates,
     latest_request: &str,
     recent_context: &str,
+    session_mode: &str,
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> Result<Option<AutoRouteRecommendation>> {
@@ -728,6 +772,7 @@ async fn auto_route_flash_recommendation(
                 text: auto_route_prompt(
                     latest_request,
                     recent_context,
+                    session_mode,
                     selected_model_mode,
                     selected_thinking_mode,
                 ),
@@ -757,11 +802,13 @@ async fn auto_route_flash_recommendation(
 fn auto_route_prompt(
     latest_request: &str,
     recent_context: &str,
+    session_mode: &str,
     selected_model_mode: &str,
     selected_thinking_mode: &str,
 ) -> String {
     format!(
-        "Session mode: agent\nSelected model mode: {}\nSelected thinking mode: {}\n\nRecent context:\n{}\n\nLatest user request:\n{}\n\nReturn JSON only.",
+        "Session mode: {}\nSelected model mode: {}\nSelected thinking mode: {}\n\nRecent context:\n{}\n\nLatest user request:\n{}\n\nReturn JSON only.",
+        session_mode,
         selected_model_mode,
         selected_thinking_mode,
         if recent_context.trim().is_empty() {
@@ -909,6 +956,22 @@ mod tests {
             selection.confidence,
             AutoModelHeuristicConfidence::Ambiguous,
             "only the grey-zone default branch should invoke the Flash router"
+        );
+    }
+
+    #[test]
+    fn auto_route_prompt_uses_current_session_mode() {
+        let prompt = auto_route_prompt(
+            "Please explain the change before editing files.",
+            "No prior context.",
+            "plan",
+            "auto",
+            "auto",
+        );
+
+        assert!(
+            prompt.starts_with("Session mode: plan\n"),
+            "auto-route prompt should reflect the active session mode, got: {prompt}"
         );
     }
 
