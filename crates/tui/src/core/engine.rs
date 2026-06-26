@@ -656,6 +656,15 @@ fn subagent_mailbox_best_effort_send_permitted(
 }
 
 impl Engine {
+    fn mode_runtime_instructions(mode: AppMode) -> &'static str {
+        match mode {
+            AppMode::Agent => prompts::AGENT_MODE,
+            AppMode::Plan => prompts::PLAN_MODE,
+            AppMode::Yolo => prompts::YOLO_MODE,
+        }
+        .trim()
+    }
+
     pub(super) async fn emit_compaction_started(
         &mut self,
         id: String,
@@ -1886,6 +1895,12 @@ impl Engine {
             // `render_environment_block` for the prefix-cache rationale).
             format!("Current workspace: {}", self.config.workspace.display()),
             format!("Current model: {routed_model}"),
+            format!("Current mode: {}", self.current_mode.as_setting()),
+            "Current mode policy source: runtime".to_string(),
+            format!(
+                "Current mode policy:\n{}",
+                Self::mode_runtime_instructions(self.current_mode)
+            ),
             format!("Input provenance: {}", provenance.as_str()),
             format!(
                 "Input authority: {}",

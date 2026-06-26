@@ -4027,32 +4027,40 @@ fn review_only_external_input_keeps_explicit_mode_with_advisory_hint() {
 }
 
 #[test]
-fn turn_metadata_omits_mode_policy() {
+fn turn_metadata_includes_plan_mode_policy() {
     let tmp = tempdir().expect("tempdir");
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         ..Default::default()
     };
-    let (engine, _handle) = Engine::new(config, &Config::default());
+    let (mut engine, _handle) = Engine::new(config, &Config::default());
+    engine.current_mode = AppMode::Plan;
 
     let user_msg = engine.user_text_message_with_turn_metadata_for_route(
-        "test mode metadata".to_string(),
+        "explain the refactor plan before editing".to_string(),
         "deepseek-v4-flash",
         false,
         None,
         false,
     );
-    // turn_meta was relocated to the tail of the user message in #2517
-    // to keep the leading bytes (user input) stable across date / model
-    // route / working-set changes.
     let last_block = user_msg.content.last().expect("turn metadata block");
     let ContentBlock::Text { text, .. } = last_block else {
         panic!("expected text metadata block");
     };
 
+    assert!(text.contains("Current mode: plan"), "got: {text}");
     assert!(
-        !text.contains("Current mode:"),
-        "turn metadata should leave runtime policy to the capability tag, got: {text}"
+        text.contains("Current mode policy source: runtime"),
+        "got: {text}"
+    );
+    assert!(text.contains("##### Mode: Plan"), "got: {text}");
+    assert!(
+        text.contains("All writes and patches are blocked"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("Shell and code execution are unavailable"),
+        "got: {text}"
     );
 }
 
