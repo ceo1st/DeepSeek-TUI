@@ -143,7 +143,12 @@ fn plugin_list(_app: &App) -> CommandResult {
         }
 
         let mut out = String::new();
-        out.push_str(&format!("Plugins ({})\n", r.len()));
+        let enabled_count = r.enabled_plugins().len();
+        out.push_str(&format!(
+            "Plugins ({}, {} enabled)\n",
+            r.len(),
+            enabled_count
+        ));
         out.push_str(&"=".repeat(40));
         out.push('\n');
 

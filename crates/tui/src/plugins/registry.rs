@@ -49,11 +49,11 @@ impl PluginRegistry {
     }
 
     pub fn enabled_plugins(&self) -> Vec<(&String, &LoadedPlugin)> {
-        self.plugins.iter().filter(|(_, p)| p.enabled).collect()
+        self.list_enabled()
     }
 
     pub fn list_enabled(&self) -> Vec<(&String, &LoadedPlugin)> {
-        self.enabled_plugins()
+        self.plugins.iter().filter(|(_, p)| p.enabled).collect()
     }
 
     pub fn is_enabled(&self, name: &str) -> bool {
