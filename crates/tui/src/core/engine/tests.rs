@@ -5048,6 +5048,28 @@ fn filter_tool_call_delta_strips_siliconflow_v4_dsml_content_fixture() {
 }
 
 #[test]
+fn filter_tool_call_delta_strips_fullwidth_dsml_invoke_fixture() {
+    // #3717: Windows users reported SiliconFlow/DSML content leaking through
+    // the ordinary text channel with fullwidth DSML wrapper tags. Treat it as
+    // non-API tool markup, not visible assistant text.
+    let mut in_block = false;
+    let visible = filter_tool_call_delta(
+        "visible prefix <｜DSML｜tool_calls>\n\
+         <｜DSML｜invoke name=\"read_file\">\n\
+         <｜DSML｜parameter name=\"path\" string=\"true\">backend/open_webui/utils/auth.py</｜DSML｜parameter>\n\
+         </｜DSML｜invoke>\n\
+         </｜DSML｜tool_calls> visible suffix",
+        &mut in_block,
+    );
+
+    assert!(!in_block);
+    assert_eq!(visible, "visible prefix  visible suffix");
+    assert!(!visible.contains("DSML"));
+    assert!(!visible.contains("read_file"));
+    assert!(!visible.contains("backend/open_webui"));
+}
+
+#[test]
 fn filter_tool_call_delta_handles_chunk_split_marker() {
     let mut in_block = false;
     // First chunk opens the wrapper but does not close it.

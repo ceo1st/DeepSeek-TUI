@@ -127,20 +127,22 @@ pub(super) fn stream_read_error_user_message(message: &str, any_content_received
     )
 }
 
-pub(crate) const TOOL_CALL_START_MARKERS: [&str; 5] = [
+pub(crate) const TOOL_CALL_START_MARKERS: [&str; 6] = [
     "[TOOL_CALL]",
     "<codewhale:tool_call",
     "<tool_call",
     "<invoke ",
     "<function_calls>",
+    "<｜DSML｜tool_calls>",
 ];
 
-pub(crate) const TOOL_CALL_END_MARKERS: [&str; 5] = [
+pub(crate) const TOOL_CALL_END_MARKERS: [&str; 6] = [
     "[/TOOL_CALL]",
     "</codewhale:tool_call>",
     "</tool_call>",
     "</invoke>",
     "</function_calls>",
+    "</｜DSML｜tool_calls>",
 ];
 
 /// Compact one-shot notice emitted when a model attempts to forge a tool-call
