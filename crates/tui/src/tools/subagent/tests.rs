@@ -5020,3 +5020,28 @@ async fn per_worker_token_budget_does_not_double_count_scope_accounting() {
         worker_record.usage
     );
 }
+
+#[test]
+fn cleanup_due_gates_write_locked_cleanup_to_a_bounded_cadence() {
+    // #3803: a fresh manager is always due (never cleaned); right after a
+    // cleanup it is not due again until the interval elapses, so the sidebar
+    // refresh (Op::ListSubAgents) renders from the read-only snapshot in
+    // between instead of taking the write lock on every request.
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+
+    assert!(
+        manager.cleanup_due(Duration::from_secs(2)),
+        "a never-cleaned manager should be due"
+    );
+
+    manager.cleanup(Duration::from_secs(3600));
+    assert!(
+        !manager.cleanup_due(Duration::from_secs(3600)),
+        "immediately after cleanup it should not be due again within the interval"
+    );
+    assert!(
+        manager.cleanup_due(Duration::from_secs(0)),
+        "a zero interval is always due"
+    );
+}

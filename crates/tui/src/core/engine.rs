@@ -1523,10 +1523,24 @@ impl Engine {
                         }
                     }
                     Op::ListSubAgents => {
-                        let agents = {
+                        // #3803: the sidebar refresh is a read-only snapshot.
+                        // Render from a read lock; only take the write lock to
+                        // run cleanup on a bounded cadence, so a UI refresh storm
+                        // during a sub-agent fanout no longer contends for the
+                        // write lock (against completions/persistence) on every
+                        // request. Cleanup still auto-cancels stale agents.
+                        let due = {
+                            let manager = self.subagent_manager.read().await;
+                            manager.cleanup_due(
+                                crate::tools::subagent::SUBAGENT_LIST_CLEANUP_MIN_INTERVAL,
+                            )
+                        };
+                        let agents = if due {
                             let mut manager = self.subagent_manager.write().await;
                             manager.cleanup(Duration::from_secs(60 * 60));
                             manager.list()
+                        } else {
+                            self.subagent_manager.read().await.list()
                         };
                         let _ = self.tx_event.send(Event::AgentList { agents }).await;
                     }

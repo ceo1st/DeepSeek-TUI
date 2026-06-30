@@ -131,6 +131,13 @@ const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
 /// checkpoints) to disk.
 const SUBAGENT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(1500);
 
+/// #3803: minimum interval between write-locked `cleanup` runs triggered by the
+/// sidebar refresh (`Op::ListSubAgents`). Cleanup auto-cancels stale agents
+/// (heartbeat timeout, default 300s) and drops old finished records, so a 2s
+/// floor keeps it responsive while preventing per-refresh write-lock contention
+/// during a high-fanout burst.
+pub const SUBAGENT_LIST_CLEANUP_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
 /// #freeze: lightweight perf counters for the sub-agent persist hot path,
 /// gated behind `CODEWHALE_SUBAGENT_PERF_TRACE=1`. The atomic increments are
 /// always cheap; only the structured `subagent_perf` log line is gated.
@@ -1806,6 +1813,11 @@ pub struct SubAgentManager {
     /// capture the most recent checkpoint.
     last_persist_at: Option<Instant>,
     persist_pending: bool,
+    /// #3803: last time `cleanup` ran. The sidebar refresh (`Op::ListSubAgents`)
+    /// renders from a read-only `list()` snapshot and only runs the
+    /// write-locked `cleanup` on a bounded cadence, so a UI refresh storm during
+    /// a sub-agent fanout no longer contends for the write lock on every request.
+    last_cleanup_at: Option<Instant>,
 }
 
 impl SubAgentManager {
@@ -1833,6 +1845,7 @@ impl SubAgentManager {
             launch_gate: Arc::new(Semaphore::new(max_agents.max(1))),
             last_persist_at: None,
             persist_pending: false,
+            last_cleanup_at: None,
         }
     }
 
@@ -2872,7 +2885,18 @@ impl SubAgentManager {
         if self.agents.len() != before || auto_cancelled > 0 {
             self.persist_state_best_effort();
         }
+        self.last_cleanup_at = Some(Instant::now());
         auto_cancelled
+    }
+
+    /// #3803: whether enough time has elapsed since the last `cleanup` that the
+    /// next sidebar refresh should run the write-locked cleanup again. Every
+    /// other refresh renders from the read-only `list()` snapshot, so a UI
+    /// refresh storm during a fanout does not take the write lock per request.
+    #[must_use]
+    pub fn cleanup_due(&self, min_interval: Duration) -> bool {
+        self.last_cleanup_at
+            .map_or(true, |last| last.elapsed() >= min_interval)
     }
 
     fn update_from_result(&mut self, agent_id: &str, result: SubAgentResult) {
