@@ -2051,6 +2051,25 @@ mod tests {
     }
 
     #[test]
+    fn back_keys_return_to_previous_step_and_clamp_at_first() {
+        let mut view = SetupWizardView::new(SetupState::default(), Locale::En);
+        assert_eq!(view.selected_step(), SetupStep::Constitution);
+
+        let action = view.handle_key(key(KeyCode::Right));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(view.selected_step(), SetupStep::Verification);
+
+        let action = view.handle_key(key(KeyCode::Char('b')));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(view.selected_step(), SetupStep::Constitution);
+
+        for _ in 0..STEP_SPECS.len() {
+            view.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(view.selected_step(), SetupStep::Language);
+    }
+
+    #[test]
     fn cancel_closes_without_commit_event() {
         let mut view = SetupWizardView::new(SetupState::default(), Locale::En);
 
