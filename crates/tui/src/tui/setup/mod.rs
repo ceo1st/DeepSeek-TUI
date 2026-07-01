@@ -151,6 +151,7 @@ impl SetupWizardView {
         Self::new(load_setup_state_for_app(app, config), app.ui_locale)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn state(&self) -> &SetupState {
         &self.state
