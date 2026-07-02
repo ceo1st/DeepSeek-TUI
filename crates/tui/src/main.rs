@@ -6947,37 +6947,38 @@ async fn run_interactive(
         logging::warn(format!("Failed to install system skills: {e}"));
     }
 
-    // Prune stale workspace snapshots from prior sessions (7-day default).
-    // Non-fatal: a flaky disk, missing `git`, or read-only home should
-    // never block the TUI from starting.
+    // Boot janitors — snapshot prune (7-day default), spillover prune
+    // (#422), and managed-session cleanup (v0.8.44) — are best-effort disk
+    // hygiene. On a large ~/.codewhale they were the dominant startup cost
+    // (a git object walk plus thousands of stat/read calls), so they run on
+    // a blocking worker while the TUI brings up its first frame (#3757).
+    // All three were already documented as non-fatal.
     let snapshots = config.snapshots_config();
-    if snapshots.enabled {
-        session_manager::prune_workspace_snapshots(&workspace, snapshots.max_age());
-    }
+    let janitor_snapshots_enabled = snapshots.enabled;
+    let janitor_max_age = snapshots.max_age();
+    let janitor_workspace = workspace.clone();
+    tokio::task::spawn_blocking(move || {
+        if janitor_snapshots_enabled {
+            session_manager::prune_workspace_snapshots(&janitor_workspace, janitor_max_age);
+        }
 
-    // Prune stale tool-output spillover files (#422). Non-fatal: home
-    // missing or directory unreadable just means nothing got pruned;
-    // we never block startup. Runs unconditionally because the
-    // spillover store is created lazily on first write — there's no
-    // user-facing setting to gate.
-    match crate::tools::truncate::prune_older_than(crate::tools::truncate::SPILLOVER_MAX_AGE) {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!(
-            target: "spillover",
-            "boot prune removed {n} spillover file(s)"
-        ),
-        Err(err) => tracing::warn!(
-            target: "spillover",
-            ?err,
-            "spillover prune skipped on boot"
-        ),
-    }
+        match crate::tools::truncate::prune_older_than(crate::tools::truncate::SPILLOVER_MAX_AGE) {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(
+                target: "spillover",
+                "boot prune removed {n} spillover file(s)"
+            ),
+            Err(err) => tracing::warn!(
+                target: "spillover",
+                ?err,
+                "spillover prune skipped on boot"
+            ),
+        }
 
-    // v0.8.44: prune managed sessions on boot to prevent unbounded growth.
-    // Keeps at most MAX_SESSIONS (50) recent sessions; non-fatal on error.
-    if let Ok(manager) = session_manager::SessionManager::default_location() {
-        let _ = manager.cleanup_old_sessions();
-    }
+        if let Ok(manager) = session_manager::SessionManager::default_location() {
+            let _ = manager.cleanup_old_sessions();
+        }
+    });
 
     // The `deepseek` launcher forwards `--yolo` to this binary via the
     // DEEPSEEK_YOLO env var (config.yolo), not as a CLI flag. Honour either.

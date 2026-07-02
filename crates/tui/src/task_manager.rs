@@ -773,7 +773,7 @@ impl TaskManager {
             )
         })?;
 
-        let (tasks, queue) = load_state(&tasks_dir, &queue_path)?;
+        let (tasks, queue, recovered) = load_state(&tasks_dir, &queue_path)?;
 
         let cancel_token = CancellationToken::new();
         let default_workspace = cfg.default_workspace.clone();
@@ -794,8 +794,16 @@ impl TaskManager {
         });
 
         {
+            // Persist only what boot actually changed: the reconciled queue
+            // and any running->failed recoveries. Rewriting every task record
+            // on every launch was a full-store write storm (#3757).
             let state = manager.state.lock().await;
-            manager.persist_all_locked(&state)?;
+            manager.persist_queue_locked(&state.queue)?;
+            for id in &recovered {
+                if let Some(task) = state.tasks.get(id) {
+                    manager.persist_task_locked(task)?;
+                }
+            }
         }
 
         for _ in 0..workers {
@@ -1528,8 +1536,9 @@ fn normalize_hunt_verdict(raw: &str) -> Result<&'static str> {
 fn load_state(
     tasks_dir: &Path,
     queue_path: &Path,
-) -> Result<(HashMap<String, TaskRecord>, VecDeque<String>)> {
+) -> Result<(HashMap<String, TaskRecord>, VecDeque<String>, Vec<String>)> {
     let mut tasks = HashMap::new();
+    let mut recovered = Vec::new();
     if tasks_dir.exists() {
         for entry in fs::read_dir(tasks_dir)
             .with_context(|| format!("Failed to read tasks dir {}", tasks_dir.display()))?
@@ -1581,6 +1590,7 @@ fn load_state(
                         .to_string(),
                     detail_path: None,
                 });
+                recovered.push(task.id.clone());
             }
             tasks.insert(task.id.clone(), task);
         }
@@ -1613,7 +1623,7 @@ fn load_state(
         queue.push_back(id);
     }
 
-    Ok((tasks, queue))
+    Ok((tasks, queue, recovered))
 }
 
 fn resolve_task_id(tasks: &HashMap<String, TaskRecord>, id_or_prefix: &str) -> Result<String> {
@@ -1925,7 +1935,7 @@ mod tests {
             })?,
         )?;
 
-        let (tasks, queue) = load_state(&tasks_dir, &queue_path)?;
+        let (tasks, queue, recovered) = load_state(&tasks_dir, &queue_path)?;
         let recovered = tasks.get(&task_id).expect("task loaded");
 
         assert!(queue.is_empty(), "stale running task must not be requeued");

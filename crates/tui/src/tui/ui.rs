@@ -1475,7 +1475,7 @@ pub(crate) fn select_work_sidebar_tasks(
         .collect()
 }
 
-async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManager) {
+async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManager) -> bool {
     let tasks = task_manager.list_tasks(None).await;
     let session_started_at = app.session_started_at;
     let now = chrono::Utc::now();
@@ -1529,7 +1529,12 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     };
     entries.extend(shell_entries);
 
+    // Report whether anything visible changed so the idle tick can skip the
+    // redraw: an unconditional 2.5 s repaint kept the app from ever going
+    // quiescent (#3757).
+    let changed = app.task_panel != entries;
     app.task_panel = entries;
+    changed
 }
 
 fn refresh_shell_exec_live_output(app: &mut App) -> bool {
@@ -1925,12 +1930,13 @@ async fn run_event_loop(
         }
 
         if last_task_refresh.elapsed() >= Duration::from_millis(2500) {
-            refresh_active_task_panel(app, &task_manager).await;
+            if refresh_active_task_panel(app, &task_manager).await {
+                app.needs_redraw = true;
+            }
             if refresh_shell_exec_live_output(app) {
                 app.needs_redraw = true;
             }
             last_task_refresh = Instant::now();
-            app.needs_redraw = true;
         }
 
         // Clear suggestion when the user modifies the input.

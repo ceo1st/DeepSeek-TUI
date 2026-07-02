@@ -2140,7 +2140,7 @@ pub struct ToolDetailRecord {
 }
 
 /// Lightweight task view for sidebar rendering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPanelEntry {
     pub id: String,
     pub status: String,
