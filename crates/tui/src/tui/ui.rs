@@ -588,6 +588,8 @@ fn open_setup_checkpoint_if_due(app: &mut App, config: &Config, skip_onboarding:
         return false;
     }
 
+    // A fresh wizard invalidates any in-flight model draft from a prior one.
+    let _ = app.next_draft_gen();
     app.view_stack
         .push(crate::tui::setup::SetupWizardView::new_for_app(app, config));
     true
@@ -1968,8 +1970,10 @@ async fn run_event_loop(
             .try_lock()
             .ok()
             .and_then(|mut guard| guard.take());
-        if let Some((model_label, outcome)) = fleet_draft_delivery {
-            deliver_fleet_draft_result(app, model_label, outcome, app.ui_locale);
+        if let Some((draft_gen, model_label, outcome)) = fleet_draft_delivery {
+            if draft_gen == app.current_draft_gen() {
+                deliver_fleet_draft_result(app, model_label, outcome, app.ui_locale);
+            }
         }
 
         // Poll the constitution model-draft cell (same background pattern).
@@ -1978,8 +1982,10 @@ async fn run_event_loop(
             .try_lock()
             .ok()
             .and_then(|mut guard| guard.take());
-        if let Some((model_label, draft_locale, outcome)) = constitution_draft_delivery {
-            deliver_constitution_draft_result(app, model_label, draft_locale, outcome);
+        if let Some((draft_gen, model_label, draft_locale, outcome)) = constitution_draft_delivery {
+            if draft_gen == app.current_draft_gen() {
+                deliver_constitution_draft_result(app, model_label, draft_locale, outcome);
+            }
         }
 
         // First, poll for engine events (non-blocking)
@@ -5453,6 +5459,7 @@ async fn handle_setup_constitution_model_draft(
     let request_model = app.model.clone();
     let cell = app.constitution_draft_cell.clone();
     let spawn_label = model_label.clone();
+    let request_gen = app.next_draft_gen();
     app.status_message = Some(match locale {
         crate::localization::Locale::ZhHans => {
             format!(
@@ -5482,7 +5489,7 @@ async fn handle_setup_constitution_model_draft(
             Ok(result) => result,
         };
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some((spawn_label, locale, outcome));
+            *guard = Some((request_gen, spawn_label, locale, outcome));
         }
     });
 }
@@ -5557,6 +5564,7 @@ async fn handle_fleet_profile_model_draft(
     let request_model = app.model.clone();
     let cell = app.fleet_draft_cell.clone();
     let spawn_label = model_label.clone();
+    let request_gen = app.next_draft_gen();
     app.status_message = Some(match locale {
         crate::localization::Locale::ZhHans => {
             format!(
@@ -5587,7 +5595,7 @@ async fn handle_fleet_profile_model_draft(
             Ok(result) => result,
         };
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some((spawn_label, outcome));
+            *guard = Some((request_gen, spawn_label, outcome));
         }
     });
 }
@@ -7994,6 +8002,7 @@ async fn apply_command_result(
             }
             AppAction::OpenFleetSetup => {
                 if app.view_stack.top_kind() != Some(ModalKind::FleetSetup) {
+                    let _ = app.next_draft_gen();
                     app.view_stack
                         .push(crate::tui::views::fleet_setup::FleetSetupView::new(
                             app, config,
@@ -8008,12 +8017,14 @@ async fn apply_command_result(
             }
             AppAction::OpenSetupWizard => {
                 if app.view_stack.top_kind() != Some(ModalKind::SetupWizard) {
+                    let _ = app.next_draft_gen();
                     app.view_stack
                         .push(crate::tui::setup::SetupWizardView::new_for_app(app, config));
                 }
             }
             AppAction::OpenSetupWizardAt { step } => {
                 if app.view_stack.top_kind() != Some(ModalKind::SetupWizard) {
+                    let _ = app.next_draft_gen();
                     app.view_stack
                         .push(crate::tui::setup::SetupWizardView::new_for_app_at(
                             app, config, step,

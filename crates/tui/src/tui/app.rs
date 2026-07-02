@@ -2018,9 +2018,16 @@ pub struct App {
     /// task fills it (model label + drafted profile or a failure reason) so
     /// the drafting network call never parks the event loop (#3757 review).
     #[allow(clippy::type_complexity)]
+    /// Monotonic generation for model-draft requests. Bumped on each draft
+    /// request and each setup/fleet wizard open, so a draft that lands after
+    /// a superseding request or a wizard reopen is dropped rather than
+    /// installed into the wrong (or a stale) wizard instance.
+    pub draft_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[allow(clippy::type_complexity)]
     pub fleet_draft_cell: std::sync::Arc<
         std::sync::Mutex<
             Option<(
+                u64,
                 String,
                 Result<Box<crate::fleet::profile::FleetProfileDraft>, String>,
             )>,
@@ -2033,6 +2040,7 @@ pub struct App {
     pub constitution_draft_cell: std::sync::Arc<
         std::sync::Mutex<
             Option<(
+                u64,
                 String,
                 crate::localization::Locale,
                 Result<Box<codewhale_config::UserConstitution>, String>,
@@ -2264,6 +2272,21 @@ fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, _is_wind
 }
 
 impl App {
+    /// Advance and return the model-draft generation. Call when a draft is
+    /// requested or a setup/fleet wizard opens; a spawned draft that captured
+    /// an older generation is dropped on delivery.
+    pub fn next_draft_gen(&self) -> u64 {
+        self.draft_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    /// The current model-draft generation (delivery compares against this).
+    #[must_use]
+    pub fn current_draft_gen(&self) -> u64 {
+        self.draft_gen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Cap on the session turn-cache history. Holds enough turns to debug a long
     /// session without being so large the on-screen `/cache` table wraps.
     pub const TURN_CACHE_HISTORY_CAP: usize = 50;
@@ -2819,6 +2842,7 @@ impl App {
             turn_last_activity_at: None,
             cumulative_turn_duration: std::time::Duration::ZERO,
             balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            draft_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             prompt_suggestion_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),

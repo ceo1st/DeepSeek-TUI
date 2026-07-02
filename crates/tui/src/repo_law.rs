@@ -23,8 +23,12 @@ use serde_json::Value;
 
 use crate::project_context::{RepoLawAction, RepoLawRule, load_repo_law_rules};
 
-/// Tools whose inputs name filesystem write targets we can hold.
-const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "apply_patch"];
+/// Tools whose inputs name filesystem write targets we can hold. Any
+/// write-capable tool MUST be listed here — the gate fails open for tools it
+/// does not recognize, so a new write tool without an entry silently evades
+/// repo law. `fim_edit` was such a hole (it declares WritesFiles, takes a
+/// `path`, and `fs::write`s to it) until it was added here.
+const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "apply_patch", "fim_edit"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RepoLawPlanDecision {
@@ -81,9 +85,13 @@ pub(crate) fn repo_law_plan_decision(
     })
 }
 
-/// Extract workspace-relative write targets from a tool input. Follows the
-/// same shapes the approval surfaces use: `path`/`target`/`destination`
-/// params, `changes[].path`, and unified-diff `+++ b/` headers.
+/// Extract workspace-relative write targets from a tool input. Covers the
+/// `path`/`target`/`destination`/`file_path` params, `changes[].path`, and
+/// every unified-diff / codex-envelope header shape the patch tools accept —
+/// old (`--- `) and new (`+++ `) paths, with or without an `a/`/`b/` prefix,
+/// tab-timestamp suffixes stripped, and `/dev/null` (deletion) falling back
+/// to the counterpart path. Missing any shape the tool honors is a hold
+/// bypass, so this deliberately over-collects candidate paths.
 fn write_target_paths(workspace: &Path, input: &Value) -> Vec<String> {
     let mut targets = Vec::new();
     for key in ["path", "target", "destination", "file_path"] {
@@ -99,15 +107,31 @@ fn write_target_paths(workspace: &Path, input: &Value) -> Vec<String> {
         }
     }
     if let Some(patch) = input.get("patch").and_then(Value::as_str) {
+        let mut pending_old: Option<String> = None;
         for line in patch.lines() {
-            if let Some(rest) = line.strip_prefix("+++ b/") {
-                push_normalized(&mut targets, workspace, rest.trim());
-            } else if let Some(rest) = line.strip_prefix("*** Update File: ") {
+            if let Some(rest) = line.strip_prefix("*** Update File: ") {
                 push_normalized(&mut targets, workspace, rest.trim());
             } else if let Some(rest) = line.strip_prefix("*** Add File: ") {
                 push_normalized(&mut targets, workspace, rest.trim());
             } else if let Some(rest) = line.strip_prefix("*** Delete File: ") {
                 push_normalized(&mut targets, workspace, rest.trim());
+            } else if let Some(rest) = line.strip_prefix("--- ") {
+                // Old path: remember it so a `+++ /dev/null` deletion still
+                // holds the file being removed.
+                pending_old = diff_header_path(rest);
+                if let Some(ref p) = pending_old {
+                    push_normalized(&mut targets, workspace, p);
+                }
+            } else if let Some(rest) = line.strip_prefix("+++ ") {
+                match diff_header_path(rest) {
+                    Some(new_path) => push_normalized(&mut targets, workspace, &new_path),
+                    // `+++ /dev/null` → deletion; the target is the old path.
+                    None => {
+                        if let Some(old) = pending_old.take() {
+                            push_normalized(&mut targets, workspace, &old);
+                        }
+                    }
+                }
             }
         }
     }
@@ -116,32 +140,59 @@ fn write_target_paths(workspace: &Path, input: &Value) -> Vec<String> {
     targets
 }
 
+/// Parse a unified-diff header path: strip an optional `a/`/`b/` prefix and a
+/// tab-delimited timestamp suffix. Returns `None` for `/dev/null` (absence).
+fn diff_header_path(rest: &str) -> Option<String> {
+    // Headers may carry a "\t<timestamp>" suffix; the path is the first field.
+    let path = rest.split('\t').next().unwrap_or(rest).trim();
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    let stripped = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    Some(stripped.to_string())
+}
+
 /// Normalize to a forward-slash, workspace-relative string so globs written
-/// as `crates/x/**` match regardless of how the tool spelled the path.
+/// as `crates/x/**` match regardless of how the tool spelled the path. Crucially
+/// this collapses `.`/`..` path components the same way the write tools'
+/// `resolve_path` does, so an interior `crates/./protocol/x` or
+/// `x/../crates/protocol/x` cannot spell its way past a glob (a confirmed
+/// bypass before this).
 fn push_normalized(targets: &mut Vec<String>, workspace: &Path, raw: &str) {
-    let trimmed = raw.trim();
+    let trimmed = raw.trim().replace('\\', "/");
     if trimmed.is_empty() {
         return;
     }
-    let path = Path::new(trimmed);
+    // Make workspace-relative when the tool gave an absolute path inside it.
+    let path = Path::new(&trimmed);
     let relative = path.strip_prefix(workspace).unwrap_or(path);
-    let mut normalized = relative
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .to_string();
-    if normalized.is_empty() {
-        return;
+
+    // Lexically collapse CurDir (`.`) and ParentDir (`..`) components, and
+    // drop any leading root/empty component. An absolute path outside the
+    // workspace keeps its tail (e.g. `/etc/passwd` -> `etc/passwd`) so a
+    // `**/passwd` glob still matches while a workspace-anchored glob does not.
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.to_string_lossy().split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                // A `..` that pops above the root escapes the workspace; keep
+                // an explicit marker so it can never match a workspace-relative
+                // glob, and the ordinary approval/sandbox gates still govern it.
+                if parts.pop().is_none() {
+                    parts.push("..".to_string());
+                }
+            }
+            other => parts.push(other.to_string()),
+        }
     }
-    // A path that escapes the workspace via `..` is normalized as-written;
-    // globs are workspace-relative so it simply won't match, and the
-    // ordinary approval/sandbox gates still govern it.
-    if let Some(stripped) = normalized.strip_prefix('/') {
-        // Absolute path outside the workspace: keep the tail so a law like
-        // `**/secrets.toml` can still match; full-anchored globs won't.
-        normalized = stripped.to_string();
+    let normalized = parts.join("/");
+    if !normalized.is_empty() {
+        targets.push(normalized);
     }
-    targets.push(normalized);
 }
 
 #[cfg(test)]
@@ -331,6 +382,79 @@ mod tests {
                 &json!({"path": "crates/protocol/wire.rs", "content": "x"}),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn interior_dot_and_parent_segments_cannot_evade_a_block() {
+        let tmp = TempDir::new().unwrap();
+        write_law(tmp.path(), LAW);
+        for path in [
+            "crates/./protocol/wire.rs",
+            "crates/../crates/protocol/wire.rs",
+            "x/../crates/protocol/wire.rs",
+            "./crates/protocol/wire.rs",
+        ] {
+            let decision = repo_law_plan_decision(
+                tmp.path(),
+                "write_file",
+                &json!({ "path": path, "content": "x" }),
+            );
+            assert!(
+                matches!(decision, Some(RepoLawPlanDecision::Block(_))),
+                "{path} must be held, got {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fim_edit_is_gated_like_other_write_tools() {
+        let tmp = TempDir::new().unwrap();
+        write_law(tmp.path(), LAW);
+        let decision = repo_law_plan_decision(
+            tmp.path(),
+            "fim_edit",
+            &json!({ "path": "crates/protocol/wire.rs", "prefix": "a", "suffix": "b" }),
+        );
+        assert!(
+            matches!(decision, Some(RepoLawPlanDecision::Block(_))),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn apply_patch_header_variants_are_all_extracted() {
+        let tmp = TempDir::new().unwrap();
+        write_law(tmp.path(), LAW);
+        // no a/ or b/ prefix
+        let d = repo_law_plan_decision(
+            tmp.path(),
+            "apply_patch",
+            &json!({ "patch": "--- crates/protocol/wire.rs\n+++ crates/protocol/wire.rs\n@@\n" }),
+        );
+        assert!(
+            matches!(d, Some(RepoLawPlanDecision::Block(_))),
+            "no-prefix: {d:?}"
+        );
+        // deletion: +++ /dev/null, target is the old path
+        let d = repo_law_plan_decision(
+            tmp.path(),
+            "apply_patch",
+            &json!({ "patch": "--- a/crates/protocol/wire.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n" }),
+        );
+        assert!(
+            matches!(d, Some(RepoLawPlanDecision::Block(_))),
+            "deletion: {d:?}"
+        );
+        // tab-timestamp suffix on the header
+        let d = repo_law_plan_decision(
+            tmp.path(),
+            "apply_patch",
+            &json!({ "patch": "--- a/x\t2026-01-01\n+++ b/crates/protocol/wire.rs\t2026-01-01 10:00:00\n@@\n" }),
+        );
+        assert!(
+            matches!(d, Some(RepoLawPlanDecision::Block(_))),
+            "tab-timestamp: {d:?}"
         );
     }
 

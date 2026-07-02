@@ -431,8 +431,90 @@ fn shell_params_are_destructive_like(params: &Value) -> bool {
 /// background/headless call in YOLO cannot run them without durable review
 /// (#3883 follow-up; the earlier narrowing lost this coverage).
 fn segment_is_device_or_filesystem_destroyer(segment: &str) -> bool {
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
-    let Some(cmd) = tokens.first().map(|t| t.trim_start_matches("./")) else {
+    // A command may be piped (`cat x | dd of=/dev/sda`); each stage is its own
+    // effective command, so check every pipe stage.
+    segment
+        .split('|')
+        .any(stage_is_device_or_filesystem_destroyer)
+}
+
+/// Strip a surrounding pair of single or double quotes from a shell token so
+/// `"dd"`, `'mkfs'`, and `of="/dev/sda"` values match their bare forms.
+fn unquote_token(token: &str) -> &str {
+    let t = token.trim();
+    for q in ['"', '\''] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            return &t[1..t.len() - 1];
+        }
+    }
+    t
+}
+
+/// Peel leading `VAR=val` env assignments and command wrappers
+/// (`sudo`/`env`/`nohup`/`time`/`command`/`nice`/`ionice`/`doas`/`stdbuf`/
+/// `timeout`/`setsid`) plus their flags, so `FOO=bar sudo -n dd of=/dev/sda`
+/// resolves to the real `dd` command. Best-effort: exotic
+/// wrapper-with-positional-arg forms may slip, but the common evasions
+/// (env assignment, sudo/env/nohup prefix) are covered.
+fn effective_command_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    const WRAPPERS: &[&str] = &[
+        "sudo", "env", "nohup", "time", "command", "nice", "ionice", "doas", "stdbuf", "timeout",
+        "setsid",
+    ];
+    let mut i = 0;
+    while i < tokens.len() {
+        let raw = unquote_token(tokens[i]);
+        // Leading env assignment: VAR=value (no slash before the '=').
+        if let Some(eq) = raw.find('=') {
+            if eq > 0 && !raw[..eq].contains('/') {
+                i += 1;
+                continue;
+            }
+        }
+        let base = raw
+            .trim_start_matches("./")
+            .rsplit('/')
+            .next()
+            .unwrap_or(raw);
+        if WRAPPERS.contains(&base) {
+            let is_timeout = base == "timeout";
+            i += 1;
+            // Skip that wrapper's leading flags and env's VAR=val args.
+            while i < tokens.len() {
+                let f = unquote_token(tokens[i]);
+                let is_env_assign = f
+                    .find('=')
+                    .is_some_and(|eq| eq > 0 && !f[..eq].contains('/'));
+                if f.starts_with('-') || is_env_assign {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // `timeout` takes a positional DURATION before the command.
+            if is_timeout
+                && i < tokens.len()
+                && unquote_token(tokens[i])
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+            {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    &tokens[i..]
+}
+
+fn stage_is_device_or_filesystem_destroyer(stage: &str) -> bool {
+    let raw_tokens: Vec<&str> = stage.split_whitespace().collect();
+    let tokens = effective_command_tokens(&raw_tokens);
+    let Some(cmd) = tokens
+        .first()
+        .map(|t| unquote_token(t).trim_start_matches("./"))
+    else {
         return false;
     };
     let base = cmd.rsplit('/').next().unwrap_or(cmd);
@@ -443,8 +525,10 @@ fn segment_is_device_or_filesystem_destroyer(segment: &str) -> bool {
     // `dd` writing to a block device (of=/dev/...): overwrites the raw disk.
     if base == "dd" {
         return tokens.iter().any(|t| {
-            t.strip_prefix("of=")
-                .is_some_and(|dest| dest.starts_with("/dev/"))
+            unquote_token(t)
+                .strip_prefix("of=")
+                .map(|dest| unquote_token(dest).starts_with("/dev/"))
+                .unwrap_or(false)
         });
     }
     // Forced recursive deletion aimed at an absolute path outside the
@@ -455,8 +539,9 @@ fn segment_is_device_or_filesystem_destroyer(segment: &str) -> bool {
         let mut force = false;
         let mut abs_system_target = false;
         for token in &tokens[1..] {
+            let token = unquote_token(token);
             if token.starts_with("--") {
-                match *token {
+                match token {
                     "--recursive" | "--dir" => recursive = true,
                     "--force" => force = true,
                     _ => {}
@@ -465,7 +550,6 @@ fn segment_is_device_or_filesystem_destroyer(segment: &str) -> bool {
                 recursive |= flags.contains('r') || flags.contains('R');
                 force |= flags.contains('f');
             } else if token.starts_with('/') {
-                // Any absolute target that is not clearly inside a temp dir.
                 abs_system_target = true;
             }
         }
@@ -813,6 +897,34 @@ mod tests {
                 decision.action,
                 AutoReviewAction::HoldForReview,
                 "{command} must hold"
+            );
+        }
+    }
+
+    #[test]
+    fn destroyer_check_resists_prefix_quote_and_pipe_evasions() {
+        let policy = AutoReviewPolicy::default();
+        for command in [
+            "FOO=bar dd if=/dev/zero of=/dev/sda",
+            "sudo dd if=/dev/zero of=/dev/sda",
+            "sudo -n mkfs.ext4 /dev/sda1",
+            "nohup shred /dev/sda",
+            "env DEBIAN_FRONTEND=noninteractive wipefs -a /dev/sda",
+            "\"dd\" if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=\"/dev/sda\"",
+            "cat junk | dd of=/dev/sda",
+            "timeout 30 mkfs /dev/sda1",
+        ] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command, "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Bypass,
+            );
+            assert_eq!(
+                policy.evaluate(&ctx).action,
+                AutoReviewAction::HoldForReview,
+                "evasion not held: {command}"
             );
         }
     }

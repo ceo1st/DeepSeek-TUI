@@ -773,7 +773,11 @@ impl TaskManager {
             )
         })?;
 
-        let (tasks, queue, recovered) = load_state(&tasks_dir, &queue_path)?;
+        let LoadedTaskState {
+            tasks,
+            queue,
+            recovered,
+        } = load_state(&tasks_dir, &queue_path)?;
 
         let cancel_token = CancellationToken::new();
         let default_workspace = cfg.default_workspace.clone();
@@ -1533,10 +1537,16 @@ fn normalize_hunt_verdict(raw: &str) -> Result<&'static str> {
     }
 }
 
-fn load_state(
-    tasks_dir: &Path,
-    queue_path: &Path,
-) -> Result<(HashMap<String, TaskRecord>, VecDeque<String>, Vec<String>)> {
+/// Outcome of loading the persisted task store at boot: the reconciled task
+/// map + queue, plus the ids whose status was flipped running->failed by
+/// crash recovery (the only records boot needs to re-persist).
+struct LoadedTaskState {
+    tasks: HashMap<String, TaskRecord>,
+    queue: VecDeque<String>,
+    recovered: Vec<String>,
+}
+
+fn load_state(tasks_dir: &Path, queue_path: &Path) -> Result<LoadedTaskState> {
     let mut tasks = HashMap::new();
     let mut recovered = Vec::new();
     if tasks_dir.exists() {
@@ -1623,7 +1633,11 @@ fn load_state(
         queue.push_back(id);
     }
 
-    Ok((tasks, queue, recovered))
+    Ok(LoadedTaskState {
+        tasks,
+        queue,
+        recovered,
+    })
 }
 
 fn resolve_task_id(tasks: &HashMap<String, TaskRecord>, id_or_prefix: &str) -> Result<String> {
@@ -1969,8 +1983,9 @@ mod tests {
             })?,
         )?;
 
-        let (tasks, queue, _recovered) = load_state(&tasks_dir, &queue_path)?;
-        let recovered = tasks.get(&task_id).expect("task loaded");
+        let loaded = load_state(&tasks_dir, &queue_path)?;
+        let queue = loaded.queue;
+        let recovered = loaded.tasks.get(&task_id).expect("task loaded");
 
         assert!(queue.is_empty(), "stale running task must not be requeued");
         assert_eq!(recovered.status, TaskStatus::Failed);
