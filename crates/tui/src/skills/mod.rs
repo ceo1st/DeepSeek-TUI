@@ -555,8 +555,6 @@ fn normalize_skill_name_for_lookup(name: &str) -> String {
             if out.len() < MAX_SKILL_NAME_CHARS {
                 out.push(ch.to_ascii_lowercase());
             }
-        } else if ch == '-' || ch == '_' || ch.is_whitespace() {
-            pending_dash = true;
         } else {
             pending_dash = true;
         }
