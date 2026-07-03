@@ -23,6 +23,7 @@ use crate::logging;
 
 const MAX_SKILL_DESCRIPTION_CHARS: usize = 280;
 const MAX_AVAILABLE_SKILLS_CHARS: usize = 12_000;
+const MAX_SKILL_NAME_CHARS: usize = 64;
 
 // === Defaults ===
 
@@ -237,6 +238,7 @@ impl SkillRegistry {
                             continue;
                         }
                         skill.path = skill_path.clone();
+                        registry.normalize_skill_name(&mut skill, &skill_path);
                         registry.skills.push(skill);
                         // This directory IS a skill. Don't descend further:
                         // any nested `SKILL.md` would be a fixture or
@@ -284,6 +286,19 @@ impl SkillRegistry {
     fn push_warning(&mut self, warning: String) {
         logging::warn(&warning);
         self.warnings.push(warning);
+    }
+
+    fn normalize_skill_name(&mut self, skill: &mut Skill, skill_path: &Path) {
+        let normalized = normalize_skill_name_for_lookup(&skill.name);
+        if normalized != skill.name || !is_valid_skill_name(&skill.name) {
+            let original = skill.name.clone();
+            skill.name = normalized;
+            self.push_warning(format!(
+                "Skill name `{original}` in {} is not a safe command name; using `{}` instead.",
+                skill_path.display(),
+                skill.name
+            ));
+        }
     }
 
     pub(crate) fn parse_skill(_path: &Path, content: &str) -> std::result::Result<Skill, String> {
@@ -487,7 +502,8 @@ impl SkillRegistry {
 
     /// Lookup a skill by name.
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.iter().find(|s| s.name == name)
+        let normalized = normalize_skill_name_for_lookup(name);
+        self.skills.iter().find(|s| s.name == normalized)
     }
 
     /// Return all loaded skills.
@@ -510,6 +526,54 @@ impl SkillRegistry {
     #[must_use]
     pub fn len(&self) -> usize {
         self.skills.len()
+    }
+}
+
+fn is_valid_skill_name(name: &str) -> bool {
+    let char_count = name.chars().count();
+    char_count > 0
+        && char_count <= MAX_SKILL_NAME_CHARS
+        && name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn normalize_skill_name_for_lookup(name: &str) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() && out.len() < MAX_SKILL_NAME_CHARS {
+                out.push('-');
+            }
+            pending_dash = false;
+            if out.len() < MAX_SKILL_NAME_CHARS {
+                out.push(ch.to_ascii_lowercase());
+            }
+        } else if ch == '-' || ch == '_' || ch.is_whitespace() {
+            pending_dash = true;
+        } else {
+            pending_dash = true;
+        }
+
+        if out.len() >= MAX_SKILL_NAME_CHARS {
+            break;
+        }
+    }
+
+    while out.ends_with('-') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "skill".to_string()
+    } else {
+        out
     }
 }
 
@@ -623,19 +687,7 @@ pub fn discover_in_workspace_with_mode(
     workspace: &Path,
     mode: SkillDiscoveryMode,
 ) -> SkillRegistry {
-    let mut merged = SkillRegistry::default();
-    for dir in skills_directories_for_mode(workspace, mode) {
-        let registry = SkillRegistry::discover(&dir);
-        for skill in registry.skills {
-            if !merged.skills.iter().any(|s| s.name == skill.name) {
-                merged.skills.push(skill);
-            }
-        }
-        for warning in registry.warnings {
-            merged.warnings.push(warning);
-        }
-    }
-    merged
+    discover_from_directories(skills_directories_for_mode(workspace, mode))
 }
 
 /// Discover skills from the workspace search set plus the configured install
@@ -701,7 +753,14 @@ pub(crate) fn discover_from_directories(dirs: impl IntoIterator<Item = PathBuf>)
     for dir in dirs {
         let registry = SkillRegistry::discover(&dir);
         for skill in registry.skills {
-            if !merged.skills.iter().any(|s| s.name == skill.name) {
+            if let Some(existing) = merged.skills.iter().find(|s| s.name == skill.name) {
+                merged.push_warning(format!(
+                    "Skill `{}` at {} is shadowed by {}.",
+                    skill.name,
+                    skill.path.display(),
+                    existing.path.display()
+                ));
+            } else {
                 merged.skills.push(skill);
             }
         }
@@ -1345,6 +1404,14 @@ body";
             "shared.path should be from .agents/skills, got {:?}",
             shared.path
         );
+        assert!(
+            registry
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("shared") && warning.contains("shadowed by")),
+            "duplicate shadowing should warn, got {:?}",
+            registry.warnings()
+        );
     }
 
     #[test]
@@ -1395,9 +1462,44 @@ body";
         .unwrap();
 
         let registry = super::SkillRegistry::discover(tmpdir.path());
-        let skill = registry.get("Plain Skill").expect("plain skill parsed");
+        let skill = registry.get("plain-skill").expect("plain skill parsed");
+        assert_eq!(skill.name, "plain-skill");
         assert_eq!(skill.description, "");
         assert!(skill.body.contains("Use this skill"));
+        assert!(
+            registry
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("using `plain-skill` instead")),
+            "expected slug warning, got {:?}",
+            registry.warnings()
+        );
+    }
+
+    #[test]
+    fn discover_slugifies_invalid_frontmatter_names_and_lookup_normalizes() {
+        let tmpdir = TempDir::new().unwrap();
+        let root = tmpdir.path().join("skills");
+        let skill_dir = root.join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: My Skill\ndescription: spaced name\n---\nbody",
+        )
+        .unwrap();
+
+        let registry = super::SkillRegistry::discover(&root);
+        let skill = registry.get("  MY   skill  ").expect("normalized lookup");
+        assert_eq!(skill.name, "my-skill");
+        assert!(
+            registry
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("My Skill")
+                    && warning.contains("using `my-skill` instead")),
+            "expected invalid-name warning, got {:?}",
+            registry.warnings()
+        );
     }
 
     #[test]
