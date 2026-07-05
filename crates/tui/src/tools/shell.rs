@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -467,7 +467,7 @@ impl StdinWriter {
 
 fn spawn_reader_thread<R: Read + Send + 'static>(
     mut reader: R,
-    buffer: Arc<Mutex<JobOutputBuffer>>,
+    buffer: Arc<Mutex<Vec<u8>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 4096];
@@ -476,230 +476,13 @@ fn spawn_reader_thread<R: Read + Send + 'static>(
                 Ok(0) => break,
                 Ok(n) => {
                     if let Ok(mut guard) = buffer.lock() {
-                        guard.append(&chunk[..n]);
+                        guard.extend_from_slice(&chunk[..n]);
                     }
                 }
                 Err(_) => break,
             }
         }
     })
-}
-
-/// In-memory cap for each retained background-job output stream. Reuses the
-/// spillover "too large to inline" ceiling so shell jobs follow the same
-/// economics as oversized tool results; the full log spills to disk once the
-/// cap is exceeded.
-const JOB_OUTPUT_MEMORY_CAP: usize = crate::tools::truncate::SPILLOVER_THRESHOLD_BYTES;
-
-/// Full-log spool for one background-job output stream. Files live in the
-/// spillover directory (`~/.codewhale/tool_outputs/`) so the existing boot
-/// prune reaps strays from crashed sessions; healthy jobs remove the file
-/// when the job is dropped.
-struct JobSpool {
-    path: PathBuf,
-    file: std::fs::File,
-}
-
-impl JobSpool {
-    fn create(spool_id: &str) -> std::io::Result<Self> {
-        let root = crate::tools::truncate::spillover_root().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no home directory available for the job output spool",
-            )
-        })?;
-        std::fs::create_dir_all(&root)?;
-        let path = root.join(format!("{spool_id}.log"));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)?;
-        Ok(Self { path, file })
-    }
-}
-
-impl Drop for JobSpool {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Output accumulator for one background-job stream (stdout or stderr).
-///
-/// Reader threads previously extended an unbounded `Vec<u8>`, so a chatty
-/// long-running job grew resident memory without limit and `full_output`
-/// cloned the whole thing. This keeps a capped in-memory tail and lazily
-/// spills the full log to disk once the cap is exceeded, so retained memory
-/// stays bounded while nothing is lost.
-pub(crate) struct JobOutputBuffer {
-    spool_id: String,
-    /// In-memory tail, capped at [`JOB_OUTPUT_MEMORY_CAP`] bytes.
-    tail: VecDeque<u8>,
-    /// Total bytes ever appended (tail + spooled/dropped prefix).
-    total_len: usize,
-    /// Full-log spool, created once the memory cap is first exceeded.
-    /// Invariant while healthy: the file holds bytes `0..total_len`.
-    spool: Option<JobSpool>,
-    /// Set once spool creation or writing fails; suppresses retries so a
-    /// broken disk can't turn every 4KB read into an error loop.
-    spool_failed: bool,
-}
-
-impl JobOutputBuffer {
-    fn new(spool_id: String) -> Self {
-        Self {
-            spool_id,
-            tail: VecDeque::new(),
-            total_len: 0,
-            spool: None,
-            spool_failed: false,
-        }
-    }
-
-    fn total_len(&self) -> usize {
-        self.total_len
-    }
-
-    fn append(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        // Spool before touching the tail: the lazy-create path backfills the
-        // spool from the tail, which still equals the full log at that point
-        // (eviction only ever happens after a spool exists or has failed).
-        self.write_spool(bytes);
-        self.total_len += bytes.len();
-        self.tail.extend(bytes.iter().copied());
-        if self.tail.len() > JOB_OUTPUT_MEMORY_CAP {
-            let excess = self.tail.len() - JOB_OUTPUT_MEMORY_CAP;
-            self.tail.drain(..excess);
-        }
-    }
-
-    fn write_spool(&mut self, bytes: &[u8]) {
-        if self.spool_failed {
-            return;
-        }
-        if self.spool.is_none() {
-            if self.tail.len() + bytes.len() <= JOB_OUTPUT_MEMORY_CAP {
-                return; // Still fits in memory — no spool needed yet.
-            }
-            match JobSpool::create(&self.spool_id) {
-                Ok(mut spool) => {
-                    let (front, back) = self.tail.as_slices();
-                    if spool
-                        .file
-                        .write_all(front)
-                        .and_then(|()| spool.file.write_all(back))
-                        .is_err()
-                    {
-                        self.spool_failed = true;
-                        return;
-                    }
-                    self.spool = Some(spool);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        spool_id = %self.spool_id,
-                        "failed to create shell job output spool; output beyond the memory cap will be dropped"
-                    );
-                    self.spool_failed = true;
-                    return;
-                }
-            }
-        }
-        if let Some(spool) = self.spool.as_mut()
-            && spool.file.write_all(bytes).is_err()
-        {
-            self.spool_failed = true;
-            self.spool = None; // Drop removes the now-incomplete file.
-        }
-    }
-
-    /// Consume unread bytes past `cursor` (a total-stream offset), advancing
-    /// the cursor. Bytes already evicted from memory are recovered from the
-    /// spool so delta consumers observe the same contiguous stream as before
-    /// the cap existed; the allocation is transient, the retained state stays
-    /// capped.
-    fn take_delta(&mut self, cursor: &mut usize) -> (Vec<u8>, usize) {
-        let total = self.total_len;
-        let start = (*cursor).min(total);
-        *cursor = total;
-        let mem_start = total - self.tail.len();
-        let mut delta: Vec<u8> = Vec::new();
-        if start < mem_start {
-            self.read_spool_range(start, mem_start - start, &mut delta);
-        }
-        let mem_offset = start.saturating_sub(mem_start);
-        let (front, back) = self.tail.as_slices();
-        if mem_offset < front.len() {
-            delta.extend_from_slice(&front[mem_offset..]);
-            delta.extend_from_slice(back);
-        } else {
-            delta.extend_from_slice(&back[mem_offset - front.len()..]);
-        }
-        (delta, total)
-    }
-
-    /// Best-effort read of `len` bytes at `offset` from the spool file via a
-    /// fresh handle (the append handle's position must not move). On any
-    /// failure the gap is simply skipped — degraded, never fatal.
-    fn read_spool_range(&self, offset: usize, len: usize, out: &mut Vec<u8>) {
-        use std::io::{Seek, SeekFrom};
-        let Some(spool) = self.spool.as_ref() else {
-            return;
-        };
-        let Ok(mut file) = std::fs::File::open(&spool.path) else {
-            return;
-        };
-        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
-            return;
-        }
-        let _ = file.take(len as u64).read_to_end(out);
-    }
-
-    /// Last `max_bytes` of the in-memory tail, snapped forward to a UTF-8
-    /// codepoint boundary so a multi-byte character split at the window edge
-    /// doesn't render a leading replacement char.
-    fn tail_lossy(&mut self, max_bytes: usize) -> String {
-        let slice = self.tail.make_contiguous();
-        let mut start = slice.len().saturating_sub(max_bytes);
-        while start < slice.len() && (slice[start] & 0xC0) == 0x80 {
-            start += 1;
-        }
-        String::from_utf8_lossy(&slice[start..]).into_owned()
-    }
-
-    /// Render the stream for "full output" consumers. When nothing has been
-    /// evicted this is the byte-identical full stream; once the cap kicked in
-    /// it is the retained tail with a note pointing at the spooled full log
-    /// instead of an unbounded clone.
-    fn view_string(&mut self) -> String {
-        let dropped = self.total_len - self.tail.len();
-        let slice = self.tail.make_contiguous();
-        if dropped == 0 {
-            return String::from_utf8_lossy(slice).into_owned();
-        }
-        let mut start = 0usize;
-        while start < slice.len() && (slice[start] & 0xC0) == 0x80 {
-            start += 1;
-        }
-        let shown = slice.len() - start;
-        let tail = String::from_utf8_lossy(&slice[start..]);
-        match self.spool.as_ref() {
-            Some(spool) => format!(
-                "[showing last {shown} of {} bytes; full log: {}]\n{tail}",
-                self.total_len,
-                spool.path.display()
-            ),
-            None => format!(
-                "[showing last {shown} of {} bytes; earlier output was dropped]\n{tail}",
-                self.total_len
-            ),
-        }
-    }
 }
 
 const SYNC_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);

@@ -1,17 +1,14 @@
 //! Todo list tool and supporting data structures.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
-    optional_bool,
 };
 
 // === Types ===
@@ -47,85 +44,12 @@ impl TodoStatus {
     }
 }
 
-/// A dependency edge that gates status transitions on a checklist item.
-///
-/// Serialized as a string: `"item:<id>"` for another checklist item that must
-/// be completed first, `"agent:<agent-id-or-session-name>"` for a sub-agent
-/// that must report completed first. Bare numeric strings are accepted as
-/// item refs for ergonomics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub enum TodoBlocker {
-    /// Another checklist item (by id) that must be completed first.
-    Item(u32),
-    /// A sub-agent (durable id or session name) that must report completed.
-    Agent(String),
-}
-
-impl TodoBlocker {
-    /// Parse a blocker reference from its string form.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        let raw = raw.trim();
-        if let Some(rest) = raw.strip_prefix("item:") {
-            return rest.trim().parse::<u32>().map(TodoBlocker::Item).map_err(|_| {
-                format!("invalid blocker '{raw}': expected item:<numeric checklist item id>")
-            });
-        }
-        if let Some(rest) = raw.strip_prefix("agent:") {
-            let rest = rest.trim();
-            if rest.is_empty() {
-                return Err(format!(
-                    "invalid blocker '{raw}': expected agent:<agent-id-or-session-name>"
-                ));
-            }
-            return Ok(TodoBlocker::Agent(rest.to_string()));
-        }
-        // Bare ids are accepted as item refs for ergonomics.
-        if let Ok(id) = raw.parse::<u32>() {
-            return Ok(TodoBlocker::Item(id));
-        }
-        Err(format!(
-            "invalid blocker '{raw}': use \"item:<id>\", \"agent:<id-or-session-name>\", or a bare numeric item id"
-        ))
-    }
-}
-
-impl std::fmt::Display for TodoBlocker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TodoBlocker::Item(id) => write!(f, "item:{id}"),
-            TodoBlocker::Agent(agent_ref) => write!(f, "agent:{agent_ref}"),
-        }
-    }
-}
-
-impl From<TodoBlocker> for String {
-    fn from(blocker: TodoBlocker) -> Self {
-        blocker.to_string()
-    }
-}
-
-impl TryFrom<String> for TodoBlocker {
-    type Error = String;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        TodoBlocker::parse(&value)
-    }
-}
-
 /// A single todo item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: u32,
     pub content: String,
     pub status: TodoStatus,
-    /// Dependency edges that must resolve before this item may move to
-    /// `in_progress` or `completed`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blocked_on: Vec<TodoBlocker>,
-    /// Audit trail for forced overrides of unresolved blockers.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub audit_notes: Vec<String>,
 }
 
 /// Snapshot of a todo list for display or serialization.
