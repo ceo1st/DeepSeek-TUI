@@ -95,6 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raised the default subagent concurrency for high-throughput fanout:
+  `max_subagents` default 20 → 64 (config ceiling 128) and the queued+running
+  admission cap 200 → 1024. Users on metered plans who want the old behavior
+  can set `max_subagents = 20` in config.toml.
 - Renamed the internal `whaleflow` subsystem to `workflow` across the
   workspace: the `codewhale-whaleflow`/`codewhale-whaleflow-js` crates become
   `codewhale-workflow`/`codewhale-workflow-js`, Rust identifiers and JS bridge
