@@ -7319,12 +7319,13 @@ async fn apply_model_picker_choice(
         ),
         (false, false) => unreachable!(),
     };
+    let persisted = persist_warning.is_none();
     if let Some(warning) = persist_warning {
         summary.push(' ');
         summary.push_str(&warning);
     }
     app.status_message = Some(summary);
-    if model_changed {
+    if model_changed && persisted {
         record_provider_model_setup_progress(app, config);
     }
 }
@@ -7555,11 +7556,14 @@ async fn switch_provider(
     });
 
     let mut status_message = format!("Provider: {} via {}", target.as_str(), new_endpoint);
+    let persisted = persist_warning.is_none();
     if persist_warning.is_some() {
         status_message.push_str(" (not fully persisted)");
     }
     app.status_message = Some(status_message);
-    record_provider_model_setup_progress(app, config);
+    if persisted {
+        record_provider_model_setup_progress(app, config);
+    }
 }
 
 fn provider_persistence_key(config: &Config, provider: ApiProvider) -> String {

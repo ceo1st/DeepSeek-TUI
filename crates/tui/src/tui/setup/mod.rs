@@ -40,6 +40,7 @@ use codewhale_config::{
 mod fleet_draft;
 mod model_draft;
 mod persistence;
+mod provider;
 mod remote;
 
 pub(crate) use fleet_draft::{draft_fleet_profile_with_model, workspace_fingerprint};
@@ -2258,11 +2259,15 @@ impl SetupWizardView {
     }
 
     fn commit_provider_model_review(&mut self) -> ViewAction {
-        let status = provider_model_step_status(&self.facts);
+        let status = provider::step_status(self.facts.provider_ready);
         let mut state = self.state.clone();
         state.set_step(
             SetupStep::ProviderModel,
-            provider_model_step_entry_from_facts(&self.facts),
+            provider::step_entry(
+                self.facts.provider_ready,
+                CONSTITUTION_CHECKPOINT_VERSION,
+                self.facts.provider_result.clone(),
+            ),
         );
         self.state = state.clone();
         self.move_next();
@@ -4185,27 +4190,14 @@ pub(crate) fn record_provider_model_setup_state_for_app(
     let mut state = load_setup_state_for_app(app, config);
     state.set_step(
         SetupStep::ProviderModel,
-        provider_model_step_entry_from_facts(&facts),
+        provider::step_entry(
+            facts.provider_ready,
+            CONSTITUTION_CHECKPOINT_VERSION,
+            facts.provider_result,
+        ),
     );
     state.save()?;
     Ok(state)
-}
-
-fn provider_model_step_status(facts: &SetupRuntimeFacts) -> StepStatus {
-    if facts.provider_ready {
-        StepStatus::Verified
-    } else {
-        StepStatus::NeedsAction
-    }
-}
-
-fn provider_model_step_entry_from_facts(facts: &SetupRuntimeFacts) -> StepEntry {
-    StepEntry::new(
-        provider_model_step_status(facts),
-        true,
-        CONSTITUTION_CHECKPOINT_VERSION,
-    )
-    .with_result(facts.provider_result.clone())
 }
 
 #[must_use]
