@@ -78,6 +78,7 @@ pub struct ProviderPickerView {
     selected_idx: usize,
     stage: Stage,
     view: ProviderListView,
+    setup_mode: bool,
     api_key_input: String,
     custom_provider_field: CustomProviderField,
     custom_provider_id: String,
@@ -1134,6 +1135,7 @@ impl ProviderPickerView {
             selected_idx,
             stage: Stage::List,
             view,
+            setup_mode: false,
             api_key_input: String::new(),
             custom_provider_field: CustomProviderField::Name,
             custom_provider_id: String::new(),
@@ -1156,6 +1158,7 @@ impl ProviderPickerView {
     ) -> Self {
         let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
         picker.view = ProviderListView::Catalog;
+        picker.setup_mode = true;
         if let Some(target) = target
             && let Some(idx) = picker.rows.iter().position(|row| row.provider == target)
         {
@@ -1411,9 +1414,11 @@ impl ProviderPickerView {
         } else {
             "set key"
         };
-        let title = match self.view {
-            ProviderListView::Configured => " Provider ".to_string(),
-            ProviderListView::Catalog => " Provider · all ".to_string(),
+        let title = match (self.setup_mode, self.view) {
+            (true, ProviderListView::Configured) => " Provider setup ".to_string(),
+            (true, ProviderListView::Catalog) => " Provider setup · all ".to_string(),
+            (false, ProviderListView::Configured) => " Provider ".to_string(),
+            (false, ProviderListView::Catalog) => " Provider · all ".to_string(),
         };
         let outer = Block::default()
             .title(Line::from(Span::styled(
@@ -1669,15 +1674,20 @@ impl ProviderPickerView {
         ])];
         Paragraph::new(key_lines).render(layout[0], buf);
 
+        let reopen_command = if self.setup_mode {
+            "/setup provider"
+        } else {
+            "/provider"
+        };
         let hint = if codex_oauth {
             format!(
-                "Run `codex login`, or set {} / CODEX_ACCESS_TOKEN and re-open /provider.",
-                self.env_var_for_selected_row()
+                "Run `codex login`, or set {} / CODEX_ACCESS_TOKEN and re-open {reopen_command}.",
+                self.env_var_for_selected_row(),
             )
         } else {
             format!(
-                "Or set the {} environment variable and re-open /provider.",
-                self.env_var_for_selected_row()
+                "Or set the {} environment variable and re-open {reopen_command}.",
+                self.env_var_for_selected_row(),
             )
         };
         Paragraph::new(Line::from(Span::styled(
@@ -3166,6 +3176,47 @@ mod tests {
         assert_eq!(picker.stage, Stage::KeyEntry);
         assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
         assert!(picker.api_key_input.is_empty());
+    }
+
+    #[test]
+    fn setup_catalog_uses_setup_title() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_setup(ApiProvider::Deepseek, None, &config, None);
+
+        let rendered = render_text(&picker, 96, 20);
+
+        assert!(rendered.contains("Provider setup"));
+    }
+
+    #[test]
+    fn setup_catalog_key_entry_uses_setup_reopen_hint() {
+        let config = Config::default();
+        let picker = ProviderPickerView::new_for_setup(
+            ApiProvider::Deepseek,
+            Some(ApiProvider::Anthropic),
+            &config,
+            None,
+        );
+
+        let rendered = render_text(&picker, 96, 20);
+
+        assert!(rendered.contains("API key"));
+        assert!(rendered.contains("/setup provider"));
+        assert!(!rendered.contains("re-open /provider."));
+    }
+
+    #[test]
+    fn default_provider_picker_keeps_provider_reopen_hint() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        move_to_provider(&mut picker, ApiProvider::Anthropic);
+        picker.handle_key(key(KeyCode::Enter));
+
+        let rendered = render_text(&picker, 96, 20);
+
+        assert!(rendered.contains("API key"));
+        assert!(rendered.contains("re-open /provider."));
+        assert!(!rendered.contains("/setup provider"));
     }
 
     #[test]
