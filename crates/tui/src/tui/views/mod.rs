@@ -661,7 +661,8 @@ pub enum ViewEvent {
     /// persisted by this event.
     FleetProfileModelDraftRequested {
         role: String,
-        model_class: String,
+        /// Target model for the worker: a concrete model id, or "inherit".
+        model: String,
         locale: crate::localization::Locale,
     },
     /// Emitted by the `/fleet` roster view (`s` / Enter) to hand off to the

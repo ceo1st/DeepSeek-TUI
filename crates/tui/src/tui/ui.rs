@@ -5597,7 +5597,7 @@ async fn handle_fleet_profile_model_draft(
     app: &mut App,
     config: &Config,
     role: String,
-    model_class: String,
+    model: String,
     locale: crate::localization::Locale,
 ) {
     // Do NOT await the network call on the event loop — that parks the whole
@@ -5652,7 +5652,7 @@ async fn handle_fleet_profile_model_draft(
                 &client,
                 &request_model,
                 &role,
-                &model_class,
+                &model,
                 locale,
                 &fingerprint,
             ),
@@ -10131,10 +10131,10 @@ async fn handle_view_events(
             }
             ViewEvent::FleetProfileModelDraftRequested {
                 role,
-                model_class,
+                model,
                 locale,
             } => {
-                handle_fleet_profile_model_draft(app, config, role, model_class, locale).await;
+                handle_fleet_profile_model_draft(app, config, role, model, locale).await;
             }
             ViewEvent::FleetRosterOpenSetupRequested => {
                 // The roster view hands off to the authoring wizard (same
