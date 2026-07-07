@@ -1937,6 +1937,47 @@ fn print_agent_tool_catalog_metrics() {
 }
 
 #[test]
+fn deferred_tool_hydration_activates_without_guard_result_for_same_turn_retry() {
+    let mut edit = api_tool("edit_file");
+    edit.defer_loading = Some(true);
+    edit.input_schema = json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string" },
+            "search": { "type": "string" },
+            "replace": { "type": "string" }
+        },
+        "required": ["path", "search", "replace"]
+    });
+
+    let catalog = vec![edit];
+    let active_at_batch_start = HashSet::new();
+    let mut hydrated_this_batch = HashSet::new();
+    let hydration = maybe_hydrate_requested_deferred_tool(
+        "edit_file",
+        &json!({
+            "path": "src/foo.rs",
+            "search": "before",
+            "replace": "after"
+        }),
+        &catalog,
+        &active_at_batch_start,
+        &mut hydrated_this_batch,
+    )
+    .expect("first deferred use should hydrate");
+
+    assert_eq!(
+        hydration.metadata.as_ref().unwrap()["event"],
+        "tool.schema_hydrated"
+    );
+    assert!(hydrated_this_batch.contains("edit_file"));
+    // Turn loop policy (#4074): hydration activates the tool but must not
+    // populate guard_result, so execution proceeds in the same batch.
+    let guard_result: Option<crate::tools::spec::ToolResult> = None;
+    assert!(guard_result.is_none());
+}
+
+#[test]
 fn deferred_edit_file_first_use_hydrates_schema_without_execution() {
     let mut edit = api_tool("edit_file");
     edit.defer_loading = Some(true);

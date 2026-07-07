@@ -1899,17 +1899,27 @@ impl Engine {
                         &mut deferred_tools_hydrated_this_batch,
                     )
                 {
+                    emit_tool_audit(json!({
+                        "event": "tool.schema_hydrated",
+                        "tool_id": tool_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "auto_retry_same_turn": true,
+                        "metadata": result.metadata,
+                    }));
                     if should_emit_hydration_status {
                         let status = if requested_tool_name == tool_name {
-                            format!("Auto-loaded deferred tool '{tool_name}' after model request.")
+                            format!(
+                                "Auto-loaded deferred tool '{tool_name}' and retrying the pending call in the same turn."
+                            )
                         } else {
                             format!(
-                                "Auto-loaded deferred tool '{tool_name}' after resolving '{requested_tool_name}'."
+                                "Auto-loaded deferred tool '{tool_name}' after resolving '{requested_tool_name}' and retrying in the same turn."
                             )
                         };
                         let _ = self.tx_event.send(Event::status(status)).await;
                     }
-                    guard_result = Some(result);
+                    // Do not set guard_result: the tool is activated for this batch
+                    // and will execute immediately with the model's original input.
                 }
 
                 plans.push(ToolExecutionPlan {
