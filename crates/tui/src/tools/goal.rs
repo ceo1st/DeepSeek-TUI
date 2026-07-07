@@ -295,7 +295,7 @@ pub fn thread_goal_status_as_goal_status(
 pub fn render_continuation_prompt(snapshot: &GoalSnapshot, continuation_index: u32) -> String {
     let goal_json = serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".to_string());
     format!(
-        "{}\n\n## Active Goal State\n\n```json\n{}\n```\n\nContinuation pass #{}.\nIf the goal is complete, first run or cite a concrete verifier/check, then call `update_goal` with `status: \"complete\"`, concrete evidence, and `verification: {{\"status\":\"passed\",\"check\":\"...\",\"summary\":\"...\"}}`. If it is blocked, call `update_goal` with `status: \"blocked\"` and the blocker. Otherwise continue making progress toward the objective.",
+        "{}\n\n## Active Goal State\n\n```json\n{}\n```\n\nContinuation pass #{}.\nIf the goal is complete, first run or cite a concrete verifier/check when one applies, then call `update_goal` with `status: \"complete\"`, concrete evidence, and `verification: {{\"status\":\"passed\",\"check\":\"...\",\"summary\":\"...\"}}`. For non-verifiable work (docs, research, writing), use `verification: {{\"status\":\"not_applicable\",\"check\":\"...\",\"summary\":\"...\"}}` with a clear rationale instead of fabricating a verifier receipt. If it is blocked, call `update_goal` with `status: \"blocked\"` and the blocker. Otherwise continue making progress toward the objective.",
         crate::prompts::GOAL_CONTINUATION_PROMPT.trim(),
         goal_json,
         continuation_index,
@@ -335,11 +335,15 @@ fn parse_completion_verification(input: &Value) -> Result<GoalCompletionVerifica
     };
     let verification: GoalCompletionVerification = serde_json::from_value(raw.clone())
         .map_err(|err| ToolError::invalid_input(format!("invalid verification: {err}")))?;
-    if verification.status.trim() != "passed" {
-        return Err(ToolError::invalid_input(
-            "verification.status must be 'passed' before update_goal can mark a goal complete",
-        ));
-    }
+    let status = verification.status.trim();
+    let normalized_status = match status {
+        "passed" | "not_applicable" => status,
+        other => {
+            return Err(ToolError::invalid_input(format!(
+                "verification.status must be 'passed' or 'not_applicable' before update_goal can mark a goal complete; got '{other}'"
+            )));
+        }
+    };
     if verification.check.trim().is_empty() {
         return Err(ToolError::invalid_input("verification.check is required"));
     }
@@ -347,7 +351,7 @@ fn parse_completion_verification(input: &Value) -> Result<GoalCompletionVerifica
         return Err(ToolError::invalid_input("verification.summary is required"));
     }
     Ok(GoalCompletionVerification {
-        status: "passed".to_string(),
+        status: normalized_status.to_string(),
         check: verification.check.trim().to_string(),
         summary: verification.summary.trim().to_string(),
     })
@@ -514,8 +518,8 @@ impl ToolSpec for UpdateGoalTool {
                     "properties": {
                         "status": {
                             "type": "string",
-                            "enum": ["passed"],
-                            "description": "Must be passed before the goal can be marked complete."
+                            "enum": ["passed", "not_applicable"],
+                            "description": "Use passed when a concrete verifier/check succeeded; not_applicable when no automated verifier applies."
                         },
                         "check": {
                             "type": "string",
@@ -666,6 +670,35 @@ mod tests {
             .expect_err("missing evidence should fail");
 
         assert!(err.to_string().contains("evidence is required"));
+    }
+
+    #[tokio::test]
+    async fn update_goal_accepts_not_applicable_verification_for_non_verifiable_goals() {
+        let state = new_shared_goal_state_from_host_status(
+            Some("write the release notes".to_string()),
+            None,
+            GoalStatus::Active,
+        );
+        let update = UpdateGoalTool::new(state.clone());
+        let completed = update
+            .execute(
+                json!({
+                    "status": "complete",
+                    "evidence": "release notes drafted and reviewed in thread",
+                    "verification": {
+                        "status": "not_applicable",
+                        "check": "no automated verifier applies",
+                        "summary": "writing task completed with evidence in thread"
+                    }
+                }),
+                &ToolContext::new("."),
+            )
+            .await
+            .expect("non-verifiable goal should complete");
+
+        assert!(completed.content.contains("\"status\": \"complete\""));
+        assert!(completed.content.contains("\"status\": \"not_applicable\""));
+        assert!(!state.lock().expect("goal lock").is_active());
     }
 
     #[tokio::test]
