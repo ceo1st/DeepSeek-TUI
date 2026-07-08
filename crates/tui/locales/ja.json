@@ -722,5 +722,16 @@
     "SetupGuidedEvidenceAssumptions": "前提を示す",
     "SetupGuidedEvidenceTestsAndReceipts": "テスト/証跡",
     "SetupGuidedEvidenceReleaseReceipts": "リリース証跡",
-    "SetupGuidedNotes": "ガイド回答：用途={purpose}；主体性={initiative}；証拠={evidence}；コミュニケーション={communication}；プライバシー={privacy}；原則={principles}。{notes} 自由記入の原則は助言であり、承認、サンドボックス、Shell、ネットワーク、信頼、MCP 権限を変更しません。"
+    "SetupGuidedNotes": "ガイド回答：用途={purpose}；主体性={initiative}；証拠={evidence}；コミュニケーション={communication}；プライバシー={privacy}；原則={principles}。{notes} 自由記入の原則は助言であり、承認、サンドボックス、Shell、ネットワーク、信頼、MCP 権限を変更しません。",
+    "OnboardWelcomeVersion": "バージョン {version}",
+    "OnboardWelcomeLead": "ここでの code には二つの意味があります。あなたが出荷するソフトウェアと、このエージェントが従う規範です。",
+    "OnboardWelcomeSetupBlurb": "セットアップは既存の設定に合わせて調整されます。表示される画面は次のものだけです。",
+    "OnboardWelcomeSteps": "次: {steps}。",
+    "OnboardWelcomeStepLanguage": "言語を選択",
+    "OnboardWelcomeStepApiKey": "API キーを接続",
+    "OnboardWelcomeStepTrust": "ワークスペースを信頼",
+    "OnboardWelcomeStepTips": "セットアップのヒント",
+    "OnboardWelcomeDefaults": "同梱のデフォルトは有効です。/constitution でいつでも変更できます。",
+    "OnboardWelcomeEnter": "Enter で続行。",
+    "OnboardWelcomeExit": "いつでも Ctrl+C で終了できます。"
 }

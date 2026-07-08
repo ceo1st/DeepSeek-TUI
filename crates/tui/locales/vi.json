@@ -722,5 +722,16 @@
     "SetupGuidedEvidenceAssumptions": "nêu giả định",
     "SetupGuidedEvidenceTestsAndReceipts": "kiểm tra/biên nhận",
     "SetupGuidedEvidenceReleaseReceipts": "biên nhận phát hành",
-    "SetupGuidedNotes": "Câu trả lời hướng dẫn: mục đích={purpose}; chủ động={initiative}; bằng chứng={evidence}; giao tiếp={communication}; riêng tư={privacy}; nguyên tắc={principles}. {notes} Nguyên tắc văn bản tự do chỉ mang tính tư vấn và không thay đổi quyền phê duyệt, sandbox, shell, mạng, tin cậy hay MCP."
+    "SetupGuidedNotes": "Câu trả lời hướng dẫn: mục đích={purpose}; chủ động={initiative}; bằng chứng={evidence}; giao tiếp={communication}; riêng tư={privacy}; nguyên tắc={principles}. {notes} Nguyên tắc văn bản tự do chỉ mang tính tư vấn và không thay đổi quyền phê duyệt, sandbox, shell, mạng, tin cậy hay MCP.",
+    "OnboardWelcomeVersion": "Phiên bản {version}",
+    "OnboardWelcomeLead": "Code có hai nghĩa ở đây: phần mềm bạn tạo ra và luật mà agent này tuân theo.",
+    "OnboardWelcomeSetupBlurb": "Thiết lập sẽ điều chỉnh theo cấu hình hiện có; chỉ các màn hình sau sẽ xuất hiện.",
+    "OnboardWelcomeSteps": "Tiếp theo: {steps}.",
+    "OnboardWelcomeStepLanguage": "chọn ngôn ngữ",
+    "OnboardWelcomeStepApiKey": "kết nối khóa API",
+    "OnboardWelcomeStepTrust": "tin cậy workspace",
+    "OnboardWelcomeStepTips": "mẹo thiết lập",
+    "OnboardWelcomeDefaults": "Các mặc định đi kèm đã hợp lệ; có thể chỉnh bất cứ lúc nào bằng /constitution.",
+    "OnboardWelcomeEnter": "Nhấn Enter để tiếp tục.",
+    "OnboardWelcomeExit": "Ctrl+C để thoát bất cứ lúc nào."
 }

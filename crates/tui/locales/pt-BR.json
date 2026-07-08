@@ -722,5 +722,16 @@
     "SetupGuidedEvidenceAssumptions": "declarar premissas",
     "SetupGuidedEvidenceTestsAndReceipts": "testes e recibos",
     "SetupGuidedEvidenceReleaseReceipts": "recibos de lançamento",
-    "SetupGuidedNotes": "Respostas guiadas: propósito={purpose}; iniciativa={initiative}; evidência={evidence}; comunicação={communication}; privacidade={privacy}; princípios={principles}. {notes} Princípios livres são orientações e não alteram aprovação, sandbox, shell, rede, confiança nem permissões MCP."
+    "SetupGuidedNotes": "Respostas guiadas: propósito={purpose}; iniciativa={initiative}; evidência={evidence}; comunicação={communication}; privacidade={privacy}; princípios={principles}. {notes} Princípios livres são orientações e não alteram aprovação, sandbox, shell, rede, confiança nem permissões MCP.",
+    "OnboardWelcomeVersion": "Versão {version}",
+    "OnboardWelcomeLead": "Código significa duas coisas aqui: o software que você entrega e a lei sob a qual este agente trabalha.",
+    "OnboardWelcomeSetupBlurb": "O setup se adapta ao que já está configurado; apenas estas telas aparecerão.",
+    "OnboardWelcomeSteps": "Próximo: {steps}.",
+    "OnboardWelcomeStepLanguage": "escolher idioma",
+    "OnboardWelcomeStepApiKey": "conectar chave de API",
+    "OnboardWelcomeStepTrust": "confiar no workspace",
+    "OnboardWelcomeStepTips": "dicas de setup",
+    "OnboardWelcomeDefaults": "Os padrões incluídos são válidos; ajuste a qualquer momento com /constitution.",
+    "OnboardWelcomeEnter": "Pressione Enter para continuar.",
+    "OnboardWelcomeExit": "Ctrl+C sai a qualquer momento."
 }

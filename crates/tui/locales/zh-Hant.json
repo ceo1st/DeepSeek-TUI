@@ -433,5 +433,16 @@
     "SetupGuidedEvidenceAssumptions": "說明假設",
     "SetupGuidedEvidenceTestsAndReceipts": "測試/憑據",
     "SetupGuidedEvidenceReleaseReceipts": "發布憑據",
-    "SetupGuidedNotes": "引導式答案：用途={purpose}；主動性={initiative}；證據={evidence}；溝通={communication}；隱私={privacy}；原則={principles}。{notes} 自由文字原則只作為建議，不會改變審批、沙箱、Shell、網路、信任或 MCP 權限。"
+    "SetupGuidedNotes": "引導式答案：用途={purpose}；主動性={initiative}；證據={evidence}；溝通={communication}；隱私={privacy}；原則={principles}。{notes} 自由文字原則只作為建議，不會改變審批、沙箱、Shell、網路、信任或 MCP 權限。",
+    "OnboardWelcomeVersion": "版本 {version}",
+    "OnboardWelcomeLead": "程式碼在這裡有兩層含義：你交付的軟體，以及此代理遵守的規則。",
+    "OnboardWelcomeSetupBlurb": "設定會依照既有配置調整；只會顯示下面這些頁面。",
+    "OnboardWelcomeSteps": "接下來：{steps}。",
+    "OnboardWelcomeStepLanguage": "選擇語言",
+    "OnboardWelcomeStepApiKey": "連接 API 金鑰",
+    "OnboardWelcomeStepTrust": "信任工作區",
+    "OnboardWelcomeStepTips": "設定提示",
+    "OnboardWelcomeDefaults": "內建預設規則已有效；可隨時用 /constitution 修改。",
+    "OnboardWelcomeEnter": "按 Enter 繼續。",
+    "OnboardWelcomeExit": "任何時候按 Ctrl+C 結束。"
 }

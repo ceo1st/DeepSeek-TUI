@@ -722,5 +722,16 @@
     "SetupGuidedEvidenceAssumptions": "说明假设",
     "SetupGuidedEvidenceTestsAndReceipts": "测试/凭据",
     "SetupGuidedEvidenceReleaseReceipts": "发布凭据",
-    "SetupGuidedNotes": "引导式答案：用途={purpose}；主动性={initiative}；证据={evidence}；沟通={communication}；隐私={privacy}；原则={principles}。{notes} 自由文本原则只作为建议，不会改变审批、沙箱、Shell、网络、信任或 MCP 权限。"
+    "SetupGuidedNotes": "引导式答案：用途={purpose}；主动性={initiative}；证据={evidence}；沟通={communication}；隐私={privacy}；原则={principles}。{notes} 自由文本原则只作为建议，不会改变审批、沙箱、Shell、网络、信任或 MCP 权限。",
+    "OnboardWelcomeVersion": "版本 {version}",
+    "OnboardWelcomeLead": "代码在这里有两层含义：你交付的软件，以及此代理遵守的规则。",
+    "OnboardWelcomeSetupBlurb": "设置会根据已有配置调整；只会显示下面这些页面。",
+    "OnboardWelcomeSteps": "接下来：{steps}。",
+    "OnboardWelcomeStepLanguage": "选择语言",
+    "OnboardWelcomeStepApiKey": "连接 API 密钥",
+    "OnboardWelcomeStepTrust": "信任工作区",
+    "OnboardWelcomeStepTips": "设置提示",
+    "OnboardWelcomeDefaults": "内置默认规则已经有效；可随时用 /constitution 修改。",
+    "OnboardWelcomeEnter": "按 Enter 继续。",
+    "OnboardWelcomeExit": "任何时候按 Ctrl+C 退出。"
 }
