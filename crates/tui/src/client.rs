@@ -1735,7 +1735,10 @@ fn parse_openrouter_models_response(
 }
 
 fn publish_provider_lake_snapshot(cache: &ProviderCatalogCache) {
-    let offerings = cache.all_fresh_offerings(now_unix());
+    // Publish fresh *and* stale/prior rows so pickers keep live catalog coverage
+    // after TTL expiry or a failed refresh (#4139). Empty caches clear the live
+    // layer and fall back to the bundled snapshot.
+    let offerings = cache.all_visible_offerings(now_unix());
     if offerings.is_empty() {
         crate::provider_lake::clear_live_snapshot();
     } else {
@@ -4640,6 +4643,16 @@ mod tests {
             "rows from the prior success must survive a failed refresh"
         );
         assert!(matches!(cached.status, CatalogStatus::Failed { .. }));
+
+        // #4139: failed/stale rows must still publish into ProviderLake so
+        // pickers keep live coverage instead of dropping back to bundled-only.
+        let visible = cache.all_visible_offerings(now_unix());
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].wire_model_id, "synthetic-model-gamma");
+        assert!(
+            cache.all_fresh_offerings(now_unix()).is_empty(),
+            "Failed entries are not fresh, but they remain visible"
+        );
     }
 
     #[tokio::test]

@@ -526,6 +526,23 @@ impl ProviderCatalogCache {
             .flat_map(|entry| entry.offerings.clone())
             .collect()
     }
+
+    /// Live offerings that pickers may still show: fresh rows plus stale / prior
+    /// rows that survived a failed refresh (#4139).
+    ///
+    /// Unlike [`Self::all_fresh_offerings`], this keeps past-TTL and
+    /// `Failed`-status entries as long as they still hold offering rows. Empty
+    /// entries contribute nothing; callers fall back to the bundled snapshot.
+    /// `now_unix` is accepted for API symmetry with the fresh helper (age chips
+    /// live above this layer).
+    #[must_use]
+    pub fn all_visible_offerings(&self, _now_unix: u64) -> Vec<CatalogOffering> {
+        self.entries
+            .values()
+            .filter(|entry| !entry.offerings.is_empty())
+            .flat_map(|entry| entry.offerings.clone())
+            .collect()
+    }
 }
 
 /// A compiled, layer-merged catalog snapshot.

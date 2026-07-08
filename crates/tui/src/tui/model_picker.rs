@@ -19,6 +19,7 @@ use ratatui::{
 
 use crate::config::{ApiProvider, Config};
 use crate::model_registry;
+use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
 use crate::provider_lake::{all_catalog_models_for_provider, configured_providers};
 use crate::tui::app::{App, ReasoningEffort};
@@ -702,6 +703,18 @@ fn push_model_row(
     rows.push(ModelPickerRow { id, provider, hint });
 }
 
+/// Compact Models.dev freshness chip for the picker chrome (#4139).
+///
+/// Fresh/live rows stay unmarked; stale and failed caches get an explicit
+/// suffix so users know the live layer is still visible but not current.
+fn catalog_freshness_title_suffix() -> &'static str {
+    match models_dev_live::status().freshness {
+        ModelsDevFreshness::Stale => " · stale",
+        ModelsDevFreshness::Failed => " · cache failed",
+        ModelsDevFreshness::Bundled | ModelsDevFreshness::Live => "",
+    }
+}
+
 /// Cross-field search (#4141): match a query against the provider name
 /// (provider key + display name), the display model name, and the wire model
 /// id, mirroring `ProviderDashboardRow::matches_query` so the two pickers behave
@@ -949,8 +962,15 @@ impl ModelPickerView {
         let outer = Block::default()
             .title(Line::from(Span::styled(
                 match self.view {
-                    ModelListView::Configured => " Model & thinking ",
-                    ModelListView::Catalog => " Model & thinking · all ",
+                    ModelListView::Configured => {
+                        format!(" Model & thinking{} ", catalog_freshness_title_suffix())
+                    }
+                    ModelListView::Catalog => {
+                        format!(
+                            " Model & thinking · all{} ",
+                            catalog_freshness_title_suffix()
+                        )
+                    }
                 },
                 Style::default()
                     .fg(palette::WHALE_INFO)

@@ -35,6 +35,7 @@ use crate::config::{
 };
 use crate::core::ops::ProviderRuntimeStatus;
 use crate::model_profile::{SupportState, resolved_capability_profile};
+use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
 use crate::provider_lake::catalog_model_count_for_provider;
 use crate::tui::app::ReasoningEffort;
@@ -755,6 +756,15 @@ impl ProviderReadiness {
             Self::Legacy => "legacy",
             Self::Invalid => "invalid",
         }
+    }
+}
+
+/// Compact Models.dev freshness chip for the provider picker chrome (#4139).
+fn catalog_freshness_title_suffix() -> &'static str {
+    match models_dev_live::status().freshness {
+        ModelsDevFreshness::Stale => " · stale",
+        ModelsDevFreshness::Failed => " · cache failed",
+        ModelsDevFreshness::Bundled | ModelsDevFreshness::Live => "",
     }
 }
 
@@ -1481,10 +1491,18 @@ impl ProviderPickerView {
             "set key"
         };
         let title = match (self.setup_mode, self.view) {
-            (true, ProviderListView::Configured) => " Provider setup ".to_string(),
-            (true, ProviderListView::Catalog) => " Provider setup · all ".to_string(),
-            (false, ProviderListView::Configured) => " Provider ".to_string(),
-            (false, ProviderListView::Catalog) => " Provider · all ".to_string(),
+            (true, ProviderListView::Configured) => {
+                format!(" Provider setup{} ", catalog_freshness_title_suffix())
+            }
+            (true, ProviderListView::Catalog) => {
+                format!(" Provider setup · all{} ", catalog_freshness_title_suffix())
+            }
+            (false, ProviderListView::Configured) => {
+                format!(" Provider{} ", catalog_freshness_title_suffix())
+            }
+            (false, ProviderListView::Catalog) => {
+                format!(" Provider · all{} ", catalog_freshness_title_suffix())
+            }
         };
         let outer = Block::default()
             .title(Line::from(Span::styled(

@@ -227,7 +227,13 @@ pub async fn refresh(force_network: bool) -> Result<usize, ModelsDevRefreshError
     }
 
     let url = resolve_catalog_url();
-    let body = fetch_catalog_body(&url).await?;
+    let body = match fetch_catalog_body(&url).await {
+        Ok(body) => body,
+        Err(err) => {
+            mark_failed(err.clone());
+            return Err(err);
+        }
+    };
     let fetched_at = now_unix();
     let fingerprint = base_url_fingerprint(&url);
     let count = publish_from_body(
@@ -278,9 +284,14 @@ pub fn spawn_background_refresh() {
 }
 
 async fn refresh_from_path(path: &Path) -> Result<usize, ModelsDevRefreshError> {
-    let body = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|err| ModelsDevRefreshError::Io(err.to_string()))?;
+    let body = match tokio::fs::read_to_string(path).await {
+        Ok(body) => body,
+        Err(err) => {
+            let mapped = ModelsDevRefreshError::Io(err.to_string());
+            mark_failed(mapped.clone());
+            return Err(mapped);
+        }
+    };
     let fetched_at = now_unix();
     let label = format!("file:{}", path.display());
     let fingerprint = base_url_fingerprint(&label);
@@ -322,9 +333,7 @@ async fn fetch_catalog_body(url: &str) -> Result<String, ModelsDevRefreshError> 
 
     let status = response.status();
     if !status.is_success() {
-        let err = ModelsDevRefreshError::HttpStatus(status.as_u16());
-        mark_failed(err.clone());
-        return Err(err);
+        return Err(ModelsDevRefreshError::HttpStatus(status.as_u16()));
     }
 
     response
@@ -365,12 +374,9 @@ fn publish_from_body(
 
 fn mark_failed(err: ModelsDevRefreshError) {
     let mut next = status();
-    // Keep prior offering_count / fetched_at so UI can still show stale rows.
-    next.freshness = if next.offering_count > 0 {
-        ModelsDevFreshness::Stale
-    } else {
-        ModelsDevFreshness::Failed
-    };
+    // Keep prior offering_count / fetched_at so UI can still show the last
+    // rows, but mark the last refresh outcome distinctly from TTL staleness.
+    next.freshness = ModelsDevFreshness::Failed;
     next.last_error = Some(err.to_string());
     set_status(next);
 }
@@ -556,6 +562,9 @@ mod tests {
 
         let after = all_catalog_models_for_provider(ApiProvider::Together);
         assert_eq!(after, before, "bundled rows must survive parse failure");
+        let st = status();
+        assert_eq!(st.freshness, ModelsDevFreshness::Failed);
+        assert!(st.last_error.is_some());
         clear_live_snapshot();
     }
 
@@ -589,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn network_failure_keeps_prior_rows() {
+    fn network_failure_keeps_prior_rows_and_marks_failed() {
         let _lock = lock_test_env();
         clear_live_snapshot();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -618,6 +627,13 @@ mod tests {
         assert!(
             together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"),
             "prior live rows must survive network failure"
+        );
+        let st = status();
+        assert_eq!(st.freshness, ModelsDevFreshness::Failed);
+        assert!(st.last_error.is_some());
+        assert!(
+            st.offering_count >= 2,
+            "status should retain prior live row count after failure"
         );
         clear_live_snapshot();
     }

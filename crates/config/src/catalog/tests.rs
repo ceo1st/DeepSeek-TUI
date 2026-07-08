@@ -497,6 +497,12 @@ fn all_fresh_offerings_spans_providers_and_skips_stale() {
     let fresh = cache.all_fresh_offerings(1_100);
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].wire_model_id, "fresh-row");
+
+    // #4139: pickers still see stale rows; only the fresh helper drops them.
+    let visible = cache.all_visible_offerings(1_100);
+    assert_eq!(visible.len(), 2);
+    assert!(visible.iter().any(|row| row.wire_model_id == "fresh-row"));
+    assert!(visible.iter().any(|row| row.wire_model_id == "stale-row"));
 }
 
 #[test]
