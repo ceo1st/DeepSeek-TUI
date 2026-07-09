@@ -812,6 +812,7 @@ dependencies = [
  "codewhale-release",
  "codewhale-secrets",
  "codewhale-state",
+ "codewhale-workflow",
  "dirs",
  "libc",
  "mimalloc",

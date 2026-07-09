@@ -12,10 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use codewhale_workflow::{
     AgentType, BranchResult, BranchSpec, BudgetSpec, ControlNodeKind, ControlNodeResult,
-    LeafResult, LeafSpec, ReduceSpec, SequenceSpec, TaskMode,
+    FleetRoleMap, LeafResult, LeafSpec, ReduceSpec, SequenceSpec, TaskMode,
     WorkflowExecution as IrWorkflowExecution, WorkflowMemoUsage, WorkflowNode,
     WorkflowRunStatus as IrWorkflowRunStatus, WorkflowSpec, WorkflowUsage,
     compile_javascript_workflow, compile_typescript_workflow, leaf_wants_worktree,
+    load_named_fleet, resolve_workflow_agent,
 };
 use codewhale_workflow_js::{
     BudgetSnapshot, DriverError, ProgressEvent, SpawnedTask, TaskCompletion, TaskRequest,
@@ -392,6 +393,10 @@ impl ToolSpec for WorkflowTool {
                     "type": "string",
                     "description": "Path to a .workflow.js script inside the workspace. Use instead of script for checked-in workflows."
                 },
+                "fleet": {
+                    "type": "string",
+                    "description": "Named Fleet roster to resolve task({ role }) declarations, loaded from $CODEWHALE_HOME/fleets/ or workspace fleets/."
+                },
                 "plan": {
                     "type": "object",
                     "description": "Structured planner plan JSON (#4124). Alternative to script/source_path. Accepts goal, risk, max_children, token_budget, phases[], and/or children[] (or IR nodes). Lowered to Workflow JS with parallel() partial-success semantics."
@@ -498,6 +503,7 @@ async fn start_workflow(
     let token_budget = optional_u64(&input, "token_budget", 0);
     let token_budget = (token_budget > 0).then_some(token_budget);
     let verify_on_complete = optional_bool(&input, "verify", false);
+    let (fleet_name, fleet_roles) = workflow_fleet_roles(&input, context)?;
     let run_id = format!("workflow_{}", &Uuid::new_v4().to_string()[..8]);
 
     // Capture the approved plan envelope for audit/receipt (#4126). Reaching
@@ -558,6 +564,8 @@ async fn start_workflow(
         runtime,
         state.clone(),
         token_budget,
+        fleet_name,
+        fleet_roles,
     );
     let vm_cancel = WorkflowRunCancel::new();
     let controller = Arc::new(WorkflowRunController::new(
@@ -643,6 +651,74 @@ async fn cancel_workflow(
     };
     state.record_snapshot(&snapshot);
     workflow_result_for(run_id, state)
+}
+
+fn workflow_fleet_name(input: &Value) -> Option<String> {
+    optional_str(input, "fleet")
+        .or_else(|| {
+            input
+                .get("args")
+                .and_then(|args| optional_str(args, "fleet"))
+        })
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn workflow_fleet_roles(
+    input: &Value,
+    context: &ToolContext,
+) -> Result<(Option<String>, Option<FleetRoleMap>), ToolError> {
+    let Some(name) = workflow_fleet_name(input) else {
+        return Ok((None, None));
+    };
+    let roots = workflow_fleet_search_roots(&context.workspace);
+    let fleet = load_named_fleet(&name, &roots).map_err(|err| {
+        ToolError::invalid_input(format!(
+            "Failed to load workflow fleet '{name}' from {}: {err}",
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    let roles = FleetRoleMap::from_pairs(
+        fleet
+            .roles
+            .iter()
+            .map(|(role, profile)| (role.as_str(), profile.as_str())),
+    )
+    .map_err(|err| ToolError::invalid_input(err.to_string()))?;
+    Ok((Some(name), Some(roles)))
+}
+
+fn workflow_fleet_search_roots(workspace: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(home) = codewhale_config::codewhale_home() {
+        roots.push(home);
+    }
+    roots.push(workspace.to_path_buf());
+    roots
+}
+
+fn apply_named_fleet_to_task_request(
+    fleet_roles: Option<&FleetRoleMap>,
+    request: &mut TaskRequest,
+) -> Result<(), DriverError> {
+    let Some(fleet_roles) = fleet_roles else {
+        return Ok(());
+    };
+    let resolved = resolve_workflow_agent(
+        request.role.as_deref(),
+        request.profile.as_deref(),
+        fleet_roles,
+        true,
+    )
+    .map_err(|err| DriverError::Rejected(err.to_string()))?;
+    request.role = resolved.resolved_role;
+    request.profile = Some(resolved.resolved_profile);
+    Ok(())
 }
 
 // Pre-existing spawn signature that grew `vm_cancel` for the cancel-interrupt
@@ -1645,6 +1721,9 @@ struct SubAgentWorkflowDriver {
     concurrent_gate: Arc<Semaphore>,
     /// Held permits for in-flight children; released on completion/cancel.
     spawn_permits: Mutex<HashMap<String, OwnedSemaphorePermit>>,
+    /// Optional named Fleet roster for resolving Workflow task roles (#4177/#4178).
+    fleet_name: Option<String>,
+    fleet_roles: Option<FleetRoleMap>,
 }
 
 impl SubAgentWorkflowDriver {
@@ -1654,6 +1733,8 @@ impl SubAgentWorkflowDriver {
         runtime: SubAgentRuntime,
         state: Arc<WorkflowWorkspaceState>,
         total_budget: Option<u64>,
+        fleet_name: Option<String>,
+        fleet_roles: Option<FleetRoleMap>,
     ) -> Arc<Self> {
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
         let driver = Arc::new(Self {
@@ -1671,6 +1752,8 @@ impl SubAgentWorkflowDriver {
             last_budget_event: Arc::new(Mutex::new(None)),
             concurrent_gate: Arc::new(Semaphore::new(WORKFLOW_MAX_CONCURRENT.max(1))),
             spawn_permits: Mutex::new(HashMap::new()),
+            fleet_name,
+            fleet_roles,
         });
         spawn_completion_pump(driver.clone(), completion_rx);
         driver
@@ -1915,7 +1998,16 @@ struct CompletionState {
 
 #[async_trait]
 impl WorkflowDriver for SubAgentWorkflowDriver {
-    async fn spawn_task(&self, request: TaskRequest) -> Result<SpawnedTask, DriverError> {
+    async fn spawn_task(&self, mut request: TaskRequest) -> Result<SpawnedTask, DriverError> {
+        apply_named_fleet_to_task_request(self.fleet_roles.as_ref(), &mut request).map_err(
+            |err| {
+                if let Some(fleet) = self.fleet_name.as_deref() {
+                    DriverError::Rejected(format!("fleet `{fleet}` role resolution failed: {err}"))
+                } else {
+                    err
+                }
+            },
+        )?;
         // Wait for a concurrent slot (max 16 live children per run).
         let permit = self
             .concurrent_gate
@@ -2743,6 +2835,67 @@ mod tests {
         assert_eq!(
             parse_workflow_action(&json!({"action": "run"})).unwrap(),
             WorkflowAction::Run
+        );
+    }
+
+    #[test]
+    fn named_fleet_maps_workflow_role_to_profile_before_spawn() {
+        let fleet = FleetRoleMap::from_pairs([
+            ("scout", "scout"),
+            ("implementer", "builder"),
+            ("reviewer", "reviewer"),
+            ("verifier", "verifier"),
+            ("release_lead", "manager"),
+        ])
+        .expect("fleet");
+        let mut request = TaskRequest {
+            description: "fix it".to_string(),
+            subagent_type: None,
+            role: Some("implementer".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: true,
+            allowed_tools: None,
+            max_depth: None,
+            token_budget: None,
+            response_schema: None,
+            label: Some("fix".to_string()),
+            phase: Some("implement".to_string()),
+        };
+
+        apply_named_fleet_to_task_request(Some(&fleet), &mut request).expect("resolve");
+
+        assert_eq!(request.role.as_deref(), Some("implementer"));
+        assert_eq!(request.profile.as_deref(), Some("builder"));
+    }
+
+    #[test]
+    fn named_fleet_rejects_unknown_workflow_role_before_spawn() {
+        let fleet = FleetRoleMap::from_pairs([("scout", "scout")]).expect("fleet");
+        let mut request = TaskRequest {
+            description: "fix it".to_string(),
+            subagent_type: None,
+            role: Some("wizard".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: false,
+            allowed_tools: None,
+            max_depth: None,
+            token_budget: None,
+            response_schema: None,
+            label: None,
+            phase: None,
+        };
+
+        let err = apply_named_fleet_to_task_request(Some(&fleet), &mut request)
+            .expect_err("unknown role should fail");
+        assert!(
+            err.to_string().contains("unknown fleet role `wizard`"),
+            "{err}"
         );
     }
 

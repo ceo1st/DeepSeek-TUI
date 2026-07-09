@@ -116,26 +116,29 @@ git checkout -b codex/v0868-stopship-<issue>
 
 Named fleet file: [`fleets/v0868-stopship.toml`](../fleets/v0868-stopship.toml)
 (roles: `scout`, `implementer`, `reviewer`, `verifier`, `release_lead`).
-Workflow: `workflows/v0868_stopship_lane.workflow.js` (steps bind
-`profile` / fleet roles — not raw provider/model identity).
+Workflow: `workflows/v0868_stopship_lane.workflow.js` (steps bind fleet
+`role` — not raw provider/model identity).
 
-**Target shape** (requires Phase 1 Lane CLI #4176 + Phase 2 role resolution #4177):
+**Target shape** (Phase 1 Lane CLI #4176 + Phase 2 role resolution #4177):
 
 ```bash
-# Create a durable tmux-backed lane bound to stopship + fleet
-codewhale lane start \
-  --workflow stopship \
+# Create a durable tmux-backed lane bound to stopship + fleet and launch Workflow
+codewhale workflow run stopship \
+  --issue 4090 \
   --fleet v0868-stopship \
   --runtime tmux \
-  --issue 4090 \
-  -- codewhale exec --auto --output-format stream-json \
-    "Run workflows/v0868_stopship_lane.workflow.js with fleet v0868-stopship. Fix #4090, #4093, #4094. Branch from main."
+  --goal "Fix #4090, #4093, #4094. Branch implementation from main."
 
 codewhale lane list
 codewhale lane attach <lane-id>          # or: codewhale lane attach <lane-id> --print
 codewhale lane logs <lane-id>
 codewhale lane stop <lane-id>
 ```
+
+`workflow run` validates the checked-in Workflow source and named Fleet roster,
+creates the Lane record, and starts the existing headless Workflow tool via the
+selected Runtime backend. The Workflow driver resolves each `task({ role })`
+through the named fleet before spawning sub-agents.
 
 Validate fleet role resolution without launching agents:
 
@@ -144,7 +147,7 @@ Validate fleet role resolution without launching agents:
 cargo test -p codewhale-workflow --lib named_fleet
 ```
 
-### Interim paths (until `workflow run --fleet` lands)
+### Direct tool paths
 
 From CodeWhale TUI or headless exec:
 
