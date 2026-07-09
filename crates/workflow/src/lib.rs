@@ -6,6 +6,7 @@
 
 mod js_authoring;
 mod model_policy;
+mod named_fleet;
 mod replay;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +20,10 @@ pub use js_authoring::{
     compile_typescript_workflow,
 };
 pub use model_policy::*;
+pub use named_fleet::{
+    NamedFleet, NamedFleetError, STOPSHIP_REQUIRED_ROLES, load_named_fleet, load_named_fleet_file,
+    parse_named_fleet,
+};
 pub use replay::*;
 
 /// Default hard ceiling on total agents a Fleet-shaped Workflow plan may launch.

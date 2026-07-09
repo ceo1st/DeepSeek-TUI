@@ -112,12 +112,46 @@ git checkout main && git pull origin main
 git checkout -b codex/v0868-stopship-<issue>
 ```
 
+### Fleet-backed stopship lane (dogfood #4178)
+
+Named fleet file: [`fleets/v0868-stopship.toml`](../fleets/v0868-stopship.toml)
+(roles: `scout`, `implementer`, `reviewer`, `verifier`, `release_lead`).
+Workflow: `workflows/v0868_stopship_lane.workflow.js` (steps bind
+`profile` / fleet roles — not raw provider/model identity).
+
+**Target shape** (requires Phase 1 Lane CLI #4176 + Phase 2 role resolution #4177):
+
+```bash
+# Create a durable tmux-backed lane bound to stopship + fleet
+codewhale lane start \
+  --workflow stopship \
+  --fleet v0868-stopship \
+  --runtime tmux \
+  --issue 4090 \
+  -- codewhale exec --auto --output-format stream-json \
+    "Run workflows/v0868_stopship_lane.workflow.js with fleet v0868-stopship. Fix #4090, #4093, #4094. Branch from main."
+
+codewhale lane list
+codewhale lane attach <lane-id>          # or: codewhale lane attach <lane-id> --print
+codewhale lane logs <lane-id>
+codewhale lane stop <lane-id>
+```
+
+Validate fleet role resolution without launching agents:
+
+```bash
+# Pure unit path (CI-safe)
+cargo test -p codewhale-workflow --lib named_fleet
+```
+
+### Interim paths (until `workflow run --fleet` lands)
+
 From CodeWhale TUI or headless exec:
 
 ```bash
-# Headless stopship lane (preferred for CI/VM agents)
+# Headless stopship lane (preferred for CI/VM agents today)
 codewhale exec --auto --output-format stream-json \
-  "Run workflows/v0868_stopship_lane.workflow.js on branch codex/v0868-stopship. Fix #4090, #4093, #4094. Branch from main."
+  "Run workflows/v0868_stopship_lane.workflow.js on branch codex/v0868-stopship. Fix #4090, #4093, #4094. Branch from main. Use fleet profiles scout/builder/reviewer/verifier from fleets/v0868-stopship.toml."
 
 # Per-issue headless (single stopship issue)
 codewhale exec --auto --output-format stream-json \
@@ -129,6 +163,7 @@ codewhale exec --auto --output-format stream-json \
 
 Workflows use read-only scouts first, then implementation agents in sequence.
 Write agents require approval in default modes; use `--auto` for headless VM runs.
+Do **not** close #4090/#4093/#4094 until human-verified on `main`.
 
 ## Per-issue implementation (single issue)
 
