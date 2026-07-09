@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,7 +32,7 @@ use crate::tools::spec::{
 };
 use crate::tools::subagent::{
     SharedSubAgentManager, SubAgentCompletion, SubAgentRuntime, SubAgentStatus,
-    WorkflowTaskSpawnMetadata, spawn_workflow_task,
+    WorkflowTaskSpawnIdentity, WorkflowTaskSpawnMetadata, spawn_workflow_task,
 };
 use crate::tools::verifier::run_workflow_completion_gates;
 use crate::utils::spawn_supervised;
@@ -191,6 +192,14 @@ struct WorkflowTaskStartedEvent {
     git_branch: Option<String>,
     parent_task_id: Option<String>,
     depth: u32,
+    /// Workflow run that admitted this child (#4119).
+    workflow_run_id: Option<String>,
+    /// Phase title/id active (or declared on the task) at spawn (#4119).
+    workflow_phase_id: Option<String>,
+    /// Typed task label — UI must prefer this over prompt text (#4119).
+    workflow_task_label: Option<String>,
+    /// 0-based admission order among children of this run (#4119).
+    workflow_child_index: Option<u32>,
 }
 
 impl WorkflowUiEventKind {
@@ -1203,6 +1212,11 @@ struct SubAgentWorkflowDriver {
     completion_tx: mpsc::UnboundedSender<SubAgentCompletion>,
     completion_state: Arc<Mutex<CompletionState>>,
     child_ids: Arc<Mutex<Vec<String>>>,
+    /// Monotonic 0-based child admission counter for `workflow_child_index`.
+    child_counter: AtomicU32,
+    /// Latest `phase(...)` title observed on this run (used when a task omits
+    /// an explicit `phase` option).
+    current_phase: Mutex<Option<String>>,
     task_records: Arc<Mutex<HashMap<String, RuntimeTaskRecord>>>,
     total_budget: Option<u64>,
     last_budget_event: Arc<Mutex<Option<BudgetSnapshot>>>,
@@ -1225,6 +1239,8 @@ impl SubAgentWorkflowDriver {
             completion_tx,
             completion_state: Arc::new(Mutex::new(CompletionState::default())),
             child_ids: Arc::new(Mutex::new(Vec::new())),
+            child_counter: AtomicU32::new(0),
+            current_phase: Mutex::new(None),
             task_records: Arc::new(Mutex::new(HashMap::new())),
             total_budget,
             last_budget_event: Arc::new(Mutex::new(None)),
@@ -1311,10 +1327,16 @@ impl SubAgentWorkflowDriver {
         metadata: &WorkflowTaskSpawnMetadata,
         result: &crate::tools::subagent::SubAgentResult,
     ) {
+        // Prefer typed spawn metadata over request fields so panel/history never
+        // need to re-derive labels from the child prompt (#4119).
+        let label = metadata
+            .workflow_task_label
+            .clone()
+            .or_else(|| request.label.clone());
         self.record_run_event(WorkflowUiEvent::new(WorkflowUiEventKind::TaskStarted(
             Box::new(WorkflowTaskStartedEvent {
                 task_id: agent_id.to_string(),
-                label: request.label.clone(),
+                label,
                 profile: request.profile.clone(),
                 model: request.model.clone(),
                 strength: request.model_strength.clone(),
@@ -1327,6 +1349,10 @@ impl SubAgentWorkflowDriver {
                 git_branch: result.git_branch.clone(),
                 parent_task_id: metadata.parent_task_id.clone(),
                 depth: metadata.depth,
+                workflow_run_id: metadata.workflow_run_id.clone(),
+                workflow_phase_id: metadata.workflow_phase_id.clone(),
+                workflow_task_label: metadata.workflow_task_label.clone(),
+                workflow_child_index: metadata.workflow_child_index,
             }),
         )));
     }
@@ -1432,7 +1458,32 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
             .clone()
             .with_parent_completion_tx(self.completion_tx.clone());
         let request_record = request.clone();
-        let result = spawn_workflow_task(request, self.manager.clone(), runtime)
+        let workflow_child_index = self.child_counter.fetch_add(1, Ordering::SeqCst);
+        let workflow_phase_id = request
+            .phase
+            .as_ref()
+            .map(|phase| phase.trim())
+            .filter(|phase| !phase.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.current_phase
+                    .lock()
+                    .ok()
+                    .and_then(|phase| phase.clone())
+            });
+        let workflow_task_label = request
+            .label
+            .as_ref()
+            .map(|label| label.trim())
+            .filter(|label| !label.is_empty())
+            .map(str::to_string);
+        let identity = WorkflowTaskSpawnIdentity {
+            workflow_run_id: self.run_id.clone(),
+            workflow_phase_id,
+            workflow_task_label,
+            workflow_child_index,
+        };
+        let result = spawn_workflow_task(request, self.manager.clone(), runtime, identity)
             .await
             .map_err(|err| DriverError::Rejected(err.to_string()))?;
         let task_id = result.result.agent_id.clone();
@@ -1468,10 +1519,15 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
                 format!("log: {message}"),
                 WorkflowUiEvent::new(WorkflowUiEventKind::Log { message }),
             ),
-            ProgressEvent::Phase { title } => (
-                format!("phase: {title}"),
-                WorkflowUiEvent::new(WorkflowUiEventKind::PhaseStarted { title }),
-            ),
+            ProgressEvent::Phase { title } => {
+                if let Ok(mut current) = self.current_phase.lock() {
+                    *current = Some(title.clone());
+                }
+                (
+                    format!("phase: {title}"),
+                    WorkflowUiEvent::new(WorkflowUiEventKind::PhaseStarted { title }),
+                )
+            }
             ProgressEvent::TaskSchemaValidationFailed { task_id, message } => {
                 self.record_schema_validation_failure(&task_id, message.clone());
                 schema_error = Some(WorkflowSchemaError {
@@ -2345,6 +2401,14 @@ mod tests {
         assert_eq!(task_started["worktree"], false);
         assert!(task_started["parent_task_id"].is_null());
         assert_eq!(task_started["depth"], 1);
+        // #4119: workflow identity on spawn / task_started metadata.
+        assert_eq!(
+            task_started["workflow_run_id"].as_str(),
+            payload["run_id"].as_str()
+        );
+        assert_eq!(task_started["workflow_phase_id"], "dispatch");
+        assert_eq!(task_started["workflow_task_label"], "inspect-child");
+        assert_eq!(task_started["workflow_child_index"], 0);
         assert!(
             events.iter().any(|event| event["type"] == "task_completed"
                 && event["task_id"] == child_id
@@ -2358,6 +2422,64 @@ mod tests {
             .expect("child result");
         assert_eq!(child.status, SubAgentStatus::Completed);
         assert_eq!(child.result.as_deref(), Some("child done"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn workflow_spawn_records_carry_child_index_and_phase_metadata() {
+        // #4119: sequential children get monotonic workflow_child_index and
+        // inherit the active phase when task options omit `phase`.
+        let _retry_guard = workflow_test_retry_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+        let (client, calls) = fake_chat_client("ok").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager.clone(),
+        );
+        let tool = WorkflowTool::new(manager.clone(), runtime);
+
+        let result = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "script": "phase('alpha'); await task({ description: 'first', type: 'explore', allowedTools: [], label: 'one' }); phase('beta'); await task({ description: 'second', type: 'explore', allowedTools: [], label: 'two', phase: 'beta-explicit' }); return { ok: true };"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("workflow run should complete");
+        let payload: Value = serde_json::from_str(&result.content).expect("json result");
+        assert_eq!(payload["status"], "completed", "{payload}");
+        assert_eq!(payload["child_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let mut started: Vec<&Value> = payload["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|event| event["type"] == "task_started")
+            .collect();
+        started.sort_by_key(|event| event["workflow_child_index"].as_u64().unwrap_or(u64::MAX));
+        assert_eq!(started.len(), 2, "{started:#?}");
+
+        assert_eq!(started[0]["workflow_run_id"], payload["run_id"]);
+        assert_eq!(started[0]["workflow_phase_id"], "alpha");
+        assert_eq!(started[0]["workflow_task_label"], "one");
+        assert_eq!(started[0]["workflow_child_index"], 0);
+        assert_eq!(started[0]["label"], "one");
+
+        assert_eq!(started[1]["workflow_run_id"], payload["run_id"]);
+        // Explicit task phase wins over the driver's current phase.
+        assert_eq!(started[1]["workflow_phase_id"], "beta-explicit");
+        assert_eq!(started[1]["workflow_task_label"], "two");
+        assert_eq!(started[1]["workflow_child_index"], 1);
+        assert_eq!(started[1]["label"], "two");
     }
 
     #[tokio::test]

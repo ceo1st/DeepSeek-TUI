@@ -1620,6 +1620,42 @@ impl GenericToolCell {
             tool_value_style(),
             width,
         ));
+        // Prefer typed task_started metadata (workflow_task_label / label) over
+        // free-form progress strings so the card never re-parses prompts (#4119).
+        if let Some(events) = value.get("events").and_then(serde_json::Value::as_array) {
+            let mut child_labels: Vec<String> = Vec::new();
+            for event in events {
+                if event.get("type").and_then(serde_json::Value::as_str) != Some("task_started") {
+                    continue;
+                }
+                let label = event
+                    .get("workflow_task_label")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| event.get("label").and_then(serde_json::Value::as_str))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(label) = label {
+                    child_labels.push(label.to_string());
+                }
+            }
+            if !child_labels.is_empty() {
+                let summary = if child_labels.len() <= 3 {
+                    child_labels.join(", ")
+                } else {
+                    format!(
+                        "{}, +{} more",
+                        child_labels[..3].join(", "),
+                        child_labels.len() - 3
+                    )
+                };
+                lines.extend(render_card_detail_line(
+                    Some("tasks"),
+                    &truncate_text(&summary, 200),
+                    tool_value_style(),
+                    width,
+                ));
+            }
+        }
         if let Some(progress) = value.get("progress").and_then(serde_json::Value::as_array)
             && let Some(last) = progress.last().and_then(serde_json::Value::as_str)
         {

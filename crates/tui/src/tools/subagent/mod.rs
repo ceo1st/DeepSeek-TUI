@@ -1078,6 +1078,16 @@ pub(crate) struct WorkflowTaskSpawnResult {
     pub metadata: WorkflowTaskSpawnMetadata,
 }
 
+/// Workflow identity stamped onto children launched via `spawn_workflow_task`
+/// (#4119). Lets panel/history render without parsing the child prompt.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowTaskSpawnIdentity {
+    pub workflow_run_id: String,
+    pub workflow_phase_id: Option<String>,
+    pub workflow_task_label: Option<String>,
+    pub workflow_child_index: u32,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowTaskSpawnMetadata {
     pub resolved_provider: String,
@@ -1085,6 +1095,14 @@ pub(crate) struct WorkflowTaskSpawnMetadata {
     pub route_source: String,
     pub parent_task_id: Option<String>,
     pub depth: u32,
+    /// Workflow run that launched this child (`None` for direct `agent` spawns).
+    pub workflow_run_id: Option<String>,
+    /// Active phase title/id when the child was admitted (`None` outside workflows).
+    pub workflow_phase_id: Option<String>,
+    /// Human label from the Workflow `task({ label })` option.
+    pub workflow_task_label: Option<String>,
+    /// 0-based admission order among children of this workflow run.
+    pub workflow_child_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4380,6 +4398,10 @@ async fn spawn_subagent_from_input(
         route_source: route_source_label(&model_route),
         parent_task_id: child_runtime.parent_agent_id.clone(),
         depth: child_runtime.spawn_depth,
+        workflow_run_id: None,
+        workflow_phase_id: None,
+        workflow_task_label: None,
+        workflow_child_index: None,
     };
 
     let mut manager_guard = manager.write().await;
@@ -4442,11 +4464,29 @@ fn apply_session_spawn_policy(
 /// Spawn one Workflow `task(...)` through the same path as the public `agent`
 /// tool. Keeping this adapter inside the sub-agent module prevents the
 /// Workflow driver from copying Fleet roster/profile/depth/budget semantics.
+///
+/// `identity` is stamped onto the returned spawn metadata so panel/history
+/// consumers can render workflow children without parsing prompt text (#4119).
 pub(crate) async fn spawn_workflow_task(
     request: codewhale_workflow_js::TaskRequest,
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
+    identity: WorkflowTaskSpawnIdentity,
 ) -> Result<WorkflowTaskSpawnResult, ToolError> {
+    // Capture identity fallbacks before consuming `request` fields into the
+    // agent-tool input JSON.
+    let request_label = request
+        .label
+        .as_ref()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .map(str::to_string);
+    let request_phase = request
+        .phase
+        .as_ref()
+        .map(|phase| phase.trim())
+        .filter(|phase| !phase.is_empty())
+        .map(str::to_string);
     let mut input = json!({
         "prompt": request.description,
         "worktree": request.worktree,
@@ -4475,7 +4515,20 @@ pub(crate) async fn spawn_workflow_task(
     if let Some(value) = request.token_budget {
         input["token_budget"] = json!(value);
     }
-    let (result, _, metadata) = spawn_subagent_from_input(input, manager, runtime).await?;
+    let (result, _, mut metadata) = spawn_subagent_from_input(input, manager, runtime).await?;
+    // Prefer the identity values the driver stamped; fall back to task options.
+    let workflow_task_label = identity
+        .workflow_task_label
+        .filter(|label| !label.trim().is_empty())
+        .or(request_label);
+    let workflow_phase_id = identity
+        .workflow_phase_id
+        .filter(|phase| !phase.trim().is_empty())
+        .or(request_phase);
+    metadata.workflow_run_id = Some(identity.workflow_run_id);
+    metadata.workflow_phase_id = workflow_phase_id;
+    metadata.workflow_task_label = workflow_task_label;
+    metadata.workflow_child_index = Some(identity.workflow_child_index);
     Ok(WorkflowTaskSpawnResult { result, metadata })
 }
 

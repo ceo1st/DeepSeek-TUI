@@ -89,6 +89,31 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
         "workflow_goal": "audit the FLEET and WORKFLOW docs",
         "child_ids": ["a1", "a2", "a3"],
         "progress": ["phase: Scan", "log: 3 findings"],
+        "events": [
+            {
+                "type": "task_started",
+                "task_id": "a1",
+                "label": "scan-docs",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_phase_id": "Scan",
+                "workflow_task_label": "scan-docs",
+                "workflow_child_index": 0,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a2",
+                "workflow_task_label": "check-fleet",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 1,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a3",
+                "label": "summarize",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 2,
+            },
+        ],
         "schema_errors": [],
     })
     .to_string();
@@ -117,6 +142,13 @@ fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
     );
     assert!(joined.contains("audit the FLEET"), "goal: {joined:?}");
     assert!(joined.contains("children: 3"), "child count: {joined:?}");
+    // #4119: history card uses typed task labels, not prompt text.
+    assert!(
+        joined.contains("scan-docs")
+            && joined.contains("check-fleet")
+            && joined.contains("summarize"),
+        "typed task labels: {joined:?}"
+    );
     assert!(
         joined.contains("log: 3 findings"),
         "last progress: {joined:?}"

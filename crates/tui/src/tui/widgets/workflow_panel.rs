@@ -277,7 +277,9 @@ impl WorkflowPanelEvent {
             }),
             "task_started" => Some(Self::TaskStarted {
                 task_id: opt_str(value, "task_id")?,
-                label: opt_str(value, "label"),
+                // Prefer typed workflow metadata over generic label so rows
+                // never fall back to prompt parsing (#4119).
+                label: opt_str(value, "workflow_task_label").or_else(|| opt_str(value, "label")),
                 profile: opt_str(value, "profile"),
                 model: opt_str(value, "model").or_else(|| opt_str(value, "resolved_model")),
                 strength: opt_str(value, "strength"),
@@ -1219,5 +1221,43 @@ mod tests {
         assert!(header.contains("1 fail"), "{header}");
         assert!(header.contains("1 cancel"), "{header}");
         assert!(header.contains("2/2"), "{header}");
+    }
+
+    #[test]
+    fn task_started_json_prefers_workflow_task_label_over_generic_label() {
+        // #4119: panel rows use typed workflow metadata, not prompt text.
+        let event = WorkflowPanelEvent::from_json_value(&json!({
+            "type": "task_started",
+            "task_id": "child-1",
+            "label": "fallback-label",
+            "workflow_task_label": "typed-label",
+            "workflow_run_id": "run-xyz",
+            "workflow_phase_id": "dispatch",
+            "workflow_child_index": 2,
+            "at_ms": 42,
+        }))
+        .expect("task_started parses");
+        match event {
+            WorkflowPanelEvent::TaskStarted { label, .. } => {
+                assert_eq!(label.as_deref(), Some("typed-label"));
+            }
+            other => panic!("expected TaskStarted, got {other:?}"),
+        }
+
+        let mut panel = WorkflowPanel::new("run-xyz", "goal", 1);
+        panel.apply_json_event(&json!({
+            "type": "task_started",
+            "task_id": "child-1",
+            "label": "fallback-label",
+            "workflow_task_label": "typed-label",
+            "at_ms": 42,
+        }));
+        let row = panel
+            .phases
+            .iter()
+            .flat_map(|phase| phase.rows.iter())
+            .find(|row| row.task_id == "child-1")
+            .expect("row recorded");
+        assert_eq!(row.label, "typed-label");
     }
 }
