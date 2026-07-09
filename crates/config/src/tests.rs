@@ -868,6 +868,12 @@ struct EnvGuard {
     xai_api_key: Option<OsString>,
     xai_base_url: Option<OsString>,
     xai_model: Option<OsString>,
+    meta_model_api_key: Option<OsString>,
+    model_api_key: Option<OsString>,
+    meta_model_api_base_url: Option<OsString>,
+    model_api_base_url: Option<OsString>,
+    meta_model_api_model: Option<OsString>,
+    model_api_model: Option<OsString>,
 }
 
 impl EnvGuard {
@@ -888,6 +894,12 @@ impl EnvGuard {
             xai_api_key: env::var_os("XAI_API_KEY"),
             xai_base_url: env::var_os("XAI_BASE_URL"),
             xai_model: env::var_os("XAI_MODEL"),
+            meta_model_api_key: env::var_os("META_MODEL_API_KEY"),
+            model_api_key: env::var_os("MODEL_API_KEY"),
+            meta_model_api_base_url: env::var_os("META_MODEL_API_BASE_URL"),
+            model_api_base_url: env::var_os("MODEL_API_BASE_URL"),
+            meta_model_api_model: env::var_os("META_MODEL_API_MODEL"),
+            model_api_model: env::var_os("MODEL_API_MODEL"),
             nvidia_api_key: env::var_os("NVIDIA_API_KEY"),
             nvidia_nim_api_key: env::var_os("NVIDIA_NIM_API_KEY"),
             nim_base_url: env::var_os("NIM_BASE_URL"),
@@ -1000,6 +1012,12 @@ impl EnvGuard {
             env::remove_var("XAI_API_KEY");
             env::remove_var("XAI_BASE_URL");
             env::remove_var("XAI_MODEL");
+            env::remove_var("META_MODEL_API_KEY");
+            env::remove_var("MODEL_API_KEY");
+            env::remove_var("META_MODEL_API_BASE_URL");
+            env::remove_var("MODEL_API_BASE_URL");
+            env::remove_var("META_MODEL_API_MODEL");
+            env::remove_var("MODEL_API_MODEL");
             env::remove_var("NVIDIA_API_KEY");
             env::remove_var("NVIDIA_NIM_API_KEY");
             env::remove_var("NIM_BASE_URL");
@@ -1135,6 +1153,15 @@ impl Drop for EnvGuard {
             Self::restore_var("XAI_API_KEY", self.xai_api_key.take());
             Self::restore_var("XAI_BASE_URL", self.xai_base_url.take());
             Self::restore_var("XAI_MODEL", self.xai_model.take());
+            Self::restore_var("META_MODEL_API_KEY", self.meta_model_api_key.take());
+            Self::restore_var("MODEL_API_KEY", self.model_api_key.take());
+            Self::restore_var(
+                "META_MODEL_API_BASE_URL",
+                self.meta_model_api_base_url.take(),
+            );
+            Self::restore_var("MODEL_API_BASE_URL", self.model_api_base_url.take());
+            Self::restore_var("META_MODEL_API_MODEL", self.meta_model_api_model.take());
+            Self::restore_var("MODEL_API_MODEL", self.model_api_model.take());
             Self::restore_var("NVIDIA_API_KEY", self.nvidia_api_key.take());
             Self::restore_var("NVIDIA_NIM_API_KEY", self.nvidia_nim_api_key.take());
             Self::restore_var("NIM_BASE_URL", self.nim_base_url.take());
@@ -3647,6 +3674,43 @@ fn xai_api_key_provider_resolves_defaults_and_env_overrides() {
 }
 
 #[test]
+fn meta_model_api_resolves_defaults_and_both_documented_key_names() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    let config = ConfigToml {
+        provider: ProviderKind::Meta,
+        ..ConfigToml::default()
+    };
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::Meta);
+    assert_eq!(resolved.base_url, DEFAULT_META_BASE_URL);
+    assert_eq!(resolved.model, DEFAULT_META_MODEL);
+    assert_eq!(resolved.api_key, None);
+
+    unsafe {
+        std::env::set_var("MODEL_API_KEY", "meta-official-key");
+        std::env::set_var("MODEL_API_BASE_URL", "https://meta-gateway.example/v1");
+        std::env::set_var("MODEL_API_MODEL", "muse-spark-canary");
+    }
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.api_key.as_deref(), Some("meta-official-key"));
+    assert_eq!(resolved.base_url, "https://meta-gateway.example/v1");
+    assert_eq!(resolved.model, "muse-spark-canary");
+
+    unsafe {
+        std::env::set_var("META_MODEL_API_KEY", "meta-models-dev-key");
+        std::env::set_var("META_MODEL_API_BASE_URL", "https://meta-primary.example/v1");
+        std::env::set_var("META_MODEL_API_MODEL", "muse-spark-1.1");
+    }
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.api_key.as_deref(), Some("meta-models-dev-key"));
+    assert_eq!(resolved.base_url, "https://meta-primary.example/v1");
+    assert_eq!(resolved.model, "muse-spark-1.1");
+}
+
+#[test]
 fn provider_metadata_registry_covers_every_provider_kind_once() {
     let providers = provider::all_providers();
     assert_eq!(providers.len(), ProviderKind::ALL.len());
@@ -3707,6 +3771,12 @@ fn provider_metadata_preserves_alias_and_config_key_semantics() {
             .expect("xAI grok alias")
             .kind(),
         ProviderKind::Xai
+    );
+    assert_eq!(
+        provider::resolve_provider("muse-spark")
+            .expect("Meta Muse Spark alias")
+            .kind(),
+        ProviderKind::Meta
     );
 
     let siliconflow_cn =

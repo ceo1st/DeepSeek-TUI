@@ -52,7 +52,7 @@ pub enum ModelProvider {
     DeepSeek,
     /// Anthropic Claude models.
     Anthropic,
-    /// OpenAI public API models (gpt-5.5 family).
+    /// OpenAI public API models (GPT-5.5 / GPT-5.6 families).
     OpenAi,
     /// OpenAI Codex route models (gpt-5*-codex).
     OpenAiCodex,
@@ -68,6 +68,8 @@ pub enum ModelProvider {
     Arcee,
     /// Xiaomi MiMo models.
     XiaomiMimo,
+    /// Meta Muse models.
+    Meta,
     /// xAI / Grok models.
     Xai,
     /// Anything not otherwise classified (still gets real metadata via the
@@ -136,6 +138,10 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // --- OpenAI public API + Codex (config DEFAULT_OPENAI_CODEX_MODEL) ---
     ("gpt-5.5", ModelProvider::OpenAi),
     ("gpt-5.5-pro", ModelProvider::OpenAi),
+    ("gpt-5.6", ModelProvider::OpenAi),
+    ("gpt-5.6-sol", ModelProvider::OpenAi),
+    ("gpt-5.6-terra", ModelProvider::OpenAi),
+    ("gpt-5.6-luna", ModelProvider::OpenAi),
     ("gpt-5-codex", ModelProvider::OpenAiCodex),
     ("gpt-5.3-codex", ModelProvider::OpenAiCodex),
     // --- Moonshot / Kimi (config DEFAULT_MOONSHOT_MODEL / KIMI_CODE) ---
@@ -171,6 +177,8 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("mimo-v2.5-pro", ModelProvider::XiaomiMimo),
     ("mimo-v2.5-pro-ultraspeed", ModelProvider::XiaomiMimo),
     ("mimo-v2.5", ModelProvider::XiaomiMimo),
+    // --- Meta Model API (config DEFAULT_META_MODEL) ---
+    ("muse-spark-1.1", ModelProvider::Meta),
     // --- xAI / Grok (config DEFAULT_XAI_MODEL) ---
     ("grok-4.5", ModelProvider::Xai),
     ("grok-4.3", ModelProvider::Xai),
@@ -258,6 +266,8 @@ mod tests {
             ("claude-sonnet-4-6", Some(1_000_000)),
             ("claude-haiku-4-5", Some(200_000)),
             ("gpt-5.5", Some(1_050_000)),
+            ("gpt-5.6", Some(1_050_000)),
+            ("gpt-5.6-terra", Some(1_050_000)),
             ("gpt-5-codex", Some(400_000)),
             ("kimi-k2.7-code", Some(262_144)),
             ("kimi-k2.6", Some(262_144)),
@@ -272,6 +282,7 @@ mod tests {
             ("mimo-v2.5-pro", Some(1_000_000)),
             ("mimo-v2.5-pro-ultraspeed", Some(1_000_000)),
             ("mimo-v2.5", Some(1_000_000)),
+            ("muse-spark-1.1", Some(1_000_000)),
             ("grok-4.5", Some(500_000)),
             ("grok-4.3", Some(1_000_000)),
             ("grok-4.20-0309-reasoning", Some(2_000_000)),
@@ -337,6 +348,15 @@ mod tests {
         assert_eq!(fast.provider, ModelProvider::Xai);
         assert_eq!(fast.context_window, Some(2_000_000));
         assert!(!fast.supports_reasoning);
+    }
+
+    #[test]
+    fn meta_muse_spark_is_classified_as_meta() {
+        let meta = lookup("muse-spark-1.1").expect("Muse Spark default should be seeded");
+        assert_eq!(meta.provider, ModelProvider::Meta);
+        assert_eq!(meta.context_window, Some(1_000_000));
+        assert_eq!(meta.max_output, Some(32_000));
+        assert!(meta.supports_reasoning);
     }
 
     #[test]

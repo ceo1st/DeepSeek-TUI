@@ -249,7 +249,7 @@ pub fn context_window_for_model(model: &str) -> Option<u32> {
         }
         return Some(LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS);
     }
-    if is_openai_gpt_55_api_model(&lower) {
+    if is_openai_gpt_55_api_model(&lower) || is_openai_gpt_56_api_model(&lower) {
         return Some(1_050_000);
     }
     if is_openai_codex_model(&lower) {
@@ -328,6 +328,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         "grok-build" => Some(512_000),
         "grok-composer-2.5-fast" => Some(200_000),
         "grok-4.20-0309-reasoning" | "grok-4.20-0309-non-reasoning" => Some(2_000_000),
+        "muse-spark-1.1" => Some(1_000_000),
         _ => None,
     }
 }
@@ -341,7 +342,10 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
     if lower.contains("deepseek") && lower.contains("v4") {
         return Some(384_000);
     }
-    if is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower) {
+    if is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
+        || is_openai_codex_model(&lower)
+    {
         return Some(128_000);
     }
     match lower.as_str() {
@@ -375,6 +379,7 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         "nvidia/nemotron-3-ultra-550b-a55b:free" => Some(65_536),
         "google/gemma-4-31b-it" => Some(16_384),
         "google/gemma-4-31b-it:free" | "google/gemma-4-26b-a4b-it:free" => Some(32_768),
+        "muse-spark-1.1" => Some(32_000),
         _ => None,
     }
 }
@@ -446,20 +451,31 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "grok-4.3"
             | "grok-build"
             | "grok-4.20-0309-reasoning"
+            | "muse-spark-1.1"
     ) || is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
         || is_openai_codex_model(&lower)
 }
 
 #[must_use]
 pub(crate) fn model_is_openai_reasoning_family(model: &str) -> bool {
     let lower = model.to_lowercase();
-    is_openai_gpt_55_api_model(&lower) || is_openai_codex_model(&lower)
+    is_openai_gpt_55_api_model(&lower)
+        || is_openai_gpt_56_api_model(&lower)
+        || is_openai_codex_model(&lower)
 }
 
 fn is_openai_gpt_55_api_model(model_lower: &str) -> bool {
     matches!(model_lower, "gpt-5.5" | "gpt-5.5-pro")
         || has_date_snapshot_suffix(model_lower, "gpt-5.5-")
         || has_date_snapshot_suffix(model_lower, "gpt-5.5-pro-")
+}
+
+pub(crate) fn is_openai_gpt_56_api_model(model_lower: &str) -> bool {
+    matches!(
+        model_lower,
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
 }
 
 fn is_openai_codex_model(model_lower: &str) -> bool {
@@ -711,6 +727,16 @@ mod tests {
 
     #[test]
     fn openai_api_and_codex_models_have_verified_context_metadata() {
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(context_window_for_model(model), Some(1_050_000));
+            assert_eq!(max_output_tokens_for_model(model), Some(128_000));
+            assert!(model_supports_reasoning(model));
+            assert_eq!(
+                compaction_threshold_for_model_at_percent(model, 80.0),
+                840_000
+            );
+        }
+
         for model in [
             "gpt-5.5",
             "gpt-5.5-pro",
@@ -750,6 +776,13 @@ mod tests {
         assert_eq!(context_window_for_model("gpt-5.5-nano"), None);
         assert_eq!(max_output_tokens_for_model("gpt-5.5-nano"), None);
         assert!(!model_supports_reasoning("gpt-5.5-nano"));
+    }
+
+    #[test]
+    fn muse_spark_has_verified_context_and_reasoning_metadata() {
+        assert_eq!(context_window_for_model("muse-spark-1.1"), Some(1_000_000));
+        assert_eq!(max_output_tokens_for_model("muse-spark-1.1"), Some(32_000));
+        assert!(model_supports_reasoning("muse-spark-1.1"));
     }
 
     #[test]

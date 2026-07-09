@@ -832,6 +832,7 @@ impl Secrets {
 /// | `atlascloud` / `atlas` | `ATLASCLOUD_API_KEY` |
 /// | `volcengine` / `ark` | `VOLCENGINE_API_KEY`, `VOLCENGINE_ARK_API_KEY`, `ARK_API_KEY` |
 /// | `wanjie` / `wanjie-ark` | `WANJIE_ARK_API_KEY`, `WANJIE_API_KEY`, `WANJIE_MAAS_API_KEY` |
+/// | `meta` / `muse-spark` | `META_MODEL_API_KEY`, `MODEL_API_KEY` |
 /// | `xai` / `grok` | `XAI_API_KEY` |
 ///
 /// Returns `None` if the provider is not recognised or none of its
@@ -878,6 +879,8 @@ pub fn env_for(name: &str) -> Option<String> {
         ],
         "sakana" | "sakana-ai" | "sakana_ai" | "fugu" => &["FUGU_API_KEY", "SAKANA_API_KEY"],
         "longcat" | "long-cat" | "meituan-longcat" | "meituan" => &["LONGCAT_API_KEY"],
+        "meta" | "meta-ai" | "meta_ai" | "meta-model-api" | "meta_model_api" | "muse"
+        | "muse-spark" => &["META_MODEL_API_KEY", "MODEL_API_KEY"],
         "xai" | "x-ai" | "x_ai" | "grok" => &["XAI_API_KEY"],
         _ => return None,
     };
@@ -933,6 +936,8 @@ mod tests {
             "FUGU_API_KEY",
             "SAKANA_API_KEY",
             "LONGCAT_API_KEY",
+            "META_MODEL_API_KEY",
+            "MODEL_API_KEY",
             "XAI_API_KEY",
             SECRET_BACKEND_ENV,
             LEGACY_SECRET_BACKEND_ENV,
@@ -1287,6 +1292,31 @@ mod tests {
         assert_eq!(env_for("x-ai").as_deref(), Some("xai-key"));
         assert_eq!(env_for("x_ai").as_deref(), Some("xai-key"));
         assert_eq!(env_for("grok").as_deref(), Some("xai-key"));
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn meta_model_api_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("MODEL_API_KEY", "meta-key") };
+
+        for alias in [
+            "meta",
+            "meta-ai",
+            "meta_ai",
+            "meta-model-api",
+            "meta_model_api",
+            "muse",
+            "muse-spark",
+        ] {
+            assert_eq!(env_for(alias).as_deref(), Some("meta-key"), "{alias}");
+        }
+
+        clear_known_envs();
+        unsafe { std::env::set_var("META_MODEL_API_KEY", "meta-prefixed-key") };
+        assert_eq!(env_for("meta").as_deref(), Some("meta-prefixed-key"),);
 
         clear_known_envs();
     }

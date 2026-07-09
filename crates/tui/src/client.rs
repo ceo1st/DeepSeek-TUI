@@ -2003,6 +2003,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::Meta => {}
             ApiProvider::Xai => {}
         },
         "low" | "minimal" | "medium" | "mid" | "high" | "" => match provider {
@@ -2094,6 +2095,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::Meta => {}
             ApiProvider::Xai => {}
         },
         "xhigh" | "max" | "highest" | "ultracode" => match provider {
@@ -2165,6 +2167,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::Stepfun => {}
             ApiProvider::Sakana => {}
             ApiProvider::LongCat => {}
+            ApiProvider::Meta => {}
             ApiProvider::Xai => {}
         },
         _ => {}

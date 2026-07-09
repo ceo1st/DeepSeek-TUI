@@ -146,6 +146,18 @@ fn pricing_for_model_at(model: &str, _now: DateTime<Utc>) -> Option<ModelPricing
 }
 
 fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
+    let explicit = match model_lower {
+        "openai/gpt-5.6" | "openai/gpt-5.6-sol" | "gpt-5.6" | "gpt-5.6-sol" => {
+            Some(usd_only_pricing(0.50, 5.00, 30.00))
+        }
+        "openai/gpt-5.6-terra" | "gpt-5.6-terra" => Some(usd_only_pricing(0.25, 2.50, 15.00)),
+        "openai/gpt-5.6-luna" | "gpt-5.6-luna" => Some(usd_only_pricing(0.10, 1.00, 6.00)),
+        "meta/muse-spark-1.1" | "muse-spark-1.1" => Some(usd_only_pricing(1.25, 1.25, 4.25)),
+        _ => None,
+    };
+    if explicit.is_some() {
+        return explicit;
+    }
     if let Some((input_usd_per_million, output_usd_per_million)) =
         crate::model_catalog::resolved_usd_pricing(model_lower)
     {
@@ -413,6 +425,10 @@ mod tests {
             ("qwen/qwen3.6-plus", 0.325, 0.325, 1.95),
             ("trinity-large-thinking", 0.06, 0.22, 0.85),
             ("gpt-5.5", 0.50, 5.00, 30.00),
+            ("gpt-5.6-sol", 0.50, 5.00, 30.00),
+            ("gpt-5.6-terra", 0.25, 2.50, 15.00),
+            ("gpt-5.6-luna", 0.10, 1.00, 6.00),
+            ("muse-spark-1.1", 1.25, 1.25, 4.25),
         ] {
             let pricing = pricing_for_model_at(model, Utc::now()).expect(model);
             assert_eq!(pricing.usd.input_cache_hit_per_million, hit);

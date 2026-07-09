@@ -133,6 +133,9 @@ pub(crate) const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 // Meituan LongCat defaults
 pub(crate) const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub(crate) const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
+// Meta Model API / Muse Spark defaults
+pub(crate) const DEFAULT_META_MODEL: &str = "muse-spark-1.1";
+pub(crate) const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";
 // xAI / Grok API-key route defaults
 pub(crate) const DEFAULT_XAI_MODEL: &str = "grok-4.5";
 pub(crate) const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";

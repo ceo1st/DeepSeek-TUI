@@ -49,8 +49,8 @@ use crate::llm_client::sanitize_http_error_body;
 use crate::logging;
 use crate::models::{
     ContentBlock, ContentBlockStart, Delta, Message, MessageDelta, MessageRequest, MessageResponse,
-    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage, model_is_openai_reasoning_family,
-    model_supports_reasoning,
+    StreamEvent, SystemPrompt, Tool, ToolCaller, Usage, is_openai_gpt_56_api_model,
+    model_is_openai_reasoning_family, model_supports_reasoning,
 };
 
 use super::{
@@ -84,23 +84,38 @@ fn apply_openai_reasoning_effort(
     model: &str,
     effort: Option<&str>,
 ) {
-    if provider != ApiProvider::Openai || !model_is_openai_reasoning_family(model) {
+    let model_lower = model.trim().to_ascii_lowercase();
+    let is_gpt_56 =
+        provider == ApiProvider::Openai && is_openai_gpt_56_api_model(model_lower.as_str());
+    let is_openai_reasoning =
+        provider == ApiProvider::Openai && model_is_openai_reasoning_family(model);
+    let is_muse_spark = provider == ApiProvider::Meta && model_lower == "muse-spark-1.1";
+    if !is_openai_reasoning && !is_muse_spark {
         return;
     }
-    let Some(effort) = effort.and_then(openai_chat_reasoning_effort) else {
+    let Some(effort) =
+        effort.and_then(|value| openai_compatible_reasoning_effort(value, is_gpt_56, !is_gpt_56))
+    else {
         return;
     };
     body["reasoning_effort"] = json!(effort);
 }
 
-fn openai_chat_reasoning_effort(effort: &str) -> Option<&'static str> {
+fn openai_compatible_reasoning_effort(
+    effort: &str,
+    supports_max: bool,
+    supports_minimal: bool,
+) -> Option<&'static str> {
     match effort.trim().to_ascii_lowercase().as_str() {
         "off" | "disabled" | "none" | "false" => Some("none"),
-        "minimal" => Some("minimal"),
+        "minimal" if supports_minimal => Some("minimal"),
+        "minimal" => Some("low"),
         "low" => Some("low"),
         "medium" | "mid" | "" => Some("medium"),
         "high" => Some("high"),
-        "max" | "highest" | "xhigh" | "ultracode" => Some("xhigh"),
+        "xhigh" => Some("xhigh"),
+        "max" | "highest" | "ultracode" if supports_max => Some("max"),
+        "max" | "highest" | "ultracode" => Some("xhigh"),
         _ => None,
     }
 }
@@ -4604,6 +4619,38 @@ mod alias_thinking_detection_tests {
                 .and_then(serde_json::Value::as_str),
             Some("high")
         );
+    }
+
+    #[test]
+    fn gpt_56_uses_documented_max_reasoning_effort() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [],
+            "max_tokens": 8192,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Openai, "gpt-5.6-sol", 8192);
+        apply_openai_reasoning_effort(&mut body, ApiProvider::Openai, "gpt-5.6-sol", Some("max"));
+
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], json!(8192));
+        assert_eq!(body["reasoning_effort"], json!("max"));
+    }
+
+    #[test]
+    fn muse_spark_uses_meta_reasoning_effort_without_openai_token_rewrite() {
+        let mut body = json!({
+            "model": "muse-spark-1.1",
+            "messages": [],
+            "max_tokens": 8192,
+        });
+
+        apply_provider_token_limit(&mut body, ApiProvider::Meta, "muse-spark-1.1", 8192);
+        apply_openai_reasoning_effort(&mut body, ApiProvider::Meta, "muse-spark-1.1", Some("max"));
+
+        assert_eq!(body["max_tokens"], json!(8192));
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["reasoning_effort"], json!("xhigh"));
     }
 
     #[test]

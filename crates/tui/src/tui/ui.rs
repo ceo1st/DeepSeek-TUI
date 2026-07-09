@@ -9671,6 +9671,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             crate::config::ApiProvider::Minimax => Some("MiniMax"),
             crate::config::ApiProvider::Sakana => Some("Sakana"),
             crate::config::ApiProvider::LongCat => Some("Meituan LongCat"),
+            crate::config::ApiProvider::Meta => Some("Meta"),
             crate::config::ApiProvider::Xai => Some("xAI"),
             crate::config::ApiProvider::Custom => Some("Custom"),
         };
@@ -11648,6 +11649,7 @@ fn mirror_saved_api_key_in_config(config: &mut Config, provider: ApiProvider, ap
         ApiProvider::Minimax => &mut providers.minimax,
         ApiProvider::Sakana => &mut providers.sakana,
         ApiProvider::LongCat => &mut providers.longcat,
+        ApiProvider::Meta => &mut providers.meta,
         ApiProvider::Xai => &mut providers.xai,
     };
     entry.api_key = Some(api_key);
@@ -11727,6 +11729,7 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
         ApiProvider::Minimax => &mut providers.minimax,
         ApiProvider::Sakana => &mut providers.sakana,
         ApiProvider::LongCat => &mut providers.longcat,
+        ApiProvider::Meta => &mut providers.meta,
         ApiProvider::Xai => &mut providers.xai,
     };
     entry.auth_mode = Some(auth_mode);

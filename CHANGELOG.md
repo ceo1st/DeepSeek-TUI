@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults when Models.dev has no rows.
 
 ### Added
+- Add GPT-5.6 Sol, Terra, and Luna to the OpenAI API route, including their
+  1.05M context metadata, 128K output limits, pricing, and `max` reasoning
+  effort. Add Meta Model API as a first-class OpenAI-compatible provider for
+  Muse Spark 1.1 with 1M context, tool/reasoning metadata, provider aliases,
+  and both `META_MODEL_API_KEY` and Meta's `MODEL_API_KEY` credential names.
 - Catalog automation: `scripts/catalog_models_dev.py` refreshes secret-free
   Models.dev / OpenRouter listings and validates the offline seed snapshot
   (`snapshot --check`) without ever persisting API keys (#4117).

@@ -66,6 +66,14 @@ enum ProviderArg {
     Sakana,
     #[value(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
     LongCat,
+    #[value(
+        alias = "meta-ai",
+        alias = "meta_ai",
+        alias = "meta-model-api",
+        alias = "muse",
+        alias = "muse-spark"
+    )]
+    Meta,
     #[value(alias = "x-ai", alias = "x_ai", alias = "grok")]
     Xai,
 }
@@ -101,6 +109,7 @@ impl From<ProviderArg> for ProviderKind {
             ProviderArg::Deepinfra => ProviderKind::Deepinfra,
             ProviderArg::Sakana => ProviderKind::Sakana,
             ProviderArg::LongCat => ProviderKind::LongCat,
+            ProviderArg::Meta => ProviderKind::Meta,
             ProviderArg::Xai => ProviderKind::Xai,
         }
     }

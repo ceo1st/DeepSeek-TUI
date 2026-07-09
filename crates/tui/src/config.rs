@@ -71,6 +71,7 @@ pub enum ApiProvider {
     Deepinfra,
     Sakana,
     LongCat,
+    Meta,
     Xai,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
@@ -206,6 +207,7 @@ impl ApiProvider {
             Self::Deepinfra => "https://deepinfra.com/dash/api_keys",
             Self::Sakana => "https://api.sakana.ai/",
             Self::LongCat => "https://longcat.chat/platform",
+            Self::Meta => "https://developer.meta.com/ai/",
             Self::Xai => "https://console.x.ai/",
             Self::OpenaiCodex | Self::Sglang | Self::Vllm | Self::Ollama => return None,
             // Custom endpoints have no canonical credential page; the user
@@ -222,7 +224,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 33] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 34] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -254,12 +256,13 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Deepinfra),
         Some(codewhale_config::ProviderKind::Sakana),
         Some(codewhale_config::ProviderKind::LongCat),
+        Some(codewhale_config::ProviderKind::Meta),
         Some(codewhale_config::ProviderKind::Xai),
         Some(codewhale_config::ProviderKind::Custom),
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 32] = [
+    const FROM_KIND_LOOKUP: [Self; 33] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -290,6 +293,7 @@ impl ApiProvider {
         Self::Deepinfra,
         Self::Sakana,
         Self::LongCat,
+        Self::Meta,
         Self::Xai,
         Self::Custom,
     ];
@@ -383,6 +387,10 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
         ApiProvider::LongCat => matches!(
             normalized.as_str(),
             "longcat" | "long_cat" | "meituan_longcat" | "meituan"
+        ),
+        ApiProvider::Meta => matches!(
+            normalized.as_str(),
+            "meta" | "meta_ai" | "meta_model_api" | "muse" | "muse_spark"
         ),
         ApiProvider::Xai => matches!(normalized.as_str(), "xai" | "x_ai" | "grok"),
         _ => false,
@@ -1177,6 +1185,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ],
         ApiProvider::Sakana => vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL],
         ApiProvider::LongCat => vec![DEFAULT_LONGCAT_MODEL],
+        ApiProvider::Meta => vec![DEFAULT_META_MODEL],
         ApiProvider::Xai => vec![
             DEFAULT_XAI_MODEL,
             XAI_GROK_4_3_MODEL,
@@ -2636,6 +2645,16 @@ pub struct ProvidersConfig {
         alias = "meituan"
     )]
     pub longcat: ProviderConfig,
+    #[serde(
+        default,
+        alias = "meta-ai",
+        alias = "meta_ai",
+        alias = "meta-model-api",
+        alias = "meta_model_api",
+        alias = "muse",
+        alias = "muse-spark"
+    )]
+    pub meta: ProviderConfig,
     #[serde(default, alias = "x-ai", alias = "x_ai", alias = "grok")]
     pub xai: ProviderConfig,
     /// Arbitrary user-named custom providers (#1519).
@@ -2688,6 +2707,7 @@ impl ProvidersConfig {
             ("providers.stepfun", &self.stepfun),
             ("providers.minimax", &self.minimax),
             ("providers.sakana", &self.sakana),
+            ("providers.meta", &self.meta),
             ("providers.xai", &self.xai),
         ];
         for (name, config) in builtins {
@@ -3029,6 +3049,7 @@ impl Config {
             ApiProvider::Minimax => &providers.minimax,
             ApiProvider::Sakana => &providers.sakana,
             ApiProvider::LongCat => &providers.longcat,
+            ApiProvider::Meta => &providers.meta,
             ApiProvider::Xai => &providers.xai,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
@@ -3091,6 +3112,7 @@ impl Config {
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
             ApiProvider::LongCat => &mut providers.longcat,
+            ApiProvider::Meta => &mut providers.meta,
             ApiProvider::Xai => &mut providers.xai,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
@@ -3285,6 +3307,7 @@ impl Config {
             ApiProvider::Minimax => DEFAULT_MINIMAX_MODEL,
             ApiProvider::Sakana => DEFAULT_SAKANA_MODEL,
             ApiProvider::LongCat => DEFAULT_LONGCAT_MODEL,
+            ApiProvider::Meta => DEFAULT_META_MODEL,
             ApiProvider::Xai => DEFAULT_XAI_MODEL,
             // Custom endpoints have no built-in default model; pass through the
             // descriptor placeholder when nothing is configured (#1519).
@@ -3340,6 +3363,7 @@ impl Config {
             | ApiProvider::Minimax
             | ApiProvider::Sakana
             | ApiProvider::LongCat
+            | ApiProvider::Meta
             | ApiProvider::Xai
             // Custom reads its base_url from the named `[providers.<name>]`
             // table (via provider_base), never from the legacy root field.
@@ -3402,6 +3426,7 @@ impl Config {
                         ApiProvider::Minimax => DEFAULT_MINIMAX_BASE_URL,
                         ApiProvider::Sakana => DEFAULT_SAKANA_BASE_URL,
                         ApiProvider::LongCat => DEFAULT_LONGCAT_BASE_URL,
+                        ApiProvider::Meta => DEFAULT_META_BASE_URL,
                         ApiProvider::Xai => DEFAULT_XAI_BASE_URL,
                         // No built-in endpoint; descriptor placeholder keeps the
                         // fallback total. A real custom route configures
@@ -4579,6 +4604,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .longcat
                     .base_url = Some(value);
             }
+            ApiProvider::Meta => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .meta
+                    .base_url = Some(value);
+            }
             ApiProvider::Xai => {
                 config
                     .providers
@@ -4763,6 +4795,17 @@ fn apply_env_overrides(config: &mut Config) {
             .vllm
             .base_url = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Meta)
+        && let Ok(value) = std::env::var("META_MODEL_API_BASE_URL")
+            .or_else(|_| std::env::var("MODEL_API_BASE_URL"))
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .meta
+            .base_url = Some(value);
+    }
     if matches!(config.api_provider(), ApiProvider::Xai)
         && let Ok(value) = std::env::var("XAI_BASE_URL")
         && !value.trim().is_empty()
@@ -4825,6 +4868,7 @@ fn apply_env_overrides(config: &mut Config) {
             ApiProvider::Minimax => &mut providers.minimax,
             ApiProvider::Sakana => &mut providers.sakana,
             ApiProvider::LongCat => &mut providers.longcat,
+            ApiProvider::Meta => &mut providers.meta,
             ApiProvider::Xai => &mut providers.xai,
             ApiProvider::Custom => providers
                 .custom
@@ -4978,6 +5022,17 @@ fn apply_env_overrides(config: &mut Config) {
             .huggingface
             .model = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Meta)
+        && let Ok(value) =
+            std::env::var("META_MODEL_API_MODEL").or_else(|_| std::env::var("MODEL_API_MODEL"))
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .meta
+            .model = Some(value);
+    }
     if matches!(config.api_provider(), ApiProvider::Xai)
         && let Ok(value) = std::env::var("XAI_MODEL")
         && !value.trim().is_empty()
@@ -5059,6 +5114,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::Minimax => &mut providers.minimax,
                 ApiProvider::Sakana => &mut providers.sakana,
                 ApiProvider::LongCat => &mut providers.longcat,
+                ApiProvider::Meta => &mut providers.meta,
                 ApiProvider::Xai => &mut providers.xai,
             };
             entry.model = Some(value);
@@ -5261,6 +5317,7 @@ pub(crate) fn provider_passes_model_through(provider: ApiProvider) -> bool {
             | ApiProvider::Openmodel
             | ApiProvider::Ollama
             | ApiProvider::Huggingface
+            | ApiProvider::Meta
             | ApiProvider::Xai
             // Custom OpenAI-compatible endpoints preserve user-supplied model
             // ids verbatim (#1519); never normalize/rewrite them.
@@ -5840,6 +5897,7 @@ fn merge_providers(
             minimax: merge_provider_config(base.minimax, override_cfg.minimax),
             sakana: merge_provider_config(base.sakana, override_cfg.sakana),
             longcat: merge_provider_config(base.longcat, override_cfg.longcat),
+            meta: merge_provider_config(base.meta, override_cfg.meta),
             xai: merge_provider_config(base.xai, override_cfg.xai),
             custom: merge_custom_providers(base.custom, override_cfg.custom),
         }),
