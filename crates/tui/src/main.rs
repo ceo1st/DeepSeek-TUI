@@ -119,6 +119,7 @@ mod worker_profile;
 mod working_set;
 mod workspace_discovery;
 mod workspace_trust;
+mod xai_oauth;
 
 use crate::config::{Config, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_dir};
 use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};

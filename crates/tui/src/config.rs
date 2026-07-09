@@ -3471,6 +3471,17 @@ impl Config {
             return kimi_cli_oauth_access_token();
         }
 
+        // xAI / Grok OAuth reuses ~/.grok/auth.json (Grok CLI) or a device-code
+        // login written in the same shape. Activated by
+        // [providers.xai] auth_mode = "oauth" (#4257 residual).
+        if provider == ApiProvider::Xai
+            && self
+                .provider_config_for(provider)
+                .is_some_and(provider_config_uses_xai_oauth)
+        {
+            return crate::xai_oauth::get_access_token();
+        }
+
         // OpenAI Codex (ChatGPT) reuses the existing Codex CLI OAuth login.
         // The access token lives in ~/.codex/auth.json (refreshed on demand)
         // rather than a stored API key, so resolve it before the config-file
@@ -3566,6 +3577,24 @@ impl Config {
                 anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
             }
             ApiProvider::OpenaiCodex => anyhow::bail!("{}", crate::oauth::missing_auth_message()),
+            ApiProvider::Xai => {
+                // Prefer OAuth guidance when auth_mode requests it or Grok CLI
+                // tokens already exist; otherwise show both API-key and OAuth.
+                if self
+                    .provider_config_for(provider)
+                    .is_some_and(provider_config_uses_xai_oauth)
+                    || crate::xai_oauth::credentials_present()
+                {
+                    anyhow::bail!("{}", crate::xai_oauth::missing_auth_message());
+                }
+                anyhow::bail!(
+                    "xAI API key not found. Get a key: https://console.x.ai/\n\
+                     Run 'codewhale auth set --provider xai', set XAI_API_KEY, or add \
+                     [providers.xai] api_key.\n\
+                     OAuth alternative: run `grok login` (or device-code login) and set \
+                     [providers.xai] auth_mode = \"oauth\"."
+                );
+            }
             // Self-hosted deployments commonly run without auth on localhost.
             // Return an empty key and let the client omit the Authorization header.
             ApiProvider::Sglang | ApiProvider::Vllm | ApiProvider::Ollama => Ok(String::new()),
@@ -5427,6 +5456,13 @@ fn auth_mode_uses_kimi_oauth(mode: &str) -> bool {
         normalize_auth_mode(mode).as_str(),
         "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"
     )
+}
+
+fn provider_config_uses_xai_oauth(config: &ProviderConfig) -> bool {
+    config
+        .auth_mode
+        .as_deref()
+        .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth)
 }
 
 fn normalize_auth_mode(mode: &str) -> String {
