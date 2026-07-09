@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codewhale_workflow_js::testing::{FakeDriver, FakeReply};
-use codewhale_workflow_js::{ProgressEvent, WORKFLOW_LIFETIME_CAP, WorkflowJsError, WorkflowVm};
+use codewhale_workflow_js::{
+    ProgressEvent, WORKFLOW_LIFETIME_CAP, WorkflowJsError, WorkflowRunCancel, WorkflowVm,
+};
 use serde_json::json;
 
 async fn run(
@@ -116,6 +118,25 @@ async fn task_accepts_prompt_and_type_aliases() {
     let request = &driver.requests()[0];
     assert_eq!(request.description, "aliased");
     assert_eq!(request.subagent_type.as_deref(), Some("verifier"));
+}
+
+#[tokio::test]
+async fn task_prompt_takes_precedence_over_short_description() {
+    let driver = Arc::new(FakeDriver::new());
+    run(
+        &driver,
+        r#"return await task({
+            description: "Short progress summary",
+            prompt: "Detailed child instructions",
+            label: "fixture-compatible"
+        });"#,
+        json!(null),
+    )
+    .await
+    .unwrap();
+    let request = &driver.requests()[0];
+    assert_eq!(request.description, "Detailed child instructions");
+    assert_eq!(request.label.as_deref(), Some("fixture-compatible"));
 }
 
 #[tokio::test]
@@ -852,6 +873,51 @@ async fn dropping_the_run_future_cancels_outstanding_tasks() {
         "dropping the run future must cancel outstanding driver tasks"
     );
     assert_eq!(driver.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn parallel_does_not_continue_after_external_run_cancellation() {
+    let driver = Arc::new(FakeDriver::new());
+    driver.on("hang", FakeReply::Never);
+    let cancel = WorkflowRunCancel::new();
+    let run_cancel = cancel.clone();
+    let run_driver = driver.clone();
+    let handle = tokio::spawn(async move {
+        WorkflowVm::new()
+            .run_script_with_cancel(
+                r#"
+                await parallel([() => task({ description: "hang" })]);
+                phase("unreachable after cancellation");
+                return "wrong";
+                "#,
+                json!(null),
+                run_driver as Arc<dyn codewhale_workflow_js::WorkflowDriver>,
+                run_cancel,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while driver.spawn_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task should start");
+    cancel.cancel();
+
+    let result = handle.await.expect("VM task should join");
+    assert!(
+        matches!(result, Err(WorkflowJsError::Cancelled)),
+        "{result:?}"
+    );
+    assert!(
+        !driver.events().iter().any(|event| matches!(
+            event,
+            ProgressEvent::Phase { title } if title == "unreachable after cancellation"
+        )),
+        "parallel() must not downgrade run cancellation into a null slot"
+    );
 }
 
 #[tokio::test]

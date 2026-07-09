@@ -708,8 +708,8 @@ async fn task_host_inner(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TaskOptions {
-    #[serde(alias = "prompt")]
     description: Option<String>,
+    prompt: Option<String>,
     #[serde(alias = "type")]
     subagent_type: Option<String>,
     /// Fleet role name (#4177). Preferred step identity field.
@@ -732,7 +732,8 @@ fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
     let options: TaskOptions =
         serde_json::from_str(opts_json).map_err(|err| format!("task(): invalid options: {err}"))?;
     let description = options
-        .description
+        .prompt
+        .or(options.description)
         .filter(|description| !description.trim().is_empty())
         .ok_or_else(|| "task(): 'description' (or 'prompt') is required".to_string())?;
     let role = options
@@ -796,7 +797,11 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
   const hostBudgetRemaining = __workflow_budget_remaining;
 
   const MAX_ITEMS = __MAX_ITEMS__;
-  const isResponseSchemaError = (err) => String(err && err.message !== undefined ? err.message : err).includes("responseSchema");
+  const taskErrorText = (err) => String(err && err.message !== undefined ? err.message : err);
+  const isFatalTaskError = (err) => {
+    const text = taskErrorText(err);
+    return text.includes("responseSchema") || text.includes("run cancelled");
+  };
 
   globalThis.task = async (opts) => {
     if (opts === null || typeof opts !== "object") {
@@ -819,12 +824,12 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
     return Promise.all(thunks.map((thunk) => {
       try {
         return Promise.resolve(typeof thunk === "function" ? thunk() : thunk).catch((err) => {
-          if (isResponseSchemaError(err)) throw err;
+          if (isFatalTaskError(err)) throw err;
           hostLog("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
           return null;
         });
       } catch (err) {
-        if (isResponseSchemaError(err)) return Promise.reject(err);
+        if (isFatalTaskError(err)) return Promise.reject(err);
         hostLog("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
         return null;
       }
@@ -844,7 +849,7 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
         try {
           value = await stage(value, item, index);
         } catch (err) {
-          if (isResponseSchemaError(err)) throw err;
+          if (isFatalTaskError(err)) throw err;
           hostLog("pipeline(): dropped item " + index + " as null: " + String((err && err.message) || err));
           return null;
         }

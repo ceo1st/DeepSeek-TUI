@@ -19,16 +19,18 @@ export default async function () {
         type: "explore",
         prompt: "Return the string READY_A. Read-only.",
       }),
-    // Intentionally hostile: request something that should fail or time out
-    // under normal policy (missing path / guaranteed empty). Operator dogfood
-    // may also kill this child mid-run to force a failed slot.
+    // Give this child an intentionally tiny budget so it starts, then fails
+    // deterministically at the runtime boundary. A model refusal is still a
+    // successful transport-level completion, while response-schema failures
+    // intentionally abort the whole workflow so they remain loud.
     () =>
       task({
         description: "Deliberately failing scout B",
         label: "scout-b-fail",
         type: "explore",
+        tokenBudget: 1,
         prompt:
-          "You MUST fail this task: refuse to produce a summary and reply only with an error about missing inputs. Do not invent success.",
+          "Inspect Cargo.toml and return a detailed workspace summary. This child intentionally has a one-token budget so parallel() exercises a failed null slot.",
       }),
     () =>
       task({

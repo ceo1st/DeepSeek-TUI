@@ -34,7 +34,7 @@ use crate::error::DriverError;
 /// Provider/model remain optional overrides, not required identity fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRequest {
-    /// The child prompt (JS `description` or `prompt`; required).
+    /// The child prompt (JS `prompt`, falling back to `description`; required).
     pub description: String,
     /// Subagent type (JS `subagentType` or `type`); `None` lets the driver
     /// apply its default (`general`).

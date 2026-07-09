@@ -19,7 +19,7 @@ Related:
 cargo build -p codewhale-tui --locked
 # Optional headless/runtime checks used by the scenarios below
 cargo test -p codewhale-tui --locked dogfood_ -- --nocapture
-cargo test -p codewhale-workflow-js --locked parallel_ fan_out cancel -- --nocapture
+cargo test -p codewhale-workflow-js --locked
 ```
 
 Isolate config so dogfood does not touch your real home:
@@ -141,6 +141,8 @@ Or run:
 - Panel phases resemble: Implement → Verify (or equivalent labels).
 - Implementer child row shows `wt` (worktree) isolation.
 - Verifier child completes with a short confirmation summary.
+- Verifier evaluates the implementer's returned worktree handoff; it does not
+  expect the unmerged edit to appear in the parent workspace.
 - One artifact / card per delegated unit (no duplicate delegate spam).
 
 ### Pass / fail notes
@@ -151,6 +153,7 @@ Or run:
 | Implementer row marks worktree | | |
 | Verifier runs after implementer | | |
 | Main workspace untouched until merge/apply | | |
+| Verifier validates isolated handoff rather than parent file | | |
 | Compact history card summarizes phases | | |
 
 Automated:
@@ -217,10 +220,11 @@ cargo test -p codewhale-workflow-js --locked parallel_fan_out_maps_one_failure_t
 
 ### Reproducible steps
 
-1. Start a long-running multi-child workflow:
+1. Start a long-running multi-child workflow without blocking the parent turn:
 
 ```text
-/workflow run docs/examples/dogfood-automatic/wf_a4_cancel_mid_run.workflow.js
+Use the workflow tool with exactly
+{"action":"start","source_path":"docs/examples/dogfood-automatic/wf_a4_cancel_mid_run.workflow.js"}.
 ```
 
 Or a natural long audit with several scouts.
@@ -269,30 +273,45 @@ File or link bugs found during dogfood here (do not silently absorb them):
 
 | Date | Scenario | Symptom | Issue / PR |
 |------|----------|---------|------------|
-| | | | |
+| 2026-07-09 | WF-A1 | Documented `export default async function` fixtures were rejected by the runtime desugaring path. | Fixed with regression coverage in #4325. |
+| 2026-07-09 | WF-A1 | Fixture options containing both `description` and `prompt` failed serde decoding as a duplicate field. | Fixed with prompt-precedence coverage in #4325. |
+| 2026-07-09 | WF-A3 | A refusal is a successful child completion, so it cannot deterministically exercise a nullable failed slot. | Fixture now uses a one-token child budget; #4325. |
+| 2026-07-09 | WF-A4 | Run cancellation was downgraded to a nullable parallel slot, allowing the script to enter its unreachable next phase. | Fixed with external-cancel regression in #4325. |
+| 2026-07-09 | WF-A4 | A racing `run_completed: failed` event left the live panel failed with running rows even though the receipt was cancelled. | Fixed by terminal row finalization + authoritative `run_cancelled` streaming in #4325. |
 
 ---
 
 ## Interactive results log (copy per pass)
 
-```
-Tree / binary: _______________
-Operator: _______________
-Date: _______________
+Tree / binary: `codex/v0868-workflow-export-default`, debug `codewhale-tui`
+Operator: release dogfood session
+Date: 2026-07-09
 
-WF-A1: PASS / FAIL — notes:
-WF-A2: PASS / FAIL — notes:
-WF-A3: PASS / FAIL — notes:
-WF-A4: PASS / FAIL — notes:
+- WF-A1: PASS — `workflow_dd5de6d0`; 3 labeled read-only scouts then one
+  synthesizer, 4/4 completed across two phases. A checked-in `source_path`
+  conservatively requested approval because its capabilities are unknown
+  before execution; no workspace files changed.
+- WF-A2: PASS — `workflow_97ae14dc`; isolated implementer worktree followed by
+  main-workspace verifier, 2/2 across Implement/Verify in 1m31s. The verifier
+  confirmed the intended handoff and that the unmerged edit remained absent
+  from the parent, treating isolation as success instead of expecting
+  cross-worktree mutation.
+- WF-A3: PASS — `workflow_2f590eec`; one child visibly exhausted its one-token
+  budget, header showed one failure, `parallel()` supplied a null slot, and the
+  synthesizer completed from two survivors (`surviving_count=2`).
+- WF-A4: PASS — `workflow_45629ac6`; nonblocking start followed by explicit
+  cancel produced lifecycle `cancelled`, preserved one completed child,
+  finalized two running children as cancelled, did not enter the unreachable
+  phase, and returned no result. Repeated cancel is covered as a no-op by the
+  tool regression test.
 
-New bugs filed:
-Follow-ups:
-```
+New bugs filed: none; all reproducible defects above were fixed in #4325.
+Follow-ups: run the fleet-backed stopship lane from #4178/#4179 after landing.
 
 ### CI / PR gate (non-interactive)
 
 ```bash
 cargo fmt --all -- --check
 cargo test -p codewhale-tui --locked dogfood_
-cargo test -p codewhale-workflow-js --locked parallel_ fan_out cancel drop
+cargo test -p codewhale-workflow-js --locked
 ```

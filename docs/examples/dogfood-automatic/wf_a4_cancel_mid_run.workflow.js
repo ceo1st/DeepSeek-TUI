@@ -17,7 +17,7 @@ export default async function () {
         label: "slow-1",
         type: "explore",
         prompt:
-          "Thoroughly inventory crates/tui/src file names (read-only). Take your time; list directories depth-first. Return a count at the end.",
+          "If a foreground shell tool is available, first run `sleep 60`; otherwise state that limitation. Then thoroughly inventory crates/tui/src file names (read-only) and return a count. This creates a practical cancellation window.",
       }),
     () =>
       task({
@@ -25,7 +25,7 @@ export default async function () {
         label: "slow-2",
         type: "explore",
         prompt:
-          "Thoroughly inventory crates/config/src file names (read-only). Take your time; list directories depth-first. Return a count at the end.",
+          "If a foreground shell tool is available, first run `sleep 60`; otherwise state that limitation. Then thoroughly inventory crates/config/src file names (read-only) and return a count. This creates a practical cancellation window.",
       }),
     () =>
       task({
@@ -33,7 +33,7 @@ export default async function () {
         label: "slow-3",
         type: "explore",
         prompt:
-          "Thoroughly inventory docs/ markdown titles (read-only). Take your time. Return a count at the end.",
+          "If a foreground shell tool is available, first run `sleep 60`; otherwise state that limitation. Then thoroughly inventory docs/ markdown titles (read-only) and return a count. This creates a practical cancellation window.",
       }),
   ]);
 

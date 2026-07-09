@@ -672,9 +672,22 @@ async fn cancel_workflow(
         let mut controllers_guard = lock_mutex(&state.controllers)?;
         controllers_guard.remove(run_id)
     };
-    if let Some(controller) = controller {
+    let already_cancelled = {
+        let runs_guard = lock_mutex(&state.runs)?;
+        let record = runs_guard.get(run_id).ok_or_else(|| {
+            ToolError::invalid_input(format!("Unknown workflow run_id '{run_id}'"))
+        })?;
+        record.status == WorkflowRunStatus::Cancelled
+    };
+    if already_cancelled {
+        return workflow_result_for(run_id, state);
+    }
+    if let Some(controller) = controller.as_ref() {
         controller.cancel();
     }
+    let cancelled_event = WorkflowUiEvent::new(WorkflowUiEventKind::RunCancelled {
+        reason: "cancelled by workflow tool".to_string(),
+    });
     let snapshot = {
         let mut runs_guard = lock_mutex(&state.runs)?;
         let record = runs_guard.get_mut(run_id).ok_or_else(|| {
@@ -683,15 +696,17 @@ async fn cancel_workflow(
         record.status = WorkflowRunStatus::Cancelled;
         record.completed_at_ms = Some(now_ms());
         let reason = "cancelled by workflow tool".to_string();
-        record.error = Some(reason.clone());
-        record
-            .events
-            .push(WorkflowUiEvent::new(WorkflowUiEventKind::RunCancelled {
-                reason,
-            }));
+        record.error = Some(reason);
+        record.events.push(cancelled_event.clone());
         record.clone()
     };
     state.record_snapshot(&snapshot);
+    // The VM may publish its terminal `run_completed` event while cancellation
+    // is racing it. Always stream the authoritative cancellation afterward so
+    // the live panel finalizes running rows and cannot remain visually failed.
+    if let Some(controller) = controller.as_ref() {
+        controller.driver.emit_ui_event(&cancelled_event);
+    }
     workflow_result_for(run_id, state)
 }
 
@@ -1824,6 +1839,9 @@ impl SubAgentWorkflowDriver {
             .lock()
             .map(|ids| ids.clone())
             .unwrap_or_default();
+        for id in &ids {
+            self.record_task_completion(id, &TaskCompletion::Cancelled);
+        }
         if let Ok(mut permits) = self.spawn_permits.lock() {
             permits.clear();
         }
@@ -4306,12 +4324,13 @@ export default workflow({
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
         let (client, calls) = fake_chat_client("child done").await;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
             ctx.clone(),
             true,
-            None,
+            Some(event_tx),
             manager.clone(),
         );
         let tool = WorkflowTool::new(manager.clone(), runtime);
@@ -4354,6 +4373,48 @@ export default workflow({
         let cancelled_payload: Value =
             serde_json::from_str(&cancelled.content).expect("cancel json");
         assert_eq!(cancelled_payload["status"], "cancelled");
+        assert!(
+            cancelled_payload["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|event| event["type"] == "run_cancelled")),
+            "cancel receipt must include the authoritative terminal event: {cancelled_payload}"
+        );
+        let mut streamed_cancel = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::WorkflowUi { event, .. } = event
+                && event["type"] == "run_cancelled"
+            {
+                streamed_cancel = true;
+            }
+        }
+        assert!(
+            streamed_cancel,
+            "cancel must stream a terminal UI event after any racing completion"
+        );
+        let first_event_count = cancelled_payload["events"]
+            .as_array()
+            .expect("events")
+            .len();
+        let first_completed_at = cancelled_payload["completed_at_ms"].clone();
+        let cancelled_again = tool
+            .execute(json!({"action": "cancel", "run_id": run_id}), &ctx)
+            .await
+            .expect("second workflow cancel is a no-op");
+        let cancelled_again_payload: Value =
+            serde_json::from_str(&cancelled_again.content).expect("second cancel json");
+        assert_eq!(cancelled_again_payload["status"], "cancelled");
+        assert_eq!(
+            cancelled_again_payload["events"]
+                .as_array()
+                .expect("events")
+                .len(),
+            first_event_count,
+            "second cancel must not append a duplicate terminal event"
+        );
+        assert_eq!(
+            cancelled_again_payload["completed_at_ms"], first_completed_at,
+            "second cancel must preserve the original completion time"
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         let calls_after_cancel = calls.load(Ordering::SeqCst);

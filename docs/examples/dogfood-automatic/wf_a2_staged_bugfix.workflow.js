@@ -2,8 +2,9 @@
  * #4131 WF-A2 — staged bug fix with worktree implementer + verifier.
  *
  * Expected UI: Implement phase with worktree-isolated implementer, then Verify
- * phase. Write/worktree plans should surface approval when
- * require_approval_for_writes is true.
+ * phase. The verifier checks the returned handoff while confirming the parent
+ * workspace remains unchanged until an explicit apply/merge. Write/worktree
+ * plans should surface approval when require_approval_for_writes is true.
  *
  * Run: /workflow run docs/examples/dogfood-automatic/wf_a2_staged_bugfix.workflow.js
  */
@@ -30,13 +31,14 @@ export default async function (args) {
 
   phase("Verify");
   const verify = await task({
-    description: "Verify the implementer change without further edits.",
+    description: "Verify the isolated implementer handoff without further edits.",
     label: "verifier",
     type: "verifier",
     worktree: false,
     prompt: [
-      "Read the implementer result and re-check the target file.",
-      "Confirm the intended one-line clarification is present and nothing else was changed.",
+      "Read the implementer result and validate its reported path and diff summary.",
+      "Confirm the intended one-line clarification was made only in the isolated worktree.",
+      "Confirm the parent workspace remains unchanged until an explicit apply or merge.",
       "Do not implement further edits. Return PASS/FAIL with evidence.",
       "",
       "implementer_result:",
