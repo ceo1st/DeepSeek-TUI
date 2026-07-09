@@ -2,7 +2,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    BranchSpec, BudgetSpec, CondSpec, ExpandSpec, LeafSpec, LoopUntilSpec, ModelPolicy,
+    BranchSpec, BudgetSpec, CondSpec, ExpandSpec, GateSpec, LeafSpec, LoopUntilSpec, ModelPolicy,
     PermissionSpec, PromotionPolicy, ReduceSpec, SequenceSpec, TeacherReviewSpec, WorkflowNode,
     WorkflowSpec, validate_workflow_nodes,
 };
@@ -47,6 +47,7 @@ fn compile_js_like_workflow(
         .map_err(JavascriptWorkflowError::InvalidJson)?;
     let mut workflow = authored.into_workflow();
     normalize_leaf_profiles(&mut workflow.nodes);
+    normalize_gate_roles(&mut workflow.gates);
     if workflow.goal.trim().is_empty() {
         return Err(JavascriptWorkflowError::InvalidNode(
             "workflow goal cannot be empty".to_string(),
@@ -84,6 +85,15 @@ fn normalize_leaf_profiles(nodes: &mut [WorkflowNode]) {
                 }
             }
             WorkflowNode::Reduce(_) | WorkflowNode::TeacherReview(_) => {}
+        }
+    }
+}
+
+fn normalize_gate_roles(gates: &mut [GateSpec]) {
+    for gate in gates {
+        gate.role = gate.role.trim().to_lowercase();
+        if let Some(blocks_role) = gate.blocks_role.as_mut() {
+            *blocks_role = blocks_role.trim().to_lowercase();
         }
     }
 }
@@ -196,6 +206,8 @@ struct JsWorkflowSpec {
     #[serde(default)]
     promotion_policy: PromotionPolicy,
     #[serde(default)]
+    gates: Vec<GateSpec>,
+    #[serde(default)]
     nodes: Vec<JsWorkflowNode>,
 }
 
@@ -209,6 +221,7 @@ impl JsWorkflowSpec {
             permissions: self.permissions,
             model_policy: self.model_policy,
             promotion_policy: self.promotion_policy,
+            gates: self.gates,
             nodes: self
                 .nodes
                 .into_iter()
@@ -438,7 +451,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentType, WorkflowReplayExecutor};
+    use crate::{AgentType, GateKind, GateOn, GateOnFail, WorkflowReplayExecutor};
 
     #[test]
     fn javascript_workflow_compiles_branch_reduce_to_ir() {
@@ -570,6 +583,43 @@ workflow({
             panic!("second node should be a leaf");
         };
         assert_eq!(fix.role.as_deref(), Some("implementer"));
+    }
+
+    #[test]
+    fn javascript_workflow_accepts_gate_specs() {
+        let source = r#"
+workflow({
+  "goal": "role gates",
+  "gates": [
+    {
+      "id": "scout-findings",
+      "role": " Scout ",
+      "on": "role_complete",
+      "gate": "approve",
+      "on_fail": "block",
+      "blocks_role": " Implementer ",
+      "artifact_kind": "findings"
+    }
+  ],
+  "nodes": [
+    { "agent": { "id": "scout", "prompt": "Find risk.", "role": "scout" } },
+    { "agent": { "id": "fix", "prompt": "Use findings.", "role": "implementer" } }
+  ]
+});
+"#;
+
+        let workflow =
+            compile_javascript_workflow("gates.workflow.js", source).expect("compile gates");
+
+        assert_eq!(workflow.gates.len(), 1);
+        let gate = &workflow.gates[0];
+        assert_eq!(gate.id, "scout-findings");
+        assert_eq!(gate.role, "scout");
+        assert_eq!(gate.on, GateOn::RoleComplete);
+        assert_eq!(gate.gate, GateKind::Approve);
+        assert_eq!(gate.on_fail, GateOnFail::Block);
+        assert_eq!(gate.blocks_role.as_deref(), Some("implementer"));
+        assert_eq!(gate.artifact_kind.as_deref(), Some("findings"));
     }
 
     #[test]

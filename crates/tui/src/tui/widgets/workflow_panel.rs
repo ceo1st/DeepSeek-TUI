@@ -153,6 +153,17 @@ pub struct WorkflowPanelRow {
     pub schema_error: Option<String>,
 }
 
+/// One lane gate status line surfaced by the Workflow runtime (#4179).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowPanelGateLine {
+    pub gate_id: String,
+    pub role: Option<String>,
+    pub gate: Option<String>,
+    pub state: String,
+    pub blocked_role: Option<String>,
+    pub blocked_reason: Option<String>,
+}
+
 /// One ordered phase group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowPanelPhase {
@@ -224,6 +235,15 @@ pub enum WorkflowPanelEvent {
     TaskCompleted {
         task_id: String,
         status: WorkflowRowStatus,
+        at_ms: u64,
+    },
+    GateUpdated {
+        gate_id: String,
+        role: Option<String>,
+        gate: Option<String>,
+        state: String,
+        blocked_role: Option<String>,
+        blocked_reason: Option<String>,
         at_ms: u64,
     },
     TaskSchemaValidationFailed {
@@ -308,6 +328,15 @@ impl WorkflowPanelEvent {
                     at_ms,
                 })
             }
+            "gate_updated" => Some(Self::GateUpdated {
+                gate_id: opt_str(value, "gate_id")?,
+                role: opt_str(value, "role"),
+                gate: opt_str(value, "gate"),
+                state: opt_str(value, "state").unwrap_or_else(|| "pending".to_string()),
+                blocked_role: opt_str(value, "blocked_role"),
+                blocked_reason: opt_str(value, "blocked_reason"),
+                at_ms,
+            }),
             "task_schema_validation_failed" => Some(Self::TaskSchemaValidationFailed {
                 task_id: opt_str(value, "task_id")?,
                 message: opt_str(value, "message").unwrap_or_else(|| "schema failed".to_string()),
@@ -338,6 +367,7 @@ pub struct WorkflowPanel {
     pub keyboard_focus: bool,
     pub phases: Vec<WorkflowPanelPhase>,
     pub selected_phase: usize,
+    pub gates: Vec<WorkflowPanelGateLine>,
     pub budget_total: Option<u64>,
     pub budget_spent: u64,
     pub budget_remaining: Option<u64>,
@@ -377,6 +407,7 @@ impl WorkflowPanel {
             keyboard_focus: false,
             phases: Vec::new(),
             selected_phase: 0,
+            gates: Vec::new(),
             budget_total: None,
             budget_spent: 0,
             budget_remaining: None,
@@ -518,6 +549,25 @@ impl WorkflowPanel {
             }
         }
 
+        if let Some(gates) = value
+            .get("gate_status")
+            .or_else(|| value.get("gates"))
+            .and_then(Value::as_array)
+        {
+            for gate in gates {
+                if let Some(gate_id) = opt_str(gate, "gate_id") {
+                    panel.upsert_gate(WorkflowPanelGateLine {
+                        gate_id,
+                        role: opt_str(gate, "role"),
+                        gate: opt_str(gate, "gate"),
+                        state: opt_str(gate, "state").unwrap_or_else(|| "pending".to_string()),
+                        blocked_role: opt_str(gate, "blocked_role"),
+                        blocked_reason: opt_str(gate, "blocked_reason"),
+                    });
+                }
+            }
+        }
+
         if let Some(status) = value.get("status").and_then(Value::as_str) {
             let life = lifecycle_from_status(status);
             if life.is_terminal() {
@@ -605,6 +655,16 @@ impl WorkflowPanel {
             "token_budget": self.budget_total,
             "budget_spent": self.budget_spent,
             "budget_remaining": self.budget_remaining,
+            "gates": self.gates.iter().map(|gate| {
+                json!({
+                    "gate_id": gate.gate_id.as_str(),
+                    "role": gate.role.as_deref(),
+                    "gate": gate.gate.as_deref(),
+                    "state": gate.state.as_str(),
+                    "blocked_role": gate.blocked_role.as_deref(),
+                    "blocked_reason": gate.blocked_reason.as_deref(),
+                })
+            }).collect::<Vec<_>>(),
             "phases": self.phases.iter().map(|phase| {
                 json!({
                     "title": phase.title,
@@ -706,6 +766,13 @@ impl WorkflowPanel {
             }
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width(&format!("phases: {}", chips.join("  ")), content_width),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+
+        if !self.gates.is_empty() {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(&format!("gates: {}", self.gates_summary()), content_width),
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         }
@@ -1009,6 +1076,27 @@ impl WorkflowPanel {
                     row.completed_at_ms = Some(at_ms);
                 }
             }
+            WorkflowPanelEvent::GateUpdated {
+                gate_id,
+                role,
+                gate,
+                state,
+                blocked_role,
+                blocked_reason,
+                at_ms: _,
+            } => {
+                self.upsert_gate(WorkflowPanelGateLine {
+                    gate_id,
+                    role,
+                    gate,
+                    state,
+                    blocked_role,
+                    blocked_reason,
+                });
+                if self.lifecycle.is_running() {
+                    self.expanded = true;
+                }
+            }
             WorkflowPanelEvent::TaskSchemaValidationFailed {
                 task_id,
                 message,
@@ -1253,6 +1341,13 @@ impl WorkflowPanel {
             )));
         }
 
+        if !self.gates.is_empty() {
+            lines.push(Line::from(Span::styled(
+                truncate_line_to_width(&format!("gates: {}", self.gates_summary()), content_width),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+
         // Selected phase rows.
         if let Some(phase) = self.phases.get(self.selected_phase) {
             lines.push(Line::from(Span::styled(
@@ -1343,6 +1438,49 @@ impl WorkflowPanel {
             }
         }
         None
+    }
+
+    fn gates_summary(&self) -> String {
+        self.gates
+            .iter()
+            .take(6)
+            .map(|gate| {
+                let target = gate
+                    .blocked_role
+                    .as_deref()
+                    .or(gate.role.as_deref())
+                    .unwrap_or("-");
+                if let Some(reason) = gate.blocked_reason.as_deref() {
+                    format!(
+                        "{}:{}->{} ({})",
+                        short_label(&gate.gate_id, 18),
+                        gate.state,
+                        target,
+                        short_label(reason, 40)
+                    )
+                } else {
+                    format!(
+                        "{}:{}->{}",
+                        short_label(&gate.gate_id, 18),
+                        gate.state,
+                        target
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+
+    fn upsert_gate(&mut self, gate: WorkflowPanelGateLine) {
+        if let Some(existing) = self
+            .gates
+            .iter_mut()
+            .find(|existing| existing.gate_id == gate.gate_id)
+        {
+            *existing = gate;
+        } else {
+            self.gates.push(gate);
+        }
     }
 
     fn finalize_running_rows(&mut self, status: WorkflowRowStatus, at_ms: u64) {
@@ -1727,6 +1865,16 @@ mod tests {
                 "status": "succeeded"
             }),
             json!({
+                "type": "gate_updated",
+                "at_ms": 15,
+                "gate_id": "reviewer-diff",
+                "role": "reviewer",
+                "gate": "review",
+                "state": "blocked",
+                "blocked_role": "verifier",
+                "blocked_reason": "review found regression"
+            }),
+            json!({
                 "type": "run_completed",
                 "at_ms": 16,
                 "status": "completed"
@@ -1751,6 +1899,8 @@ mod tests {
         assert!(!joined.contains("should not appear"), "{joined}");
         assert!(joined.contains("scout"), "{joined}");
         assert!(joined.contains("done"), "{joined}");
+        assert!(joined.contains("reviewer-diff"), "{joined}");
+        assert!(joined.contains("review found regression"), "{joined}");
     }
 
     #[test]

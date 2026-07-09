@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use codewhale_workflow::{
     AgentType, BranchResult, BranchSpec, BudgetSpec, ControlNodeKind, ControlNodeResult,
-    FleetRoleMap, LeafResult, LeafSpec, ReduceSpec, SequenceSpec, TaskMode,
+    FleetRoleMap, GateKind, GateOn, GateOutcome, GateSpec, GateState, GateStatusLine,
+    HandoffArtifact, LaneGateBoard, LeafResult, LeafSpec, ReduceSpec, SequenceSpec, TaskMode,
     WorkflowExecution as IrWorkflowExecution, WorkflowMemoUsage, WorkflowNode,
     WorkflowRunStatus as IrWorkflowRunStatus, WorkflowSpec, WorkflowUsage,
     compile_javascript_workflow, compile_typescript_workflow, leaf_wants_worktree,
@@ -111,6 +112,9 @@ struct WorkflowRunSummary {
     branch_count: usize,
     control_count: usize,
     execution_status: Option<IrWorkflowRunStatus>,
+    gate_count: usize,
+    blocked_gate_count: usize,
+    gate_status: Vec<GateStatusLine>,
     error: Option<String>,
 }
 
@@ -168,6 +172,14 @@ enum WorkflowUiEventKind {
         task_id: String,
         status: IrWorkflowRunStatus,
     },
+    GateUpdated {
+        gate_id: String,
+        role: String,
+        gate: String,
+        state: String,
+        blocked_role: Option<String>,
+        blocked_reason: Option<String>,
+    },
     TaskSchemaValidationFailed {
         task_id: String,
         message: String,
@@ -223,6 +235,7 @@ impl WorkflowUiEventKind {
             Self::PhaseStarted { .. } => "phase_started",
             Self::TaskStarted(_) => "task_started",
             Self::TaskCompleted { .. } => "task_completed",
+            Self::GateUpdated { .. } => "gate_updated",
             Self::TaskSchemaValidationFailed { .. } => "task_schema_validation_failed",
             Self::BudgetUpdated { .. } => "budget_updated",
             Self::Log { .. } => "log",
@@ -255,6 +268,9 @@ struct WorkflowRunRecord {
     /// Durable elevated-plan approval receipt for audit (#4126).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_approval: Option<WorkflowPlanApprovalReceipt>,
+    /// Compact lane gate state for status / panel surfaces (#4179).
+    #[serde(default)]
+    gate_status: Vec<GateStatusLine>,
 }
 
 impl WorkflowRunRecord {
@@ -264,6 +280,9 @@ impl WorkflowRunRecord {
         token_budget: Option<u64>,
         spec: Option<&WorkflowSpec>,
     ) -> Self {
+        let gate_status = spec
+            .map(|spec| initial_gate_status(&run_id, &spec.gates))
+            .unwrap_or_default();
         Self {
             run_id,
             status: WorkflowRunStatus::Running,
@@ -283,6 +302,7 @@ impl WorkflowRunRecord {
             verify_on_complete: false,
             verification: None,
             plan_approval: None,
+            gate_status,
         }
     }
 
@@ -321,9 +341,25 @@ impl WorkflowRunRecord {
                 .map(|execution| execution.control_node_results.len())
                 .unwrap_or_default(),
             execution_status: self.execution.as_ref().map(|execution| execution.status),
+            gate_count: self.gate_status.len(),
+            blocked_gate_count: self
+                .gate_status
+                .iter()
+                .filter(|line| line.blocked_reason.is_some())
+                .count(),
+            gate_status: self.gate_status.clone(),
             error: self.error.clone(),
         }
     }
+}
+
+fn initial_gate_status(run_id: &str, gates: &[GateSpec]) -> Vec<GateStatusLine> {
+    if gates.is_empty() {
+        return Vec::new();
+    }
+    let mut board = LaneGateBoard::new(run_id);
+    board.install_gates(gates);
+    board.status_summary()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,6 +541,11 @@ async fn start_workflow(
     let verify_on_complete = optional_bool(&input, "verify", false);
     let (fleet_name, fleet_roles) = workflow_fleet_roles(&input, context)?;
     let run_id = format!("workflow_{}", &Uuid::new_v4().to_string()[..8]);
+    let gate_specs = source
+        .spec
+        .as_ref()
+        .map(|spec| spec.gates.clone())
+        .unwrap_or_default();
 
     // Capture the approved plan envelope for audit/receipt (#4126). Reaching
     // execute means the approval gate already passed (or YOLO/auto-start).
@@ -566,6 +607,7 @@ async fn start_workflow(
         token_budget,
         fleet_name,
         fleet_roles,
+        gate_specs,
     );
     let vm_cancel = WorkflowRunCancel::new();
     let controller = Arc::new(WorkflowRunController::new(
@@ -845,6 +887,9 @@ fn workflow_result_for(
         "branch_count": summary.branch_count,
         "control_count": summary.control_count,
         "execution_status": summary.execution_status,
+        "gate_count": summary.gate_count,
+        "blocked_gate_count": summary.blocked_gate_count,
+        "gate_status": summary.gate_status,
         // #4126: durable plan-approval receipt for audit/receipt consumers.
         "plan_approval": record.plan_approval,
     }));
@@ -920,6 +965,9 @@ struct StructuredWorkflowPlan {
     /// Escape hatch: full Workflow IR nodes (kind/spec or JS authoring shapes).
     #[serde(default)]
     nodes: Option<Value>,
+    /// Optional Workflow-owned gate specs (#4179).
+    #[serde(default)]
+    gates: Vec<GateSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1093,6 +1141,7 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
         permissions: Default::default(),
         model_policy: Default::default(),
         promotion_policy: Default::default(),
+        gates: plan.gates,
         nodes,
     })
 }
@@ -1696,6 +1745,7 @@ fn task_mode_name(mode: TaskMode) -> &'static str {
 struct RuntimeTaskRecord {
     agent_id: String,
     label: Option<String>,
+    role: Option<String>,
     status: IrWorkflowRunStatus,
     output: Option<String>,
     schema_error: Option<String>,
@@ -1717,6 +1767,10 @@ struct SubAgentWorkflowDriver {
     task_records: Arc<Mutex<HashMap<String, RuntimeTaskRecord>>>,
     total_budget: Option<u64>,
     last_budget_event: Arc<Mutex<Option<BudgetSnapshot>>>,
+    /// Workflow-owned gates installed for this run (#4179).
+    gate_specs: Arc<Vec<GateSpec>>,
+    /// Lane-scoped gate and handoff state keyed by run id.
+    gate_board: Arc<Mutex<LaneGateBoard>>,
     /// Caps concurrently live `task()` children for this run (product: 16).
     concurrent_gate: Arc<Semaphore>,
     /// Held permits for in-flight children; released on completion/cancel.
@@ -1735,8 +1789,11 @@ impl SubAgentWorkflowDriver {
         total_budget: Option<u64>,
         fleet_name: Option<String>,
         fleet_roles: Option<FleetRoleMap>,
+        gate_specs: Vec<GateSpec>,
     ) -> Arc<Self> {
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+        let mut gate_board = LaneGateBoard::new(run_id.clone());
+        gate_board.install_gates(&gate_specs);
         let driver = Arc::new(Self {
             run_id,
             manager,
@@ -1750,6 +1807,8 @@ impl SubAgentWorkflowDriver {
             task_records: Arc::new(Mutex::new(HashMap::new())),
             total_budget,
             last_budget_event: Arc::new(Mutex::new(None)),
+            gate_specs: Arc::new(gate_specs),
+            gate_board: Arc::new(Mutex::new(gate_board)),
             concurrent_gate: Arc::new(Semaphore::new(WORKFLOW_MAX_CONCURRENT.max(1))),
             spawn_permits: Mutex::new(HashMap::new()),
             fleet_name,
@@ -1853,6 +1912,126 @@ impl SubAgentWorkflowDriver {
         }
     }
 
+    fn prepare_request_for_gates(&self, request: &mut TaskRequest) -> Result<(), DriverError> {
+        let Some(role) = request.role.as_deref().filter(|role| !role.is_empty()) else {
+            return Ok(());
+        };
+        if self.gate_specs.is_empty() {
+            return Ok(());
+        }
+
+        let (blocked, handoffs) = {
+            let board = self
+                .gate_board
+                .lock()
+                .map_err(|_| DriverError::Rejected("workflow gate board lock poisoned".into()))?;
+            let blocked = board.role_is_blocked(&self.gate_specs, role).cloned();
+            let handoffs = board
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.to_role.eq_ignore_ascii_case(role))
+                .rev()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>();
+            (blocked, handoffs)
+        };
+
+        if let Some(state) = blocked {
+            return Err(DriverError::Rejected(format!(
+                "workflow gate blocks role `{role}`: {}",
+                gate_state_reason(&state)
+            )));
+        }
+
+        if !handoffs.is_empty() {
+            append_handoff_context(request, &handoffs);
+        }
+        Ok(())
+    }
+
+    fn update_gate_status(&self, status: Vec<GateStatusLine>) {
+        let snapshot = if let Ok(mut runs) = self.state.runs.lock()
+            && let Some(record) = runs.get_mut(&self.run_id)
+        {
+            record.gate_status = status;
+            Some(record.clone())
+        } else {
+            None
+        };
+        if let Some(record) = snapshot {
+            self.state.record_snapshot(&record);
+        }
+    }
+
+    fn evaluate_gates_for_completed_role(&self, record: &RuntimeTaskRecord) {
+        let Some(role) = record.role.as_deref().filter(|role| !role.is_empty()) else {
+            return;
+        };
+        if self.gate_specs.is_empty() {
+            return;
+        }
+        let specs = self
+            .gate_specs
+            .iter()
+            .filter(|spec| spec.on == GateOn::RoleComplete && spec.role.eq_ignore_ascii_case(role))
+            .cloned()
+            .collect::<Vec<_>>();
+        if specs.is_empty() {
+            return;
+        }
+
+        let outcome = match record.status {
+            IrWorkflowRunStatus::Succeeded => GateOutcome::Pass,
+            _ => GateOutcome::Fail {
+                reason: record.output.clone().unwrap_or_else(|| {
+                    format!("task {} ended as {:?}", record.agent_id, record.status)
+                }),
+            },
+        };
+
+        let mut events = Vec::new();
+        let mut next_status = Vec::new();
+        if let Ok(mut board) = self.gate_board.lock() {
+            for spec in specs {
+                if matches!(outcome, GateOutcome::Pass)
+                    && let (Some(kind), Some(to_role)) =
+                        (spec.artifact_kind.as_deref(), spec.blocks_role.as_deref())
+                {
+                    let _ = board.record_handoff(HandoffArtifact {
+                        id: format!("{}:{}:{kind}", self.run_id, record.agent_id),
+                        lane_id: self.run_id.clone(),
+                        from_role: spec.role.clone(),
+                        to_role: to_role.to_string(),
+                        kind: kind.to_string(),
+                        payload: record.output.clone().unwrap_or_default(),
+                        created_at: now_ms().to_string(),
+                    });
+                }
+                let state = board
+                    .evaluate(&spec, outcome.clone())
+                    .unwrap_or_else(|err| GateState::Blocked {
+                        reason: err.to_string(),
+                    });
+                events.push(WorkflowUiEvent::new(WorkflowUiEventKind::GateUpdated {
+                    gate_id: spec.id.clone(),
+                    role: spec.role.clone(),
+                    gate: gate_kind_label(spec.gate).to_string(),
+                    state: state.as_str().to_string(),
+                    blocked_role: spec.blocks_role.clone(),
+                    blocked_reason: state.blocked_reason().map(str::to_string),
+                }));
+            }
+            next_status = board.status_summary();
+        }
+        if !events.is_empty() || !next_status.is_empty() {
+            self.update_gate_status(next_status);
+        }
+        for event in events {
+            self.record_run_event(event);
+        }
+    }
+
     fn record_task_started(
         &self,
         agent_id: &str,
@@ -1907,6 +2086,7 @@ impl SubAgentWorkflowDriver {
                 RuntimeTaskRecord {
                     agent_id: agent_id.to_string(),
                     label: request.label.clone(),
+                    role: request.role.clone(),
                     status: IrWorkflowRunStatus::Running,
                     output: None,
                     schema_error: None,
@@ -1925,6 +2105,7 @@ impl SubAgentWorkflowDriver {
 
     fn record_task_completion(&self, agent_id: &str, completion: &TaskCompletion) {
         let mut terminal_event = None;
+        let mut completed_record = None;
         if let Ok(mut records) = self.task_records.lock()
             && let Some(record) = records.get_mut(agent_id)
         {
@@ -1937,7 +2118,11 @@ impl SubAgentWorkflowDriver {
                     task_id: agent_id.to_string(),
                     status,
                 }));
+                completed_record = Some(record.clone());
             }
+        }
+        if let Some(record) = completed_record.as_ref() {
+            self.evaluate_gates_for_completed_role(record);
         }
         if let Some(event) = terminal_event {
             self.record_run_event(event);
@@ -2008,6 +2193,7 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
                 }
             },
         )?;
+        self.prepare_request_for_gates(&mut request)?;
         // Wait for a concurrent slot (max 16 live children per run).
         let permit = self
             .concurrent_gate
@@ -2135,6 +2321,47 @@ fn budget_event_kind(snapshot: BudgetSnapshot) -> WorkflowUiEventKind {
         spent: snapshot.spent,
         remaining: snapshot.remaining(),
     }
+}
+
+fn gate_kind_label(kind: GateKind) -> &'static str {
+    match kind {
+        GateKind::Verify => "verify",
+        GateKind::Review => "review",
+        GateKind::Approve => "approve",
+    }
+}
+
+fn gate_state_reason(state: &GateState) -> String {
+    state
+        .blocked_reason()
+        .map(str::to_string)
+        .unwrap_or_else(|| state.as_str().to_string())
+}
+
+fn append_handoff_context(request: &mut TaskRequest, handoffs: &[HandoffArtifact]) {
+    request
+        .description
+        .push_str("\n\nWorkflow handoff artifacts available for this role:\n");
+    for artifact in handoffs {
+        request.description.push_str(&format!(
+            "- id: {} kind: {} from: {} to: {}\n  payload: {}\n",
+            artifact.id,
+            artifact.kind,
+            artifact.from_role,
+            artifact.to_role,
+            compact_handoff_payload(&artifact.payload, 900)
+        ));
+    }
+}
+
+fn compact_handoff_payload(payload: &str, max_chars: usize) -> String {
+    let trimmed = payload.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn task_completion_status(completion: &TaskCompletion) -> (IrWorkflowRunStatus, Option<String>) {
@@ -2717,6 +2944,7 @@ mod journal {
                 verify_on_complete: false,
                 verification: None,
                 plan_approval: None,
+                gate_status: Vec::new(),
             }
         }
 
@@ -3643,6 +3871,142 @@ export default workflow({
         let second_body = bodies.get(1).expect("second provider call").to_string();
         assert!(second_body.contains("--- first ---"), "{second_body}");
         assert!(second_body.contains("upstream-output"), "{second_body}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn workflow_runtime_gates_promote_handoff_and_block_downstream_role() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager.clone(),
+        );
+        let state = WorkflowWorkspaceState::open(tmp.path());
+        let run_id = "workflow_gate".to_string();
+        let gates = vec![GateSpec {
+            id: "scout-findings".to_string(),
+            role: "scout".to_string(),
+            on: GateOn::RoleComplete,
+            gate: GateKind::Approve,
+            on_fail: codewhale_workflow::GateOnFail::Block,
+            blocks_role: Some("implementer".to_string()),
+            max_retries: 0,
+            artifact_kind: Some("findings".to_string()),
+        }];
+        let spec = WorkflowSpec {
+            id: Some("gate-fixture".to_string()),
+            goal: "gate fixture".to_string(),
+            description: None,
+            budget: BudgetSpec::default(),
+            permissions: Default::default(),
+            model_policy: Default::default(),
+            promotion_policy: Default::default(),
+            gates: gates.clone(),
+            nodes: Vec::new(),
+        };
+        state.runs.lock().expect("runs").insert(
+            run_id.clone(),
+            WorkflowRunRecord::new(run_id.clone(), None, None, Some(&spec)),
+        );
+        let driver = SubAgentWorkflowDriver::new(
+            run_id.clone(),
+            manager,
+            runtime,
+            state.clone(),
+            None,
+            None,
+            None,
+            gates,
+        );
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "scout-agent".to_string(),
+            label: Some("scout".to_string()),
+            role: Some("scout".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("findings: inspect tui exit path".to_string()),
+            schema_error: None,
+        });
+
+        let mut implementer = TaskRequest {
+            description: "Use the findings.".to_string(),
+            subagent_type: Some("implementer".to_string()),
+            role: Some("implementer".to_string()),
+            profile: None,
+            model: None,
+            model_strength: None,
+            thinking: None,
+            worktree: false,
+            allowed_tools: Some(Vec::new()),
+            max_depth: None,
+            token_budget: None,
+            response_schema: None,
+            label: Some("fix".to_string()),
+            phase: None,
+        };
+        driver
+            .prepare_request_for_gates(&mut implementer)
+            .expect("passed gate should admit implementer");
+        assert!(
+            implementer
+                .description
+                .contains("Workflow handoff artifacts available"),
+            "{}",
+            implementer.description
+        );
+        assert!(
+            implementer.description.contains("inspect tui exit path"),
+            "{}",
+            implementer.description
+        );
+
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "scout-agent-2".to_string(),
+            label: Some("scout".to_string()),
+            role: Some("scout".to_string()),
+            status: IrWorkflowRunStatus::Failed,
+            output: Some("scout incomplete".to_string()),
+            schema_error: None,
+        });
+        let mut blocked = TaskRequest {
+            description: "Try after block.".to_string(),
+            role: Some("implementer".to_string()),
+            ..implementer.clone()
+        };
+        let err = driver
+            .prepare_request_for_gates(&mut blocked)
+            .expect_err("blocked gate should reject downstream role");
+        assert!(err.to_string().contains("scout incomplete"), "{err}");
+
+        let run = state
+            .runs
+            .lock()
+            .expect("runs")
+            .get(&run_id)
+            .cloned()
+            .expect("run");
+        assert!(
+            run.gate_status
+                .iter()
+                .any(|line| line.gate_id == "scout-findings"
+                    && line.state == "blocked"
+                    && line.blocked_reason.as_deref() == Some("scout incomplete")),
+            "{:?}",
+            run.gate_status
+        );
+        assert!(
+            run.events
+                .iter()
+                .any(|event| event.event_type() == "gate_updated"),
+            "{:?}",
+            run.events
+        );
     }
 
     #[tokio::test]

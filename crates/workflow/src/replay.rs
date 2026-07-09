@@ -552,6 +552,7 @@ mod tests {
             permissions: PermissionSpec::default(),
             model_policy: ModelPolicy::default(),
             promotion_policy: crate::PromotionPolicy::default(),
+            gates: Vec::new(),
             nodes,
         }
     }

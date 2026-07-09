@@ -82,6 +82,10 @@ pub struct WorkflowSpec {
     pub model_policy: ModelPolicy,
     #[serde(default)]
     pub promotion_policy: PromotionPolicy,
+    /// Workflow-owned role gates and handoffs (#4179). Fleet supplies roles;
+    /// gate semantics stay attached to the Workflow definition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<GateSpec>,
     #[serde(default)]
     pub nodes: Vec<WorkflowNode>,
 }
@@ -2181,6 +2185,7 @@ mod tests {
             permissions: PermissionSpec::default(),
             model_policy: ModelPolicy::default(),
             promotion_policy: PromotionPolicy::default(),
+            gates: Vec::new(),
             nodes,
         }
     }
@@ -2573,6 +2578,7 @@ mod tests {
                 min_successful_branches: Some(1),
                 promotion_gate: PromotionGate::default(),
             },
+            gates: Vec::new(),
             nodes: vec![
                 WorkflowNode::BranchSet(BranchSpec {
                     id: "discover".to_string(),
