@@ -2178,8 +2178,8 @@ impl ModalView for ConfigView {
             (lines, self.tr(MessageId::ConfigEditFooter).to_string())
         } else {
             let content_height = usize::from(inner.height);
-            // Title, subtitle, search, blank, column headers, separator.
-            let header_lines = 6usize;
+            // Title (with job subtitle), search, blank, column headers, separator.
+            let header_lines = 5usize;
             let bottom_lines = 1usize;
             // The action footer now lives inside the modal body (reserved by
             // `render_modal_text_footer` below) rather than on the border, so it
@@ -2204,14 +2204,16 @@ impl ModalView for ConfigView {
             let (key_column_width, value_column_width, scope_column_width) =
                 self.table_column_widths(usize::from(inner.width));
             let mut lines: Vec<Line> = vec![
-                Line::from(vec![Span::styled(
-                    self.tr(MessageId::ConfigTitle),
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
-                )]),
-                Line::from(vec![Span::styled(
-                    self.tr(MessageId::ConfigSubtitle),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )]),
+                Line::from(vec![
+                    Span::styled(
+                        self.tr(MessageId::ConfigTitle),
+                        Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+                    ),
+                    Span::styled(
+                        format!(" — {}", self.tr(MessageId::ConfigSubtitle)),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    ),
+                ]),
                 Line::from(vec![
                     Span::styled("  Search: ", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw(search_value),
