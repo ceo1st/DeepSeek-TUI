@@ -807,6 +807,7 @@ dependencies = [
  "codewhale-build-support",
  "codewhale-config",
  "codewhale-execpolicy",
+ "codewhale-lane",
  "codewhale-mcp",
  "codewhale-release",
  "codewhale-secrets",
@@ -885,6 +886,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "codewhale-lane"
+version = "0.8.67"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "codewhale-config",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
