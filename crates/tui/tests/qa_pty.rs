@@ -221,6 +221,135 @@ fn smoke_keystroke_reaches_composer() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Release stopship coverage: a real built TUI restores durable Work state and
+/// keeps both To-do and the effective permission posture visible at each
+/// supported compact evidence size. No model turn is sent.
+#[test]
+fn work_and_permission_are_visible_at_release_terminal_sizes() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+
+    for (cols, rows) in [(120_u16, 32_u16), (100, 30), (80, 24)] {
+        let ws = make_sealed_workspace()?;
+        let codewhale_home = ws.home().join(".codewhale");
+        let codex_home = ws.home().join(".codex");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::write(codewhale_home.join("config.toml"), "allow_shell = true\n")?;
+        std::fs::write(
+            codewhale_home.join("settings.toml"),
+            "permission_posture = \"full-access\"\n",
+        )?;
+        std::fs::write(
+            codex_home.join("models_cache.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "fetched_at": chrono::Utc::now(),
+                "models": [{"slug": "gpt-pty-fixture", "priority": 1}]
+            }))?,
+        )?;
+
+        let session_path = ws.workspace().join("release-work-session.json");
+        std::fs::write(
+            &session_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "metadata": {
+                    "id": format!("pty-{cols}x{rows}"),
+                    "title": "Release Work continuity",
+                    "created_at": "2026-07-10T00:00:00Z",
+                    "updated_at": "2026-07-10T00:00:00Z",
+                    "message_count": 0,
+                    "total_tokens": 0,
+                    "model": "deepseek-v4-pro",
+                    "model_provider": "deepseek",
+                    "workspace": ws.workspace(),
+                    "mode": "operate",
+                    "cost": {},
+                    "cumulative_turn_secs": 0
+                },
+                "messages": [],
+                "system_prompt": null,
+                "work_state": {
+                    "todos": {
+                        "items": [
+                            {"id": 1, "content": "persisted inspect", "status": "completed"},
+                            {"id": 2, "content": "persisted patch", "status": "in_progress"}
+                        ],
+                        "completion_pct": 50,
+                        "in_progress_id": 2
+                    },
+                    "plan": {
+                        "objective": "Keep release Work visible",
+                        "items": [
+                            {"step": "verify PTY", "status": "in_progress"}
+                        ]
+                    }
+                }
+            }))?,
+        )?;
+
+        let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+            .cwd(ws.workspace())
+            .clear_env()
+            .seal_home(ws.home())
+            .env("CODEWHALE_HOME", codewhale_home.to_string_lossy())
+            .env(
+                "DEEPSEEK_CONFIG_PATH",
+                codewhale_home.join("config.toml").to_string_lossy(),
+            )
+            .env("CODEX_HOME", codex_home.to_string_lossy())
+            .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
+            .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+            .env("RUST_LOG", "warn")
+            .args([
+                "--workspace",
+                ws.workspace().to_str().expect("utf-8 workspace path"),
+                "--no-project-config",
+                "--skip-onboarding",
+            ])
+            .size(rows, cols)
+            .spawn()?;
+
+        h.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+        h.send(keys::key::text(&format!(
+            "/load {}",
+            session_path.to_string_lossy()
+        )))?;
+        h.wait_for_text("/load", KEY_TIMEOUT)?;
+        h.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
+        h.send(keys::key::enter())?;
+        h.wait_for_text("To-do", KEY_TIMEOUT)?;
+        h.wait_for_text("Full Access", KEY_TIMEOUT)?;
+        h.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
+
+        let frame = h.frame();
+        let dump = frame.debug_dump();
+        assert!(
+            frame.contains("To-do"),
+            "To-do missing at {cols}x{rows}:\n{dump}"
+        );
+        assert!(
+            frame.contains("persisted") || frame.contains("2 items"),
+            "Work state missing at {cols}x{rows}:\n{dump}"
+        );
+        assert!(
+            frame.contains("Full Access"),
+            "effective permission missing at {cols}x{rows}:\n{dump}"
+        );
+        assert!(
+            frame.contains("Operate") || frame.contains("operate"),
+            "restored mode missing at {cols}x{rows}:\n{dump}"
+        );
+
+        if let Some(dir) = std::env::var_os("CODEWHALE_QA_EVIDENCE_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("tui-{cols}x{rows}.txt")), dump)?;
+        }
+
+        let _ = h.shutdown();
+    }
+    Ok(())
+}
+
 /// Regression: `/skills` should reflect the same merged discovery set as the
 /// slash menu and model-visible skills block, not just the first selected
 /// skills directory.

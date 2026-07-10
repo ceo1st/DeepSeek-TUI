@@ -51,7 +51,7 @@ const HOTBAR_ROW_COLUMNS: usize = 4;
 pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config) {
     // Clear hover state at the start of each render
     app.sidebar_hover = SidebarHoverState::default();
-    if area.width < 24 || area.height < 8 {
+    if area.width < 20 || area.height < 3 {
         // Paint a styled block over the area so stale cells from a previous
         // (wider) frame don't persist as bleed-through artifacts (#400).
         Block::default()
@@ -67,15 +67,42 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config)
         return;
     }
 
-    let hotbar_enabled = hotbar_panel_enabled(app, config) && !is_hotbar_disabled(config);
+    let work_has_content = sidebar_work_summary(app).has_useful_content();
+    // At compact heights the durable Work state outranks optional Hotbar
+    // chrome. The Hotbar returns automatically after the terminal grows.
+    let hotbar_enabled = hotbar_panel_enabled(app, config)
+        && !is_hotbar_disabled(config)
+        && !(work_has_content && area.height < 12);
     let (main_area, hotbar_area) = split_sidebar_hotbar_area(area, hotbar_enabled);
-    match app.sidebar_focus {
-        SidebarFocus::Auto => render_sidebar_auto(f, main_area, app),
-        SidebarFocus::Pinned => render_sidebar_pinned(f, main_area, app),
-        SidebarFocus::Tasks => render_sidebar_tasks(f, main_area, app),
-        SidebarFocus::Agents => render_sidebar_subagents(f, main_area, app),
-        SidebarFocus::Context => render_context_panel(f, main_area, app),
-        SidebarFocus::Hidden => unreachable!("hidden sidebar returned before render dispatch"),
+    let fixed_focus = matches!(
+        app.sidebar_focus,
+        SidebarFocus::Tasks | SidebarFocus::Agents | SidebarFocus::Context
+    );
+    if fixed_focus && work_has_content {
+        if main_area.height < 7 {
+            render_sidebar_work_compact(f, main_area, app);
+        } else {
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(4)])
+                .split(main_area);
+            match app.sidebar_focus {
+                SidebarFocus::Tasks => render_sidebar_tasks(f, sections[0], app),
+                SidebarFocus::Agents => render_sidebar_subagents(f, sections[0], app),
+                SidebarFocus::Context => render_context_panel(f, sections[0], app),
+                _ => unreachable!("fixed focus was checked above"),
+            }
+            render_sidebar_work_compact(f, sections[1], app);
+        }
+    } else {
+        match app.sidebar_focus {
+            SidebarFocus::Auto => render_sidebar_auto(f, main_area, app),
+            SidebarFocus::Pinned => render_sidebar_pinned(f, main_area, app),
+            SidebarFocus::Tasks => render_sidebar_tasks(f, main_area, app),
+            SidebarFocus::Agents => render_sidebar_subagents(f, main_area, app),
+            SidebarFocus::Context => render_context_panel(f, main_area, app),
+            SidebarFocus::Hidden => unreachable!("hidden sidebar returned before render dispatch"),
+        }
     }
     if let Some(hotbar_area) = hotbar_area {
         render_hotbar_panel(f, hotbar_area, app, config);
@@ -136,10 +163,12 @@ fn render_sidebar_panel_stack(
             Constraint::Min(0),
         ],
         4 => vec![
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Min(6),
+            // Work is first whenever present. Give it a hard compact floor so
+            // Context cannot starve a live To-do after a resize.
+            Constraint::Length(5),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Min(3),
         ],
         _ => vec![
             Constraint::Percentage(20),
@@ -528,6 +557,51 @@ impl SidebarWorkSummary {
         let percent = completed.saturating_mul(100) / self.strategy_steps.len();
         u8::try_from(percent).unwrap_or(u8::MAX)
     }
+
+    fn compact_indicator(&self) -> Option<String> {
+        if !self.checklist_items.is_empty() {
+            return Some(format!(
+                "To-do {} · {}%",
+                self.checklist_items.len(),
+                self.checklist_completion_pct
+            ));
+        }
+        if self.has_strategy() {
+            return Some("Work plan active".to_string());
+        }
+        self.goal_objective
+            .as_ref()
+            .map(|_| "Work goal active".to_string())
+    }
+}
+
+/// Compact Work fallback for surfaces used when the sidebar cannot fit.
+/// Reads the live stores first and only falls back to the last rendered
+/// summary during brief lock contention.
+pub(crate) fn compact_work_indicator(app: &App) -> Option<String> {
+    let todos = app.todos.try_lock().ok().map(|todos| todos.snapshot());
+    if let Some(snapshot) = todos.as_ref().filter(|snapshot| !snapshot.is_empty()) {
+        return Some(format!(
+            "To-do {} · {}%",
+            snapshot.items.len(),
+            snapshot.completion_pct
+        ));
+    }
+
+    let plan = app.plan_state.try_lock().ok().map(|plan| !plan.is_empty());
+    if plan == Some(true) {
+        return Some("Work plan active".to_string());
+    }
+    if app.hunt.quarry.is_some() || app.paused_quarry.is_some() {
+        return Some("Work goal active".to_string());
+    }
+    if todos.is_none() || plan.is_none() {
+        return app
+            .cached_work_summary
+            .as_ref()
+            .and_then(SidebarWorkSummary::compact_indicator);
+    }
+    None
 }
 
 fn should_render_strategy_step(
@@ -1211,6 +1285,41 @@ fn render_sidebar_work(f: &mut Frame, area: Rect, app: &mut App) {
 
     let full_texts = work_panel_hover_texts(&summary, content_width.max(1), usable_rows);
     render_sidebar_section(f, area, "To-do", lines, full_texts, Vec::new(), app);
+}
+
+fn render_sidebar_work_compact(f: &mut Frame, area: Rect, app: &mut App) {
+    let summary = sidebar_work_summary(app);
+    let label = if !summary.checklist_items.is_empty() {
+        let count = summary.checklist_items.len();
+        format!(
+            "{count} item{} · {}%",
+            if count == 1 { "" } else { "s" },
+            summary.checklist_completion_pct
+        )
+    } else if summary.has_strategy() {
+        let (pending, in_progress, completed) = summary.strategy_counts();
+        let total = pending + in_progress + completed;
+        if total == 0 {
+            "plan active".to_string()
+        } else {
+            format!("plan {completed}/{total} · {in_progress} active")
+        }
+    } else if summary.goal_objective.is_some() {
+        "goal active".to_string()
+    } else {
+        "Work state updating...".to_string()
+    };
+    let content_width = area.width.saturating_sub(4) as usize;
+    let line = truncate_line_to_width(&label, content_width.max(1));
+    render_sidebar_section(
+        f,
+        area,
+        "To-do",
+        vec![Line::from(line.clone())],
+        vec![label],
+        Vec::new(),
+        app,
+    );
 }
 
 /// Click actions for one background job row pair (#3028).
@@ -3306,7 +3415,9 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn context_panel_cost_line(app: &App) -> String {
     let displayed_total = app.displayed_session_cost_for_currency(app.cost_currency);
-    if displayed_total == 0.0 && !crate::pricing::has_pricing_for_model(&app.model) {
+    if displayed_total == 0.0
+        && !crate::pricing::has_pricing_for_provider(app.api_provider, &app.model)
+    {
         return format!("cost: n/a (no pricing data for {})", app.model);
     }
 
@@ -3582,6 +3693,18 @@ mod tests {
         assert_eq!(
             context_panel_cost_line(&app),
             "cost: n/a (no pricing data for unknown-provider/unknown-model)"
+        );
+    }
+
+    #[test]
+    fn context_panel_cost_line_does_not_inherit_api_pricing_for_codex_oauth() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+        app.model = "gpt-5.5".to_string();
+
+        assert_eq!(
+            context_panel_cost_line(&app),
+            "cost: n/a (no pricing data for gpt-5.5)"
         );
     }
 
@@ -3945,6 +4068,104 @@ mod tests {
             rendered.contains("Alt4"),
             "active agent-mode slot should render distinctly: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn nonempty_todo_remains_visible_across_release_sizes_and_focuses() {
+        // These sidebar widths are the actual splits produced by 120, 100,
+        // and 80-column terminals (the compact 80-column case is 20 wide).
+        for (sidebar_width, height) in [(33, 32), (28, 30), (20, 24)] {
+            for focus in [
+                SidebarFocus::Auto,
+                SidebarFocus::Pinned,
+                SidebarFocus::Tasks,
+                SidebarFocus::Agents,
+                SidebarFocus::Context,
+            ] {
+                let mut app = create_test_app();
+                app.sidebar_focus = focus;
+                {
+                    let mut todos = app.todos.try_lock().expect("todos lock");
+                    todos.add("inspect".to_string(), TodoStatus::Completed);
+                    todos.add("patch".to_string(), TodoStatus::InProgress);
+                }
+                let config = Config {
+                    hotbar: Some(Vec::new()),
+                    ..Config::default()
+                };
+                let backend = TestBackend::new(sidebar_width, height);
+                let mut terminal = Terminal::new(backend).expect("terminal");
+                terminal
+                    .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &config))
+                    .expect("draw sidebar");
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+
+                assert!(
+                    rendered.contains("To-do"),
+                    "To-do title missing at {sidebar_width}x{height} in {focus:?}: {rendered:?}"
+                );
+                assert!(
+                    rendered.contains("patch") || rendered.contains("2 items"),
+                    "neither full nor compact To-do state rendered at {sidebar_width}x{height} in {focus:?}: {rendered:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_is_the_only_focus_that_suppresses_nonempty_todo() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Hidden;
+        app.todos
+            .try_lock()
+            .expect("todos lock")
+            .add("hidden explicitly".to_string(), TodoStatus::InProgress);
+        let backend = TestBackend::new(20, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &Config::default()))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("To-do"));
+    }
+
+    #[test]
+    fn compact_metadata_only_plan_reports_active_without_zero_counts() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Agents;
+        app.plan_state
+            .try_lock()
+            .expect("plan lock")
+            .update(crate::tools::plan::UpdatePlanArgs {
+                objective: Some("metadata-only release plan".to_string()),
+                ..crate::tools::plan::UpdatePlanArgs::default()
+            });
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), &mut app, &Config::default()))
+            .expect("draw sidebar");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("plan active"), "{rendered:?}");
+        assert!(!rendered.contains("0/0"), "{rendered:?}");
     }
 
     #[test]

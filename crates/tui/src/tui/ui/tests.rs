@@ -2242,6 +2242,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         system_prompt: None,
         context_references: Vec::new(),
         artifacts: Vec::new(),
+        work_state: None,
     }
 }
 
@@ -2253,7 +2254,8 @@ fn apply_loaded_session_restores_dangling_user_tail_as_retry_draft() {
         "finish the Qthresh proof bundle",
     )]);
 
-    let recovered = apply_loaded_session(&mut app, &mut Config::default(), &session);
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
     assert!(recovered);
     assert!(app.api_messages.is_empty());
@@ -2283,7 +2285,8 @@ fn apply_loaded_session_does_not_restore_slash_command_tail_as_retry_draft() {
     let mut app = create_test_app();
     let session = saved_session_with_messages(vec![text_message("user", "/sessions")]);
 
-    let recovered = apply_loaded_session(&mut app, &mut Config::default(), &session);
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
     assert!(!recovered);
     assert_eq!(app.input, "");
@@ -2325,7 +2328,8 @@ fn apply_loaded_session_resets_unpersisted_telemetry() {
     let mut session = saved_session_with_messages(vec![text_message("assistant", "ready")]);
     session.metadata.total_tokens = 500;
 
-    let recovered = apply_loaded_session(&mut app, &mut Config::default(), &session);
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
     assert!(!recovered);
     assert_eq!(app.session.total_tokens, 500);
@@ -2368,7 +2372,7 @@ async fn apply_loaded_session_resets_workspace_runtime_state() {
     let mut session = saved_session_with_messages(vec![text_message("assistant", "ready")]);
     session.metadata.workspace = TempDir::new().expect("temp dir").path().to_path_buf();
 
-    let recovered = apply_loaded_session(&mut app, &mut config, &session);
+    let recovered = apply_loaded_session(&mut app, &mut config, &session).expect("restore session");
 
     assert!(!recovered);
     assert_eq!(app.workspace, session.metadata.workspace);
@@ -2431,7 +2435,7 @@ fn apply_loaded_session_updates_current_workspace_display() {
     let mut session = saved_session_with_messages(vec![text_message("assistant", "ready")]);
     session.metadata.workspace = workspace.path().to_path_buf();
 
-    let recovered = apply_loaded_session(&mut app, &mut config, &session);
+    let recovered = apply_loaded_session(&mut app, &mut config, &session).expect("restore session");
     let result = commands::execute("/workspace", &mut app);
 
     assert!(!recovered);
@@ -4753,7 +4757,17 @@ fn hidden_sidebar_focus_suppresses_sidebar_split_even_when_wide() {
 }
 
 #[test]
-fn sidebar_width_gate_uses_sixty_four_column_boundary() {
+fn compact_sidebar_split_survives_eighty_column_file_tree_host() {
+    let mut app = create_test_app();
+    app.sidebar_focus = SidebarFocus::Pinned;
+
+    // 80-column body -> 20-column file tree + 60-column chat host.
+    assert_eq!(sidebar_width_for_chat_area(&app, 60), Some(20));
+    assert_eq!(sidebar_width_for_chat_area(&app, 59), None);
+}
+
+#[test]
+fn sidebar_width_gate_uses_compact_sixty_column_boundary() {
     let mut app = create_test_app();
     app.sidebar_focus = SidebarFocus::Pinned;
     app.last_sidebar_host_width = Some(SIDEBAR_VISIBLE_MIN_WIDTH - 1);
@@ -5435,6 +5449,7 @@ fn subagent_token_usage_updates_live_cost_counter_without_card_change() {
         1,
         &crate::tools::subagent::MailboxMessage::TokenUsage {
             agent_id: "agent-a".to_string(),
+            provider: ApiProvider::Deepseek,
             model: "deepseek-v4-flash".to_string(),
             usage: crate::models::Usage {
                 input_tokens: 10_000,
@@ -5452,10 +5467,37 @@ fn subagent_token_usage_updates_live_cost_counter_without_card_change() {
 }
 
 #[test]
+fn subagent_token_usage_prices_the_child_route_not_the_parent_route() {
+    let mut app = create_test_app();
+    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+
+    handle_subagent_mailbox(
+        &mut app,
+        2,
+        &crate::tools::subagent::MailboxMessage::TokenUsage {
+            agent_id: "agent-codex".to_string(),
+            provider: ApiProvider::OpenaiCodex,
+            model: "gpt-5.5".to_string(),
+            usage: crate::models::Usage {
+                input_tokens: 10_000,
+                output_tokens: 1_000,
+                ..Default::default()
+            },
+        },
+    );
+
+    assert_eq!(
+        app.session.subagent_cost, 0.0,
+        "ChatGPT/Codex child usage must not inherit the DeepSeek parent's pricing"
+    );
+}
+
+#[test]
 fn subagent_token_usage_is_deduped_by_mailbox_sequence() {
     let mut app = create_test_app();
     let usage = crate::tools::subagent::MailboxMessage::TokenUsage {
         agent_id: "agent-a".to_string(),
+        provider: ApiProvider::Deepseek,
         model: "deepseek-v4-flash".to_string(),
         usage: crate::models::Usage {
             input_tokens: 10_000,
@@ -6553,7 +6595,7 @@ fn issue_2739_stalled_turn_snapshot_preserves_api_messages() {
     // which in turn calls build_session_snapshot. Since persistence
     // may fail in tests (no real home dir), we verify directly that
     // build_session_snapshot captures the in-progress messages.
-    let snapshot = build_session_snapshot(&app, &manager);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     assert_eq!(snapshot.messages.len(), 2);
     assert_eq!(snapshot.messages[0].role, "user");
     assert_eq!(snapshot.messages[1].role, "assistant");
@@ -6583,7 +6625,7 @@ fn issue_2739_esc_cancel_preserves_session_messages_before_clear() {
         app.current_session_id.is_some(),
         "local cancel should create a resumable session snapshot"
     );
-    let snapshot = build_session_snapshot(&app, &manager);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     assert_eq!(snapshot.messages.len(), 2);
     assert_eq!(snapshot.messages[0].role, "user");
     assert_eq!(snapshot.messages[1].role, "assistant");
@@ -6618,7 +6660,7 @@ fn issue_2739_dispatch_timeout_preserves_user_prompt() {
     // #2739: the user's prompt must survive dispatch-timeout recovery so a
     // snapshot (and therefore --continue) still has it instead of loading the
     // previous save.
-    let snapshot = build_session_snapshot(&app, &manager);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     assert_eq!(snapshot.messages.len(), 1);
     assert_eq!(snapshot.messages[0].role, "user");
 }
@@ -7605,7 +7647,7 @@ fn throttled_recovery_snapshot_persists_during_loading_turns() {
     let t0 = Instant::now();
     maybe_throttled_recovery_snapshot(&mut app, t0, &mut last_snapshot_at);
     assert!(last_snapshot_at.is_some());
-    let snapshot = build_session_snapshot(&app, &manager);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     assert_eq!(snapshot.messages.len(), 1);
 
     maybe_throttled_recovery_snapshot(
@@ -8948,6 +8990,95 @@ fn tool_child_usage_metadata_updates_live_cost_counter() {
 }
 
 #[test]
+fn picker_renamed_active_title_survives_automatic_snapshot() {
+    let mut app = create_test_app();
+    let manager = SessionManager::new(tempfile::tempdir().expect("tempdir").path().to_path_buf())
+        .expect("session manager");
+    let mut metadata = crate::session_manager::create_saved_session_with_id_and_mode(
+        "session-active".to_string(),
+        &app.api_messages,
+        &app.model,
+        &app.workspace,
+        0,
+        app.system_prompt.as_ref(),
+        Some(app.mode.as_setting()),
+    )
+    .metadata;
+    metadata.title = "Before".to_string();
+    metadata.parent_session_id = Some("session-parent".to_string());
+    metadata.forked_from_message_count = Some(7);
+    let created_at = metadata.created_at;
+    app.current_session_id = Some(metadata.id.clone());
+    app.current_session_metadata = Some(metadata.clone());
+    app.session_title = Some(metadata.title.clone());
+
+    metadata.title = "After".to_string();
+    assert!(apply_picker_session_rename_to_active_app(
+        &mut app, metadata
+    ));
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("snapshot");
+
+    assert_eq!(snapshot.metadata.title, "After");
+    assert_eq!(snapshot.metadata.created_at, created_at);
+    assert_eq!(
+        snapshot.metadata.parent_session_id.as_deref(),
+        Some("session-parent")
+    );
+    assert_eq!(snapshot.metadata.forked_from_message_count, Some(7));
+}
+
+#[test]
+fn picker_rename_of_inactive_session_does_not_touch_active_metadata() {
+    let mut app = create_test_app();
+    let mut active = crate::session_manager::create_saved_session_with_id_and_mode(
+        "session-active".to_string(),
+        &app.api_messages,
+        &app.model,
+        &app.workspace,
+        0,
+        app.system_prompt.as_ref(),
+        Some(app.mode.as_setting()),
+    )
+    .metadata;
+    active.title = "Active".to_string();
+    let mut inactive = active.clone();
+    inactive.id = "session-inactive".to_string();
+    inactive.title = "Renamed inactive".to_string();
+    app.current_session_id = Some(active.id.clone());
+    app.current_session_metadata = Some(active.clone());
+    app.session_title = Some(active.title.clone());
+
+    assert!(!apply_picker_session_rename_to_active_app(
+        &mut app, inactive
+    ));
+    assert_eq!(app.session_title.as_deref(), Some("Active"));
+    assert_eq!(
+        app.current_session_metadata
+            .as_ref()
+            .map(|metadata| metadata.title.as_str()),
+        Some("Active")
+    );
+}
+
+#[test]
+fn codex_tool_child_usage_does_not_inherit_public_api_pricing() {
+    let mut app = create_test_app();
+    app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+    let result = Ok(crate::tools::spec::ToolResult::success("ok").with_metadata(
+        serde_json::json!({
+            "child_model": "gpt-5.5",
+            "child_input_tokens": 10_000,
+            "child_output_tokens": 1_000,
+            "child_provider": "openai-codex",
+        }),
+    ));
+
+    handle_tool_call_complete(&mut app, "review-usage", "review", &result);
+
+    assert_eq!(app.session.subagent_cost, 0.0);
+}
+
+#[test]
 fn spilled_tool_completion_records_session_artifact_metadata() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spillover_path = tmp.path().join("call-big.txt");
@@ -8984,7 +9115,7 @@ fn spilled_tool_completion_records_session_artifact_metadata() {
 
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
-    let snapshot = build_session_snapshot(&app, &manager);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     assert_eq!(snapshot.artifacts, app.session_artifacts);
 }
 
@@ -8997,7 +9128,7 @@ fn first_snapshot_preserves_current_session_id_for_artifact_ownership() {
     app.current_session_id = Some("session-123".to_string());
     app.api_messages.push(text_message("user", "hello"));
 
-    let snapshot = build_session_snapshot(&app, &manager);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
 
     assert_eq!(snapshot.metadata.id, "session-123");
 }
@@ -9018,10 +9149,306 @@ fn existing_session_snapshot_updates_model_selection() {
     app.api_messages.push(text_message("user", "hello"));
     app.set_model_selection("deepseek-v4-flash".to_string());
 
-    let snapshot = build_session_snapshot(&app, &manager);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
 
     assert_eq!(snapshot.metadata.id, existing.metadata.id);
     assert_eq!(snapshot.metadata.model, "deepseek-v4-flash");
+}
+
+#[test]
+fn session_snapshot_and_resume_round_trip_work_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    app.api_messages.push(text_message("user", "keep my work"));
+    app.api_messages
+        .push(text_message("assistant", "continuity captured"));
+    {
+        let mut todos = app.todos.try_lock().expect("todos lock");
+        todos.add(
+            "inspect".to_string(),
+            crate::tools::todo::TodoStatus::Completed,
+        );
+        todos.add(
+            "patch".to_string(),
+            crate::tools::todo::TodoStatus::InProgress,
+        );
+    }
+    {
+        let mut plan = app.plan_state.try_lock().expect("plan lock");
+        plan.update(crate::tools::plan::UpdatePlanArgs {
+            objective: Some("Ship continuity".to_string()),
+            plan: vec![crate::tools::plan::PlanItemArg {
+                step: "verify".to_string(),
+                status: crate::tools::plan::StepStatus::InProgress,
+            }],
+            ..crate::tools::plan::UpdatePlanArgs::default()
+        });
+    }
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    let expected = snapshot.work_state.clone().expect("persisted Work state");
+    manager.save_session(&snapshot).expect("save session");
+
+    let loaded = manager
+        .load_session(&snapshot.metadata.id)
+        .expect("load session");
+    let mut restored = create_test_app();
+    let recovered = apply_loaded_session(&mut restored, &mut Config::default(), &loaded)
+        .expect("restore session");
+    assert!(!recovered);
+    assert_eq!(
+        restored.work_state_snapshot().expect("restored snapshot"),
+        Some(expected)
+    );
+}
+
+#[test]
+fn session_snapshot_preserves_last_work_state_when_lock_is_busy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    app.current_session_id = Some("work-lock-session".to_string());
+    app.todos.try_lock().expect("todos lock").add(
+        "durable".to_string(),
+        crate::tools::todo::TodoStatus::InProgress,
+    );
+    let initial = build_session_snapshot(&mut app, &manager).expect("initial snapshot");
+    let expected = initial.work_state.clone();
+    manager.save_session(&initial).expect("save initial");
+
+    let todos = app.todos.clone();
+    let _held = todos.try_lock().expect("hold todos lock");
+    let contended = build_session_snapshot(&mut app, &manager).expect("contended snapshot");
+    assert_eq!(contended.work_state, expected);
+}
+
+#[test]
+fn session_snapshot_prefers_newer_memory_over_stale_disk_when_lock_is_busy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    app.current_session_id = Some("work-cache-newer-than-disk".to_string());
+    app.todos.try_lock().expect("todos lock").add(
+        "disk state".to_string(),
+        crate::tools::todo::TodoStatus::Completed,
+    );
+    let disk_snapshot = build_session_snapshot(&mut app, &manager).expect("disk snapshot");
+    manager
+        .save_session(&disk_snapshot)
+        .expect("save disk snapshot");
+
+    app.todos.try_lock().expect("todos lock").add(
+        "newer memory state".to_string(),
+        crate::tools::todo::TodoStatus::InProgress,
+    );
+    let memory_snapshot = build_session_snapshot(&mut app, &manager).expect("memory snapshot");
+    assert_ne!(memory_snapshot.work_state, disk_snapshot.work_state);
+
+    let todos = app.todos.clone();
+    let _held = todos.try_lock().expect("hold todos lock");
+    let contended = build_session_snapshot(&mut app, &manager).expect("contended snapshot");
+
+    assert_eq!(contended.work_state, memory_snapshot.work_state);
+}
+
+#[test]
+fn automatic_session_snapshot_never_reloads_existing_json_on_ui_thread() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sessions_dir = tmp.path().join("sessions");
+    let manager =
+        crate::session_manager::SessionManager::new(sessions_dir.clone()).expect("manager");
+    let mut app = create_test_app();
+    app.current_session_id = Some("nonblocking-snapshot".to_string());
+    app.api_messages
+        .push(text_message("user", "first in-memory checkpoint"));
+    let initial = build_session_snapshot(&mut app, &manager).expect("initial snapshot");
+    manager.save_session(&initial).expect("save initial");
+    std::fs::write(
+        sessions_dir.join("nonblocking-snapshot.json"),
+        "{ intentionally malformed and never read",
+    )
+    .expect("corrupt disk fixture");
+    app.api_messages
+        .push(text_message("assistant", "newer in-memory state"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("nonblocking snapshot");
+
+    assert_eq!(snapshot.metadata.id, "nonblocking-snapshot");
+    assert_eq!(snapshot.messages.len(), 2);
+    assert_eq!(snapshot.metadata.created_at, initial.metadata.created_at);
+}
+
+#[test]
+fn renamed_title_survives_next_in_memory_automatic_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut session = saved_session_with_messages(vec![text_message("user", "original title")]);
+    session.metadata.title = "Original Title".to_string();
+    manager.save_session(&session).expect("save session");
+    let mut app = create_test_app();
+    app.current_session_id = Some(session.metadata.id.clone());
+    app.api_messages.clone_from(&session.messages);
+
+    let renamed = crate::commands::rename_session_with_manager(
+        "Renamed In Memory",
+        &session.metadata.id,
+        &manager,
+        &mut app,
+    );
+    assert!(!renamed.is_error, "{:?}", renamed.message);
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("automatic snapshot");
+
+    assert_eq!(snapshot.metadata.title, "Renamed In Memory");
+}
+
+#[test]
+fn session_snapshot_uses_last_known_work_before_first_file_flush() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    app.todos.try_lock().expect("todos lock").add(
+        "queued durable state".to_string(),
+        crate::tools::todo::TodoStatus::InProgress,
+    );
+    let initial = build_session_snapshot(&mut app, &manager).expect("initial snapshot");
+    let expected = initial.work_state.clone();
+    app.current_session_id = Some(initial.metadata.id);
+    app.api_messages
+        .push(text_message("user", "new transcript content"));
+
+    let todos = app.todos.clone();
+    let _held = todos.try_lock().expect("hold todos lock");
+    let contended = build_session_snapshot(&mut app, &manager).expect("cached snapshot");
+
+    assert_eq!(contended.work_state, expected);
+    assert_eq!(contended.messages.len(), 1);
+}
+
+#[test]
+fn first_contended_snapshot_fails_instead_of_serializing_false_empty_work() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    app.todos.try_lock().expect("todos lock").add(
+        "not empty".to_string(),
+        crate::tools::todo::TodoStatus::InProgress,
+    );
+    let todos = app.todos.clone();
+    let _held = todos.try_lock().expect("hold todos lock");
+
+    let err = build_session_snapshot(&mut app, &manager).unwrap_err();
+
+    assert!(err.contains("skipped"), "{err}");
+}
+
+#[test]
+fn legacy_session_without_work_state_clears_previous_todo_on_load() {
+    let mut app = create_test_app();
+    app.todos.try_lock().expect("todos lock").add(
+        "old session".to_string(),
+        crate::tools::todo::TodoStatus::Pending,
+    );
+    let session = saved_session_with_messages(vec![text_message("user", "legacy")]);
+    assert!(session.work_state.is_none());
+
+    apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+    assert_eq!(app.work_state_snapshot().expect("snapshot"), None);
+}
+
+#[test]
+fn contended_work_restore_leaves_current_session_wholly_unchanged() {
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    app.current_session_id = Some("current-session".to_string());
+    let mut session = saved_session_with_messages(vec![text_message("user", "replacement")]);
+    session.work_state = Some(crate::session_manager::SessionWorkState {
+        todos: crate::tools::todo::TodoListSnapshot {
+            items: vec![crate::tools::todo::TodoItem {
+                id: 1,
+                content: "replacement todo".to_string(),
+                status: crate::tools::todo::TodoStatus::Pending,
+            }],
+            completion_pct: 0,
+            in_progress_id: None,
+        },
+        plan: crate::tools::plan::PlanSnapshot::default(),
+    });
+    let plan_state = app.plan_state.clone();
+    let _held = plan_state.try_lock().expect("hold plan lock");
+
+    let err = apply_loaded_session(&mut app, &mut Config::default(), &session).unwrap_err();
+
+    assert!(err.contains("session was not restored"), "{err}");
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
+}
+
+#[test]
+fn session_picker_restore_rejects_active_turn_before_mutating() {
+    let mut app = create_test_app();
+    app.api_messages
+        .push(text_message("user", "current active conversation"));
+    app.current_session_id = Some("current-session".to_string());
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    let session = saved_session_with_messages(vec![text_message("user", "replacement")]);
+
+    let err = apply_loaded_session(&mut app, &mut Config::default(), &session).unwrap_err();
+
+    assert!(err.contains("runtime work is active"), "{err}");
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
+}
+
+#[test]
+fn session_restore_rebuilds_fresh_codex_route_limits() {
+    let _lock = crate::test_support::lock_test_env();
+    let codex_home = tempfile::tempdir().expect("Codex home");
+    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
+    std::fs::write(
+        codex_home.path().join("models_cache.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "fetched_at": chrono::Utc::now(),
+            "models": [{
+                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+                "priority": 1,
+                "context_window": 272000,
+                "supported_reasoning_levels": [{"effort": "high"}]
+            }]
+        }))
+        .expect("serialize cache"),
+    )
+    .expect("write cache");
+    let mut app = create_test_app();
+    let mut config = Config::default();
+    let mut session = saved_session_with_messages(vec![text_message("user", "resume Codex")]);
+    session.metadata.model_provider = ApiProvider::OpenaiCodex.as_str().to_string();
+    session.metadata.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
+
+    apply_loaded_session(&mut app, &mut config, &session).expect("restore session");
+
+    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(app.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
+    assert_eq!(
+        app.active_route_limits
+            .and_then(|limits| limits.context_tokens),
+        Some(272_000)
+    );
+    let engine_config = build_engine_config(&app, &config);
+    assert_eq!(
+        engine_config
+            .active_route_limits
+            .and_then(|limits| limits.context_tokens),
+        Some(272_000)
+    );
 }
 
 #[test]
@@ -9034,7 +9461,8 @@ fn apply_loaded_session_restores_concrete_model_mode() {
     ]);
     session.metadata.model = "deepseek-v4-flash".to_string();
 
-    let recovered = apply_loaded_session(&mut app, &mut Config::default(), &session);
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
     assert!(!recovered);
     assert!(!app.auto_model);
@@ -9055,7 +9483,8 @@ fn apply_loaded_session_restores_auto_model_mode() {
     ]);
     session.metadata.model = "auto".to_string();
 
-    let recovered = apply_loaded_session(&mut app, &mut Config::default(), &session);
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
     assert!(!recovered);
     assert!(app.auto_model);
@@ -9077,7 +9506,8 @@ fn apply_loaded_session_restores_saved_mode() {
     ]);
     session.metadata.mode = Some("plan".to_string());
 
-    let recovered = apply_loaded_session(&mut app, &mut Config::default(), &session);
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
     assert!(!recovered);
     assert_eq!(app.mode, crate::tui::app::AppMode::Plan);
@@ -9253,7 +9683,8 @@ fn apply_loaded_session_restores_artifact_registry() {
         storage_path: PathBuf::from("/tmp/tool_outputs/call-big.txt"),
     });
 
-    let recovered = apply_loaded_session(&mut app, &mut Config::default(), &session);
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
     assert!(!recovered);
     assert_eq!(app.session_artifacts, session.artifacts);
@@ -11776,6 +12207,7 @@ fn duplicate_mailbox_token_usage_does_not_regress_displayed_cost() {
     let mut app = create_test_app();
     let usage = crate::tools::subagent::MailboxMessage::TokenUsage {
         agent_id: "agent-x".to_string(),
+        provider: ApiProvider::Deepseek,
         model: "deepseek-v4-flash".to_string(),
         usage: crate::models::Usage {
             input_tokens: 10_000,

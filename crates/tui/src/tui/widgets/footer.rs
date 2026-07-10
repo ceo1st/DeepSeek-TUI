@@ -14,7 +14,7 @@
 //! | Glance fact | Footer field | Drill-down owner |
 //! |-------------|--------------|------------------|
 //! | state | `state_label` (+ working strip) | transcript / live work strip |
-//! | work count | `agents` | Agents sidebar, `/fleet` |
+//! | work count | `work`, `agents` | To-do/Agents sidebar, `/fleet` |
 //! | mode | `mode_label` | `/mode` picker |
 //! | permission | `permission` | Shift+Tab cycle, `/config` |
 //! | cost/rate | `cost`, `balance`, `cache` | `/tokens`, context inspector |
@@ -34,7 +34,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
-use crate::tui::app::{App, AppMode};
+use crate::tui::app::{App, AppMode, SidebarFocus};
 
 use super::Renderable;
 
@@ -74,6 +74,9 @@ pub struct FooterProps {
     pub mcp: Vec<Span<'static>>,
     /// Permission posture chip (Ask / Auto-Review / Full Access) when visible.
     pub permission: Vec<Span<'static>>,
+    /// Compact nonempty Work indicator when terminal width suppresses the
+    /// sidebar. Empty when Work is visible or explicitly hidden.
+    pub work: Vec<Span<'static>>,
     /// Cumulative model-work chip spans ("worked 3h 12m"). Sums the
     /// elapsed time of completed turns (from `App::cumulative_turn_duration`),
     /// **not** wall-clock since launch — an idle TUI shouldn't claim
@@ -286,6 +289,7 @@ impl FooterProps {
             .map(|s| s.servers.iter().filter(|server| server.connected).count());
         let mcp = footer_mcp_chip(mcp_connected, mcp_configured);
         let permission = footer_permission_chip(app);
+        let work = footer_compact_work_chip(app);
         // #448: cumulative work-time chip. Sums actual turn durations
         // (set on `TurnComplete`) rather than wall-clock uptime — a TUI
         // that's been open and idle for 4 minutes shouldn't claim
@@ -307,6 +311,7 @@ impl FooterProps {
             cache,
             mcp,
             permission,
+            work,
             worked,
             cost,
             balance,
@@ -334,10 +339,11 @@ fn mode_style(app: &App) -> (&'static str, Color) {
 }
 
 pub fn footer_permission_chip(app: &App) -> Vec<Span<'static>> {
-    if !app.mode.uses_agent_baseline() && app.mode != AppMode::Yolo {
-        return Vec::new();
-    }
-    let label = app.approval_mode.permission_chip_label();
+    let label = if app.mode == AppMode::Plan {
+        "Read Only"
+    } else {
+        app.approval_mode.permission_chip_label()
+    };
     vec![
         Span::raw("perm "),
         Span::styled(
@@ -345,6 +351,22 @@ pub fn footer_permission_chip(app: &App) -> Vec<Span<'static>> {
             Style::default().fg(app.ui_theme.text_hint),
         ),
     ]
+}
+
+fn footer_compact_work_chip(app: &App) -> Vec<Span<'static>> {
+    if app.sidebar_focus == SidebarFocus::Hidden
+        || !app
+            .last_sidebar_host_width
+            .is_some_and(|width| width < crate::tui::ui::SIDEBAR_VISIBLE_MIN_WIDTH)
+    {
+        return Vec::new();
+    }
+    crate::tui::sidebar::compact_work_indicator(app).map_or_else(Vec::new, |label| {
+        vec![Span::styled(
+            label,
+            Style::default().fg(palette::WHALE_INFO),
+        )]
+    })
 }
 
 /// Pure-render footer. Build once per frame, then `render(area, buf)`.
@@ -365,6 +387,7 @@ impl FooterWidget {
         // disappear without disturbing the steady mode·model·cost line.
         let parts: Vec<&Vec<Span<'static>>> = [
             &self.props.permission,
+            &self.props.work,
             &self.props.agents,
             &self.props.reasoning_replay,
             &self.props.cache,
@@ -649,7 +672,23 @@ impl Renderable for FooterWidget {
             }
         }
 
-        let preview_left_spans = self.left_spans(available_width);
+        // Permission posture is a safety fact. Reserve it before allowing a
+        // long toast/model label to consume the row, then let lower-priority
+        // auxiliary chips fill whatever remains.
+        let permission_width = span_width(&self.props.permission);
+        let work_width = span_width(&self.props.work);
+        let critical_inner_gap = usize::from(permission_width > 0 && work_width > 0) * 2;
+        let critical_width = permission_width + critical_inner_gap + work_width;
+        let reserved_gap = usize::from(critical_width > 0) * 2;
+        let preview_left_budget = if critical_width > 0 {
+            available_width
+                .saturating_sub(critical_width)
+                .saturating_sub(reserved_gap)
+                .max(1)
+        } else {
+            available_width
+        };
+        let preview_left_spans = self.left_spans(preview_left_budget);
         let preview_left_width = span_width(&preview_left_spans);
         let right_budget = available_width
             .saturating_sub(preview_left_width)
@@ -1230,6 +1269,147 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    #[test]
+    fn permission_chip_reports_effective_posture_for_every_visible_mode() {
+        let mut app = make_app();
+        app.approval_mode = crate::tui::approval::ApprovalMode::Bypass;
+
+        app.mode = AppMode::Agent;
+        assert_eq!(
+            super::spans_text(&super::footer_permission_chip(&app)),
+            "perm Full Access"
+        );
+        app.mode = AppMode::Operate;
+        assert_eq!(
+            super::spans_text(&super::footer_permission_chip(&app)),
+            "perm Full Access"
+        );
+        app.mode = AppMode::Plan;
+        assert_eq!(
+            super::spans_text(&super::footer_permission_chip(&app)),
+            "perm Read Only"
+        );
+    }
+
+    #[test]
+    fn width_suppressed_sidebar_falls_back_to_compact_work_chip() {
+        let mut app = make_app();
+        app.mode = AppMode::Operate;
+        app.approval_mode = crate::tui::approval::ApprovalMode::Bypass;
+        app.last_sidebar_host_width = Some(59);
+        {
+            let mut todos = app.todos.try_lock().expect("todos lock");
+            todos.add(
+                "inspect".to_string(),
+                crate::tools::todo::TodoStatus::Completed,
+            );
+            todos.add(
+                "patch".to_string(),
+                crate::tools::todo::TodoStatus::InProgress,
+            );
+        }
+
+        let props = FooterProps::from_app(
+            &app,
+            None,
+            "ready",
+            palette::TEXT_MUTED,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(super::spans_text(&props.work), "To-do 2 · 50%");
+        let line = render_at_width(props, 59);
+        assert!(line.contains("To-do 2 · 50%"), "{line:?}");
+        assert!(line.contains("perm Full Access"), "{line:?}");
+
+        app.sidebar_focus = crate::tui::app::SidebarFocus::Hidden;
+        let hidden = FooterProps::from_app(
+            &app,
+            None,
+            "ready",
+            palette::TEXT_MUTED,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(hidden.work.is_empty());
+    }
+
+    #[test]
+    fn permission_safety_chip_survives_long_toast_at_release_widths() {
+        let mut app = make_app();
+        app.mode = AppMode::Plan;
+        let props = FooterProps::from_app(
+            &app,
+            Some(super::FooterToast {
+                text:
+                    "Permissions is locked while a turn is running — press Esc to interrupt first"
+                        .to_string(),
+                color: palette::STATUS_WARNING,
+            }),
+            "working",
+            palette::WHALE_INFO,
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+            Vec::<Span<'static>>::new(),
+        );
+
+        for width in [120, 100, 80] {
+            let line = render_at_width(props.clone(), width);
+            assert!(
+                line.contains("perm Read Only"),
+                "effective safety posture missing at {width} cols: {line:?}"
+            );
+            assert!(line.width() <= usize::from(width));
+        }
+    }
+
+    #[test]
+    fn ask_auto_and_full_access_render_at_release_widths() {
+        for (posture, expected) in [
+            (crate::tui::approval::ApprovalMode::Suggest, "perm Ask"),
+            (crate::tui::approval::ApprovalMode::Auto, "perm Auto-Review"),
+            (
+                crate::tui::approval::ApprovalMode::Bypass,
+                "perm Full Access",
+            ),
+        ] {
+            let mut app = make_app();
+            app.mode = AppMode::Operate;
+            app.approval_mode = posture;
+            let props = FooterProps::from_app(
+                &app,
+                Some(super::FooterToast {
+                    text:
+                        "A long runtime status must not displace the effective permission posture"
+                            .to_string(),
+                    color: palette::STATUS_WARNING,
+                }),
+                "working",
+                palette::WHALE_INFO,
+                Vec::<Span<'static>>::new(),
+                Vec::<Span<'static>>::new(),
+                Vec::<Span<'static>>::new(),
+                Vec::<Span<'static>>::new(),
+                Vec::<Span<'static>>::new(),
+            );
+            for width in [120, 100, 80] {
+                let line = render_at_width(props.clone(), width);
+                assert!(
+                    line.contains(expected),
+                    "{expected:?} missing at {width} cols: {line:?}"
+                );
+            }
+        }
     }
 
     fn props_with_status(state: &str) -> FooterProps {

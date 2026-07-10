@@ -539,7 +539,8 @@ impl SetupRuntimePreset {
             Self::AskFirst | Self::NormalAgent => Some("on-request"),
             // YOLO derives bypass approval from `default_mode = "yolo"`.
             // `approval_policy = "bypass"` is intentionally not a persisted
-            // config value in v0.8.67.
+            // config value. Interactive Shift+Tab posture is stored separately
+            // in TUI settings and cannot override managed approval policy.
             Self::HighTrustLocal => None,
         }
     }
@@ -1708,10 +1709,10 @@ impl SetupWizardView {
     }
 
     fn operate_fleet_facts_ready(&self) -> bool {
-        self.state.first_run_ready()
-            && self.facts.provider_ready
-            && self.facts.operate_runtime_ready
-            && self.facts.fleet_roster_ready
+        // Provider, capacity, and roster facts are configuration snapshots,
+        // not proof of dispatch and terminal receipts. This release must never
+        // persist an Operate-ready claim from those facts alone.
+        false
     }
 
     fn commit_operate_fleet_review(&mut self) -> ViewAction {
@@ -5590,7 +5591,7 @@ mod tests {
     }
 
     #[test]
-    fn operate_fleet_review_records_ready_without_plan_probe() {
+    fn operate_fleet_review_records_needs_action_without_receipt_capability() {
         let facts = SetupRuntimeFacts {
             provider_ready: true,
             operate_runtime_ready: true,
@@ -5613,15 +5614,18 @@ mod tests {
         else {
             panic!("expected setup-state commit event");
         };
-        assert_eq!(state.status(SetupStep::OperateFleet), StepStatus::Verified);
-        assert!(state.operate_ready());
+        assert_eq!(
+            state.status(SetupStep::OperateFleet),
+            StepStatus::NeedsAction
+        );
+        assert!(!state.operate_ready());
         let result = state
             .steps
             .get(&SetupStep::OperateFleet)
             .and_then(|entry| entry.result.as_deref())
             .expect("operate result");
         assert!(result.contains("plan limit not probed"), "{result}");
-        assert!(message.contains("Operate/Fleet readiness recorded"));
+        assert!(message.contains("needs action"));
         assert_eq!(view.selected_step(), SetupStep::Hotbar);
     }
 

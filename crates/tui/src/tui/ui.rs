@@ -52,7 +52,7 @@ use crate::commands;
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::{
     ApiProvider, Config, ProviderConfig, ProvidersConfig, StatusItem, UpdateConfig,
-    provider_capability, save_provider_auth_mode_for_at,
+    save_provider_auth_mode_for_at,
 };
 use crate::config_ui::{self, ConfigUiMode, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
@@ -67,7 +67,7 @@ use crate::prompts;
 use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
 use crate::session_manager::{
     OfflineQueueState, QueuedSessionMessage, SavedSession, SessionManager,
-    create_saved_session_with_id_and_mode, create_saved_session_with_mode, update_session,
+    create_saved_session_with_id_and_mode, create_saved_session_with_mode,
 };
 use crate::settings::Settings;
 use crate::task_manager::{
@@ -202,7 +202,9 @@ const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(600);
 // the per-tool spinner pulse — keep this fast enough that the whale-spout
 // braille pattern reads as continuous motion instead of teleport-frames.
 const UI_STATUS_ANIMATION_MS: u64 = crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
-pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 64;
+// At an 80-column terminal the file tree owns 20 columns, leaving a 60-column
+// chat host. Keep a compact 20-column sidebar plus a 40-column transcript.
+pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 60;
 const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 const PERIODIC_FULL_REPAINT_EVERY_N: u64 = 50;
 const TURN_META_PREFIX: &str = "<turn_meta>";
@@ -915,15 +917,18 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
             };
 
         match load_result {
-            Ok(Some(saved)) => {
-                let recovered = apply_loaded_session(&mut app, config, &saved);
-                if !recovered {
+            Ok(Some(saved)) => match apply_loaded_session(&mut app, config, &saved) {
+                Ok(false) => {
                     app.status_message = Some(format!(
                         "Resumed session: {}",
                         crate::session_manager::truncate_id(&saved.metadata.id)
                     ));
                 }
-            }
+                Ok(true) => {}
+                Err(err) => {
+                    app.status_message = Some(format!("Failed to restore session: {err}"));
+                }
+            },
             Ok(None) => {
                 app.status_message = Some("No sessions found to resume".to_string());
             }
@@ -1064,10 +1069,13 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     // Spawn the persistence actor so checkpoint/session-save I/O stays off
     // the UI thread.  The actor serialises + writes to disk in a dedicated
     // task; the UI just `try_send`s a request and returns immediately.
-    if let Ok(persist_manager) = SessionManager::default_location() {
-        let handle = persistence_actor::spawn_persistence_actor(persist_manager);
-        persistence_actor::init_actor(handle);
-    }
+    let persistence_runtime = SessionManager::default_location()
+        .ok()
+        .map(|persist_manager| {
+            let (handle, task) = persistence_actor::spawn_persistence_actor(persist_manager);
+            persistence_actor::init_actor(handle.clone());
+            (handle, task)
+        });
 
     submit_initial_input_if_ready(&mut app, config, &engine_handle).await?;
 
@@ -1092,8 +1100,11 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     }
 
     // Flush the persistence actor: clear checkpoint + graceful shutdown.
-    persistence_actor::persist(PersistRequest::ClearCheckpoint);
-    persistence_actor::persist(PersistRequest::Shutdown);
+    if let Some((handle, task)) = persistence_runtime {
+        handle.try_send(PersistRequest::ClearCheckpoint);
+        handle.try_send(PersistRequest::Shutdown);
+        let _ = task.await;
+    }
 
     cleanup_guard.defused = true;
     pop_keyboard_enhancement_flags(terminal.backend_mut());
@@ -1577,9 +1588,11 @@ fn build_app_system_prompt(app: &App, config: &Config) -> SystemPrompt {
             locale_tag: app.ui_locale.tag(),
             translation_enabled: app.translation_enabled,
             model_id: &app.model,
-            context_window_override: Some(
-                provider_capability(app.api_provider, &app.model).context_window,
-            ),
+            context_window_override: Some(crate::route_budget::route_context_window_tokens(
+                app.api_provider,
+                &app.model,
+                app.active_route_limits,
+            )),
             show_thinking: app.show_thinking,
             verbosity: app.verbosity.as_deref(),
             skills_scan_codewhale_only: app.skills_scan_codewhale_only,
@@ -2828,12 +2841,17 @@ async fn run_event_loop(
                         // Auto-save completed turn and clear crash checkpoint.
                         // Offloaded to the persistence actor so the UI
                         // stays responsive.
-                        if let Ok(manager) = SessionManager::default_location() {
-                            let session = build_session_snapshot(app, &manager);
+                        let mut completed_snapshot_queued = false;
+                        if let Ok(manager) = SessionManager::default_location()
+                            && let Ok(session) = build_session_snapshot(app, &manager)
+                        {
                             app.current_session_id = Some(session.metadata.id.clone());
                             persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+                            completed_snapshot_queued = true;
                         }
-                        persistence_actor::persist(PersistRequest::ClearCheckpoint);
+                        if completed_snapshot_queued {
+                            persistence_actor::persist(PersistRequest::ClearCheckpoint);
+                        }
 
                         // Refresh DeepSeek account balance after each completed
                         // turn so the footer balance chip stays current without
@@ -2940,7 +2958,7 @@ async fn run_event_loop(
                         model,
                         workspace,
                     } => {
-                        app.current_session_id = Some(session_id);
+                        app.current_session_id = Some(session_id.clone());
                         app.api_messages = messages;
                         app.system_prompt = system_prompt;
                         if app.auto_model {
@@ -2953,25 +2971,21 @@ async fn run_event_loop(
                         if (app.is_loading || app.is_compacting || app.is_purging)
                             && let Ok(manager) = SessionManager::default_location()
                         {
-                            let session = build_session_snapshot(app, &manager);
-                            app.session_title = Some(session.metadata.title.clone());
-                            persistence_actor::persist(PersistRequest::Checkpoint(session));
+                            if let Ok(session) = build_session_snapshot(app, &manager) {
+                                app.session_title = Some(session.metadata.title.clone());
+                                persistence_actor::persist(PersistRequest::Checkpoint(session));
+                            }
                         } else if app.session_title.is_none() {
-                            // First turn on a brand-new session: persist hasn't fired yet so
-                            // read the title from the session file if it already exists,
-                            // otherwise fall back to deriving from messages.
-                            let persisted = app
-                                .current_session_id
-                                .as_deref()
-                                .and_then(|id| {
-                                    SessionManager::default_location()
-                                        .ok()?
-                                        .load_session(id)
-                                        .ok()
-                                })
-                                .map(|s| s.metadata.title);
+                            // Never synchronously reload the growing session
+                            // JSON on the event-loop task just to recover a
+                            // title. The in-memory metadata cache is authoritative.
+                            let cached = app
+                                .current_session_metadata
+                                .as_ref()
+                                .filter(|metadata| metadata.id == session_id)
+                                .map(|metadata| metadata.title.clone());
                             app.session_title =
-                                persisted.or_else(|| derive_session_title(&app.api_messages));
+                                cached.or_else(|| derive_session_title(&app.api_messages));
                         }
                     }
                     EngineEvent::CompactionStarted { message, .. } => {
@@ -5996,51 +6010,69 @@ fn deliver_fleet_draft_result(
 
 // `format_*` chip/message builders moved to `tui/format_helpers.rs`.
 
-fn build_session_snapshot(app: &App, manager: &SessionManager) -> SavedSession {
+fn build_session_snapshot(
+    app: &mut App,
+    _manager: &SessionManager,
+) -> Result<SavedSession, String> {
     let model = app.model_selection_for_persistence();
-    if let Some(ref existing_id) = app.current_session_id
-        && let Ok(existing) = manager.load_session(existing_id)
-    {
-        let mut updated = update_session(
-            existing,
+    let work_state = match app.try_work_state_snapshot() {
+        Ok(work_state) => work_state,
+        Err(err) => app.last_known_work_state.clone().ok_or_else(|| {
+            format!("automatic session snapshot skipped while Work state is busy: {err}")
+        })?,
+    };
+    let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
+        create_saved_session_with_id_and_mode(
+            existing_id.clone(),
             &app.api_messages,
+            &model,
+            &app.workspace,
             u64::from(app.session.total_tokens),
             app.system_prompt.as_ref(),
-        );
-        updated.metadata.model = model;
-        updated.metadata.model_provider = app.api_provider.as_str().to_string();
-        updated.metadata.mode = Some(app.mode.as_setting().to_string());
-        app.sync_cost_to_metadata(&mut updated.metadata);
-        updated.context_references = app.session_context_references.clone();
-        updated.artifacts = app.session_artifacts.clone();
-        updated
+            Some(app.mode.as_setting()),
+        )
     } else {
-        let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
-            create_saved_session_with_id_and_mode(
-                existing_id.clone(),
-                &app.api_messages,
-                &model,
-                &app.workspace,
-                u64::from(app.session.total_tokens),
-                app.system_prompt.as_ref(),
-                Some(app.mode.as_setting()),
-            )
-        } else {
-            create_saved_session_with_mode(
-                &app.api_messages,
-                &model,
-                &app.workspace,
-                u64::from(app.session.total_tokens),
-                app.system_prompt.as_ref(),
-                Some(app.mode.as_setting()),
-            )
-        };
-        session.metadata.model_provider = app.api_provider.as_str().to_string();
-        app.sync_cost_to_metadata(&mut session.metadata);
-        session.context_references = app.session_context_references.clone();
-        session.artifacts = app.session_artifacts.clone();
+        create_saved_session_with_mode(
+            &app.api_messages,
+            &model,
+            &app.workspace,
+            u64::from(app.session.total_tokens),
+            app.system_prompt.as_ref(),
+            Some(app.mode.as_setting()),
+        )
+    };
+    if let Some(cached) = app
+        .current_session_metadata
+        .as_ref()
+        .filter(|cached| cached.id == session.metadata.id)
+    {
+        session.metadata.created_at = cached.created_at;
+        session.metadata.title.clone_from(&cached.title);
         session
+            .metadata
+            .parent_session_id
+            .clone_from(&cached.parent_session_id);
+        session.metadata.forked_from_message_count = cached.forked_from_message_count;
     }
+    session.metadata.model_provider = app.api_provider.as_str().to_string();
+    app.sync_cost_to_metadata(&mut session.metadata);
+    session.context_references = app.session_context_references.clone();
+    session.artifacts = app.session_artifacts.clone();
+    session.work_state = work_state;
+    app.current_session_metadata = Some(session.metadata.clone());
+    Ok(session)
+}
+
+fn apply_picker_session_rename_to_active_app(
+    app: &mut App,
+    metadata: crate::session_manager::SessionMetadata,
+) -> bool {
+    if app.current_session_id.as_deref() != Some(metadata.id.as_str()) {
+        return false;
+    }
+    app.session_title = Some(metadata.title.clone());
+    app.current_session_metadata = Some(metadata);
+    true
 }
 
 fn queued_ui_to_session(msg: &QueuedMessage) -> QueuedSessionMessage {
@@ -6163,13 +6195,27 @@ fn turn_stall_watchdog_timeout(app: &App) -> Duration {
 /// written to disk, so `--continue` loads the *previous* save — effectively
 /// losing the entire in-progress turn.
 fn persist_recovery_snapshot(app: &mut App) {
-    if let Ok(manager) = SessionManager::default_location() {
-        let session = build_session_snapshot(app, &manager);
+    if let Ok(manager) = SessionManager::default_location()
+        && let Ok(session) = build_session_snapshot(app, &manager)
+    {
         if app.current_session_id.is_none() {
             app.current_session_id = Some(session.metadata.id.clone());
         }
         persistence_actor::persist(PersistRequest::SessionSnapshot(session));
     }
+}
+
+fn persist_full_reset_snapshot(app: &mut App) {
+    if let Ok(manager) = SessionManager::default_location()
+        && let Ok(session) = build_session_snapshot(app, &manager)
+    {
+        app.current_session_id = Some(session.metadata.id.clone());
+        persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+    }
+    // `/clear` and `/new` are explicit boundaries. Never let an older
+    // in-flight checkpoint resurrect the session the user just discarded,
+    // even if the replacement snapshot could not be constructed.
+    persistence_actor::persist(PersistRequest::ClearCheckpoint);
 }
 
 fn maybe_throttled_recovery_snapshot(
@@ -6687,7 +6733,13 @@ async fn tool_result_content_for_api_message(
     }
 
     if matches!(name, "run_tests" | "run_verifiers" | "task_gate_run") {
-        return crate::core::engine::compact_tool_result_for_context(&app.model, name, output);
+        return crate::core::engine::compact_tool_result_for_route(
+            app.api_provider,
+            &app.model,
+            app.active_route_limits,
+            name,
+            output,
+        );
     }
 
     if raw.chars().count() > crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
@@ -6707,7 +6759,13 @@ async fn tool_result_content_for_api_message(
         }
     }
 
-    crate::core::engine::compact_tool_result_for_context(&app.model, name, output)
+    crate::core::engine::compact_tool_result_for_route(
+        app.api_provider,
+        &app.model,
+        app.active_route_limits,
+        name,
+        output,
+    )
 }
 
 fn live_tool_receipt_messages(app: &App, id: &str, raw: &str, success: bool) -> Vec<Message> {
@@ -7204,8 +7262,9 @@ async fn dispatch_user_message(
     app.session.last_reasoning_replay_tokens = None;
     // Persist immediately so abrupt termination can recover this in-flight turn.
     // Offloaded to the persistence actor.
-    if let Ok(manager) = SessionManager::default_location() {
-        let session = build_session_snapshot(app, &manager);
+    if let Ok(manager) = SessionManager::default_location()
+        && let Ok(session) = build_session_snapshot(app, &manager)
+    {
         persistence_actor::persist(PersistRequest::Checkpoint(session));
     }
 
@@ -7269,6 +7328,8 @@ async fn dispatch_user_message(
             mode: app.mode,
             provider: Some(effective_provider),
             model: effective_model,
+            route_limits: app.active_route_limits,
+            compaction: Box::new(app.compaction_config()),
             goal_objective: app.hunt.quarry.clone(),
             goal_token_budget: app.hunt.token_budget,
             goal_status: app.hunt.verdict.goal_status(),
@@ -8137,6 +8198,38 @@ async fn apply_command_result(
                     app.current_session_id = Some(new_session_id.clone());
                     session_id = Some(new_session_id);
                 }
+                let workspace_changed = task_manager.default_workspace().await != workspace;
+                if workspace_changed {
+                    apply_workspace_runtime_state(app, config, workspace.clone());
+                    sync_runtime_workspace_state(task_manager, workspace.clone()).await;
+                }
+                let provider_changed = config.api_provider() != app.api_provider;
+                if provider_changed {
+                    let provider_name = app.api_provider.as_str().to_string();
+                    restore_loaded_session_provider(app, config, &provider_name);
+                    config.provider_config_for_mut(app.api_provider).model = Some(model.clone());
+                }
+                // Re-resolve from the live config even when the provider did
+                // not change. The command layer intentionally has no Config
+                // handle, so its provisional limits cannot include current
+                // provider overrides.
+                resolve_loaded_session_route(app, config);
+                app.update_model_compaction_budget();
+                if provider_changed || workspace_changed {
+                    let _ = engine_handle.send(Op::Shutdown).await;
+                    *engine_handle = spawn_engine(build_engine_config(app, config), config);
+                }
+                // SyncSession carries the conversation but not resolved route
+                // limits. Refresh the engine's model first so a loaded,
+                // forked, or freshly reset session cannot retain the previous
+                // route's context/output facts.
+                let _ = engine_handle
+                    .send(Op::SetModel {
+                        model: model.clone(),
+                        mode,
+                        route_limits: app.active_route_limits,
+                    })
+                    .await;
                 let _ = engine_handle
                     .send(Op::SyncSession {
                         session_id,
@@ -8154,12 +8247,7 @@ async fn apply_command_result(
                     })
                     .await;
                 if is_full_reset {
-                    if let Ok(manager) = SessionManager::default_location() {
-                        let session = build_session_snapshot(app, &manager);
-                        app.current_session_id = Some(session.metadata.id.clone());
-                        persistence_actor::persist(PersistRequest::SessionSnapshot(session));
-                    }
-                    persistence_actor::persist(PersistRequest::ClearCheckpoint);
+                    persist_full_reset_snapshot(app);
                 }
             }
             AppAction::ModeChanged(_mode) => {
@@ -9626,10 +9714,14 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
 
     // Render header
     {
-        let sanitized_context_window = context_usage
-            .as_ref()
-            .map(|(_, max, _)| *max)
-            .or_else(|| crate::models::context_window_for_model(&app.model));
+        let sanitized_context_window =
+            context_usage.as_ref().map(|(_, max, _)| *max).or_else(|| {
+                Some(crate::route_budget::route_context_window_tokens(
+                    app.api_provider,
+                    app.effective_model_for_budget(),
+                    app.active_route_limits,
+                ))
+            });
         let sanitized_prompt_tokens = context_usage
             .as_ref()
             .and_then(|(used, _, _)| u32::try_from(*used).ok());
@@ -10415,8 +10507,31 @@ async fn handle_view_events(
 
                 match manager.load_session(&session_id) {
                     Ok(session) => {
-                        let recovered = apply_loaded_session(app, config, &session);
+                        let previous_provider = app.api_provider;
+                        let previous_workspace = app.workspace.clone();
+                        let recovered = match apply_loaded_session(app, config, &session) {
+                            Ok(recovered) => recovered,
+                            Err(err) => {
+                                app.status_message =
+                                    Some(format!("Failed to restore session: {err}"));
+                                continue;
+                            }
+                        };
                         sync_runtime_workspace_state(task_manager, app.workspace.clone()).await;
+                        if app.api_provider != previous_provider
+                            || app.workspace != previous_workspace
+                        {
+                            let _ = engine_handle.send(Op::Shutdown).await;
+                            *engine_handle = spawn_engine(build_engine_config(app, config), config);
+                        } else {
+                            let _ = engine_handle
+                                .send(Op::SetModel {
+                                    model: app.model.clone(),
+                                    mode: app.mode,
+                                    route_limits: app.active_route_limits,
+                                })
+                                .await;
+                        }
                         let _ = engine_handle
                             .send(Op::SyncSession {
                                 session_id: app.current_session_id.clone(),
@@ -10447,6 +10562,31 @@ async fn handle_view_events(
                         ));
                     }
                 }
+            }
+            ViewEvent::SessionRenamed { metadata } => {
+                let session_id = metadata.id.clone();
+                let title = metadata.title.clone();
+                if apply_picker_session_rename_to_active_app(app, metadata)
+                    && let Ok(manager) = SessionManager::default_location()
+                {
+                    match build_session_snapshot(app, &manager) {
+                        Ok(session) => {
+                            persistence_actor::persist(PersistRequest::SessionSnapshot(session))
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                error = %err,
+                                "Could not queue active session rename snapshot"
+                            );
+                        }
+                    }
+                }
+                app.status_message = Some(format!(
+                    "Renamed session {} to \"{}\"",
+                    crate::session_manager::truncate_id(&session_id),
+                    title
+                ));
             }
             ViewEvent::SessionDeleted { session_id, title } => {
                 app.status_message = Some(format!(
@@ -11786,7 +11926,20 @@ fn set_provider_auth_mode_in_memory(config: &mut Config, provider: ApiProvider, 
     entry.auth_mode = Some(auth_mode);
 }
 
-fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSession) -> bool {
+fn apply_loaded_session(
+    app: &mut App,
+    config: &mut Config,
+    session: &SavedSession,
+) -> Result<bool, String> {
+    if app.session_transition_blocked() {
+        return Err(
+            "runtime work is active; wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work before switching sessions".to_string(),
+        );
+    }
+    // Restore/validate the contended state before mutating conversation or
+    // workspace fields. A failed session switch must leave the current session
+    // wholly intact.
+    app.restore_work_state(session.work_state.as_ref())?;
     let (messages, recovered_draft) = recover_interrupted_user_tail(&session.messages);
     app.api_messages = messages;
     app.clear_history();
@@ -11801,7 +11954,6 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
     app.ignored_tool_calls.clear();
     app.pending_tool_uses.clear();
     app.last_exec_wait_command = None;
-
     let messages = app.api_messages.clone();
     let mut message_to_cell = std::collections::HashMap::new();
     for (message_index, msg) in messages.iter().enumerate() {
@@ -11833,6 +11985,7 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
     app.viewport.transcript_selection.clear();
     restore_loaded_session_provider(app, config, &session.metadata.model_provider);
     app.set_model_selection(session.metadata.model.clone());
+    resolve_loaded_session_route(app, config);
     app.provider_models.insert(
         app.api_provider.as_str().to_string(),
         app.model_selection_for_persistence(),
@@ -11880,6 +12033,7 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
     app.cumulative_turn_duration =
         std::time::Duration::from_secs(session.metadata.cumulative_turn_secs);
     app.current_session_id = Some(session.metadata.id.clone());
+    app.current_session_metadata = Some(session.metadata.clone());
     app.session_artifacts = session.artifacts.clone();
     app.session_title = Some(session.metadata.title.clone());
     app.workspace_context = None;
@@ -11896,7 +12050,7 @@ fn apply_loaded_session(app: &mut App, config: &mut Config, session: &SavedSessi
         false
     };
     app.scroll_to_bottom();
-    recovered
+    Ok(recovered)
 }
 
 fn restore_loaded_session_provider(app: &mut App, config: &mut Config, model_provider: &str) {
@@ -11918,6 +12072,29 @@ fn restore_loaded_session_provider(app: &mut App, config: &mut Config, model_pro
     app.reasoning_effort = app.reasoning_effort.normalize_for_provider(provider);
     app.set_active_context_window_override(config.context_window_for_provider_config(provider));
     app.active_route_limits = app.context_window_override_limits();
+}
+
+fn resolve_loaded_session_route(app: &mut App, config: &Config) {
+    let context_override = config.context_window_for_provider_config(app.api_provider);
+    app.set_active_context_window_override(context_override);
+    if app.auto_model {
+        app.active_route_limits = app.context_window_override_limits();
+        return;
+    }
+
+    let saved_provider_model = config
+        .provider_config_for(app.api_provider)
+        .and_then(|provider| provider.model.as_deref());
+    app.active_route_limits = resolve_route_candidate(
+        app.api_provider,
+        Some(&app.model),
+        saved_provider_model,
+        Some(config.deepseek_base_url()),
+        context_override,
+    )
+    .ok()
+    .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits))
+    .or_else(|| app.context_window_override_limits());
 }
 
 /// Derive a short display title from the API message list.

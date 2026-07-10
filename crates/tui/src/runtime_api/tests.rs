@@ -67,6 +67,7 @@ fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedS
         system_prompt: None,
         context_references: Vec::new(),
         artifacts: Vec::new(),
+        work_state: None,
     }
 }
 
@@ -198,6 +199,8 @@ fn messages_from_thread_detail_batches_tool_results() {
         ended_at: Some(now),
         duration_ms: Some(0),
         usage: None,
+        effective_provider: None,
+        effective_model: None,
         error: None,
         item_ids: vec![
             "item_user".to_string(),

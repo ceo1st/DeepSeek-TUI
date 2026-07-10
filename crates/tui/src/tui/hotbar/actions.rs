@@ -2200,8 +2200,10 @@ mod tests {
             "---\nname: hotbar-demo-skill\ndescription: Demo skill for hotbar tests\n---\n\nFollow the demo instructions.\n",
         )
         .expect("write SKILL.md");
-        let mut config = Config::default();
-        config.skills_dir = Some(skills_dir.path().to_string_lossy().into_owned());
+        let config = Config {
+            skills_dir: Some(skills_dir.path().to_string_lossy().into_owned()),
+            ..Config::default()
+        };
         let mut app = test_app_with_paths_and_config(
             workspace.path().to_path_buf(),
             skills_dir.path().to_path_buf(),

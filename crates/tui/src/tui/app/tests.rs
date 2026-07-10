@@ -396,6 +396,62 @@ fn app_new_normalizes_saved_codex_reasoning_effort() {
 }
 
 #[test]
+fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
+    let _lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let codex_home = tmp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("Codex home");
+    std::fs::write(
+        codex_home.join("models_cache.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "fetched_at": chrono::Utc::now(),
+            "models": [{
+                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+                "priority": 1,
+                "context_window": 128000,
+                "supported_reasoning_levels": [{"effort": "high"}]
+            }]
+        }))
+        .expect("serialize cache"),
+    )
+    .expect("write cache");
+    let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+    let _token = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-startup-token");
+    let config = Config {
+        provider: Some("openai-codex".to_string()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+
+    let mut options = test_options(false);
+    options.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
+    let app = App::new(options, &config);
+
+    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(
+        app.active_route_limits
+            .and_then(|limits| limits.context_tokens),
+        Some(128_000)
+    );
+    assert_eq!(
+        crate::route_budget::route_context_window_tokens(
+            app.api_provider,
+            &app.model,
+            app.active_route_limits,
+        ),
+        128_000
+    );
+}
+
+#[test]
 fn settings_default_provider_auth_check_uses_provider_scoped_key() {
     let _lock = lock_test_env();
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -568,6 +624,7 @@ fn cny_display_keeps_cny_when_costs_have_cny_rates() {
 fn cny_cache_savings_falls_back_to_usd_for_usd_only_models() {
     let mut app = App::new(test_options(false), &Config::default());
     app.cost_currency = CostCurrency::Cny;
+    app.api_provider = ApiProvider::Moonshot;
     app.model = "kimi-k2.6".to_string();
     app.session.last_prompt_cache_hit_tokens = Some(1_000_000);
 
@@ -1493,6 +1550,63 @@ fn clear_todos_resets_plan_state() {
 }
 
 #[test]
+fn work_state_snapshot_round_trips_todos_and_plan() {
+    let app = App::new(test_options(false), &Config::default());
+    {
+        let mut todos = app.todos.try_lock().expect("todos lock");
+        todos.add("inspect".to_string(), TodoStatus::Completed);
+        todos.add("patch".to_string(), TodoStatus::InProgress);
+    }
+    {
+        let mut plan = app.plan_state.try_lock().expect("plan lock");
+        plan.update(UpdatePlanArgs {
+            objective: Some("Keep Work durable".to_string()),
+            plan: vec![PlanItemArg {
+                step: "verify".to_string(),
+                status: StepStatus::InProgress,
+            }],
+            ..UpdatePlanArgs::default()
+        });
+    }
+    let state = app
+        .work_state_snapshot()
+        .expect("snapshot locks")
+        .expect("non-empty state");
+
+    let mut restored = App::new(test_options(false), &Config::default());
+    restored
+        .restore_work_state(Some(&state))
+        .expect("restore Work state");
+    assert_eq!(
+        restored.work_state_snapshot().expect("snapshot"),
+        Some(state)
+    );
+}
+
+#[test]
+fn clear_todos_is_atomic_and_invalidates_cached_work_summary() {
+    let mut app = App::new(test_options(false), &Config::default());
+    {
+        let mut todos = app.todos.try_lock().expect("todos lock");
+        todos.add("clear me".to_string(), TodoStatus::Pending);
+    }
+    app.cached_work_summary = Some(SidebarWorkSummary::default());
+
+    assert!(app.clear_todos());
+    assert!(app.cached_work_summary.is_none());
+    assert_eq!(app.work_state_snapshot().expect("snapshot"), None);
+}
+
+#[test]
+fn entering_operate_preserves_user_sidebar_focus() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.sidebar_focus = SidebarFocus::Tasks;
+
+    assert!(app.set_mode(AppMode::Operate));
+    assert_eq!(app.sidebar_focus, SidebarFocus::Tasks);
+}
+
+#[test]
 fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::parse("agent"), Some(AppMode::Agent));
     assert_eq!(AppMode::parse("act"), Some(AppMode::Agent));
@@ -1799,8 +1913,13 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
 
 #[test]
 fn cycle_approval_posture_cycles_suggest_auto_bypass() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let mut options = test_options(false);
     options.start_in_agent_mode = true;
+    options.config_path = Some(config_path);
     let mut app = App::new(options, &Config::default());
     app.approval_mode = ApprovalMode::Suggest;
 
@@ -1812,12 +1931,19 @@ fn cycle_approval_posture_cycles_suggest_auto_bypass() {
 
     assert!(app.cycle_approval_posture());
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    let persisted = std::fs::read_to_string(tmp.path().join("settings.toml")).expect("settings");
+    assert!(persisted.contains("permission_posture = \"ask\""));
 }
 
 #[test]
 fn cycle_approval_posture_emits_rebinding_notice_once() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
     let mut options = test_options(false);
     options.start_in_agent_mode = true;
+    options.config_path = Some(config_path);
     let mut app = App::new(options, &Config::default());
 
     assert!(app.cycle_approval_posture());
@@ -1835,6 +1961,118 @@ fn cycle_approval_posture_emits_rebinding_notice_once() {
         .filter(|toast| toast.text.contains("moved to Ctrl+T"))
         .count();
     assert_eq!(notices, 1, "notice is one-shot per session");
+}
+
+#[test]
+fn plan_permission_cycle_is_rejected_without_mutating_agent_baseline() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(false);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &Config::default());
+    app.set_agent_approval_posture(ApprovalMode::Auto);
+    app.set_mode(AppMode::Plan);
+
+    assert!(!app.cycle_approval_posture());
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert_eq!(app.mode_prefs.agent_approval_mode, ApprovalMode::Auto);
+    assert!(!tmp.path().join("settings.toml").exists());
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("Read Only"))
+    );
+
+    app.set_mode(AppMode::Operate);
+    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+}
+
+#[test]
+fn busy_permission_cycle_changes_neither_runtime_nor_persistence() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let mut options = test_options(false);
+    options.config_path = Some(config_path);
+    let mut app = App::new(options, &Config::default());
+    let before = app.approval_mode;
+    app.is_loading = true;
+
+    assert!(!app.cycle_approval_posture());
+    assert_eq!(app.approval_mode, before);
+    assert_eq!(app.mode_prefs.agent_approval_mode, before);
+    assert!(!tmp.path().join("settings.toml").exists());
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("locked"))
+    );
+}
+
+#[test]
+fn permission_postures_persist_across_restart() {
+    let _env_lock = lock_test_env();
+    for (cycles, expected) in [
+        (1, ApprovalMode::Auto),
+        (2, ApprovalMode::Bypass),
+        (3, ApprovalMode::Suggest),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &path);
+        let mut options = test_options(false);
+        options.start_in_agent_mode = true;
+        options.config_path = Some(path.clone());
+        let mut app = App::new(options.clone(), &Config::default());
+        for _ in 0..cycles {
+            assert!(app.cycle_approval_posture());
+        }
+        assert_eq!(app.approval_mode, expected);
+
+        let restarted = App::new(options, &Config::default());
+        assert_eq!(restarted.approval_mode, expected);
+        assert_eq!(restarted.mode_prefs.agent_approval_mode, expected);
+        drop(config_env);
+    }
+}
+
+#[test]
+fn managed_requirements_ignore_saved_full_access_and_lock_changes() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let requirements_path = tmp.path().join("requirements.toml");
+    std::fs::write(
+        tmp.path().join("settings.toml"),
+        "permission_posture = \"full-access\"\n",
+    )
+    .expect("settings");
+    std::fs::write(
+        &requirements_path,
+        "allowed_approval_policies = [\"on-request\"]\n",
+    )
+    .expect("requirements");
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let config = Config {
+        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
+        ..Config::default()
+    };
+
+    let mut app = App::new(test_options(false), &config);
+
+    assert!(app.approval_policy_locked());
+    assert!(app.approval_policy_requirements_managed());
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert!(!app.cycle_approval_posture());
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("controlled"))
+    );
 }
 
 #[test]
@@ -1910,6 +2148,8 @@ fn set_mode_captures_agent_edits_as_the_durable_baseline() {
     options.start_in_agent_mode = true;
     let mut app = App::new(options, &Config::default());
     assert_eq!(app.mode, AppMode::Agent);
+    app.allow_shell = false;
+    app.set_agent_approval_posture(ApprovalMode::Suggest);
 
     // Initial baseline restores to no-shell / Suggest.
     app.set_mode(AppMode::Plan);
@@ -2153,6 +2393,7 @@ fn test_update_model_compaction_budget() {
     // depend on the developer's local `auto_compact_threshold_percent`
     // setting (App::new loads real settings) or on auto-model resolution.
     app.auto_model = false;
+    app.api_provider = ApiProvider::Deepseek;
     app.active_route_limits = None;
     app.active_context_window_override = None;
     app.auto_compact_threshold_percent = 80.0;

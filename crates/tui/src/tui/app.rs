@@ -27,13 +27,13 @@ use crate::models::{Message, SystemPrompt, Tool};
 use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::resource_telemetry::TokenThroughput;
-use crate::session_manager::SessionContextReference;
+use crate::session_manager::{SessionContextReference, SessionMetadata, SessionWorkState};
 use crate::settings::Settings;
-use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
+use crate::tools::plan::{PlanState, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::new_shared_shell_manager;
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::subagent::SubAgentResult;
-use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
+use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
@@ -1061,12 +1061,6 @@ impl AppMode {
         }
     }
 
-    /// Whether entering this mode should emphasize the Agents sidebar panel.
-    #[must_use]
-    pub fn prefers_agents_sidebar(self) -> bool {
-        matches!(self, Self::Operate)
-    }
-
     /// Localized short name for the mode picker (user-facing surface only).
     #[must_use]
     pub fn display_name_localized(self, locale: Locale) -> Cow<'static, str> {
@@ -1940,6 +1934,12 @@ pub struct App {
     /// restore to (#3386). Refreshed from the live fields whenever the user
     /// leaves Agent mode; see [`base_policy_for_mode`] and `set_mode`.
     mode_prefs: ModeSessionPrefs,
+    /// True when config/requirements supplied an approval policy. In that
+    /// case the TUI-only Shift+Tab preference must not loosen it.
+    approval_policy_locked: bool,
+    /// True only when an organization requirements file owns approval policy.
+    /// Unlike a user-owned config key, this source cannot be edited in-app.
+    approval_policy_requirements_managed: bool,
     // Clipboard handler
     pub clipboard: ClipboardHandler,
     // Tool approval session allowlist
@@ -1961,6 +1961,13 @@ pub struct App {
     pub backtrack: crate::tui::backtrack::BacktrackState,
     /// Current session ID for auto-save updates
     pub current_session_id: Option<String>,
+    /// Last non-contended Work snapshot captured in this App. The outer
+    /// option distinguishes "never captured" from a captured empty state.
+    pub(crate) last_known_work_state: Option<Option<SessionWorkState>>,
+    /// Metadata for the active session, cached in memory so automatic
+    /// checkpoints never synchronously reload and parse a growing JSON file on
+    /// the UI thread.
+    pub(crate) current_session_metadata: Option<SessionMetadata>,
     /// Metadata-only registry of large tool outputs produced in this session.
     pub session_artifacts: Vec<ArtifactRecord>,
     /// Trust mode - allow access outside workspace
@@ -2666,10 +2673,22 @@ impl App {
         // documented, while an explicit `allow_shell = false` still hides it.
         // Trust is never part of the Agent baseline (it is YOLO-only authority).
         // Approval mirrors the configured policy.
-        let configured_approval_mode = config
+        let explicit_approval_mode = config
             .approval_policy
             .as_deref()
-            .and_then(ApprovalMode::from_config_value)
+            .and_then(ApprovalMode::from_config_value);
+        let approval_policy_locked = config.approval_policy_is_managed();
+        let approval_policy_requirements_managed = config.approval_policy_is_requirements_managed();
+        let saved_permission_posture = if approval_policy_locked {
+            None
+        } else {
+            settings
+                .permission_posture
+                .as_deref()
+                .and_then(ApprovalMode::from_config_value)
+        };
+        let configured_approval_mode = explicit_approval_mode
+            .or(saved_permission_posture)
             .unwrap_or_default();
         let mode_prefs = ModeSessionPrefs {
             agent_allow_shell: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
@@ -2888,22 +2907,22 @@ impl App {
             yolo_compat_notified: false,
             keybinding_migration_notified: false,
             mode_prefs,
+            approval_policy_locked,
+            approval_policy_requirements_managed,
             clipboard: ClipboardHandler::new(),
             approval_session_approved: HashSet::new(),
             approval_session_denied: HashSet::new(),
             approval_mode: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
                 ApprovalMode::Bypass
             } else {
-                config
-                    .approval_policy
-                    .as_deref()
-                    .and_then(ApprovalMode::from_config_value)
-                    .unwrap_or_default()
+                configured_approval_mode
             },
             view_stack: ViewStack::new(),
             pending_user_input_prompt: None,
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
+            last_known_work_state: None,
+            current_session_metadata: None,
             session_artifacts: Vec::new(),
             trust_mode: yolo_compat || initial_mode == AppMode::Yolo,
             translation_enabled: false,
@@ -3197,10 +3216,6 @@ impl App {
             self.plan_tool_used_in_turn = false;
         }
 
-        if mode.prefers_agents_sidebar() {
-            self.set_sidebar_focus(SidebarFocus::Agents);
-        }
-
         // Execute mode change hooks
         let context = HookContext::new()
             .with_mode(mode.label())
@@ -3307,7 +3322,56 @@ impl App {
         if self.reject_setting_change_while_busy("Permissions") {
             return false;
         }
+        if self.mode == AppMode::Plan {
+            self.push_status_toast(
+                "Plan is Read Only; switch to Act or Operate to change permissions".to_string(),
+                StatusToastLevel::Info,
+                Some(5_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+        if self.approval_policy_locked() {
+            self.push_status_toast(
+                "Permissions are controlled by config or managed requirements".to_string(),
+                StatusToastLevel::Warning,
+                Some(6_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
         let next = self.mode_prefs.agent_approval_mode.cycle_permission_next();
+        let persisted = match next {
+            ApprovalMode::Suggest => "ask",
+            ApprovalMode::Auto => "auto-review",
+            ApprovalMode::Bypass => "full-access",
+            ApprovalMode::Never => "never",
+        };
+        let persistence_result = (|| -> anyhow::Result<()> {
+            let mut settings = Settings::load()?;
+            settings.permission_posture = Some(persisted.to_string());
+            settings.save()
+        })();
+        if let Err(err) = persistence_result {
+            self.push_status_toast(
+                format!("Permissions were not changed: could not save TUI posture ({err})"),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+            self.needs_redraw = true;
+            return false;
+        }
+        self.set_agent_approval_posture(next);
+        self.needs_redraw = true;
+        // Footer permission chip is canonical — no status toast for the new
+        // value, only the one-shot rebinding notice.
+        self.notify_keybinding_migration_once();
+        true
+    }
+
+    /// Update the durable Act/Operate baseline and project it onto the live
+    /// runtime when the current mode uses that baseline. Plan remains read-only.
+    pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
         self.mode_prefs.agent_approval_mode = next;
         if self.mode.uses_agent_baseline() {
             let policy = base_policy_for_mode(self.mode, &self.mode_prefs);
@@ -3316,11 +3380,35 @@ impl App {
             self.approval_mode = policy.approval_mode;
             self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
         }
-        self.needs_redraw = true;
-        // Footer permission chip is canonical — no status toast for the new
-        // value, only the one-shot rebinding notice.
-        self.notify_keybinding_migration_once();
-        true
+    }
+
+    #[must_use]
+    pub fn approval_policy_locked(&self) -> bool {
+        self.approval_policy_locked
+    }
+
+    #[must_use]
+    pub fn approval_policy_requirements_managed(&self) -> bool {
+        self.approval_policy_requirements_managed
+    }
+
+    /// Session transitions must never detach live runtime producers. Late
+    /// engine, compaction, purge, or background-task events could otherwise
+    /// contaminate the replacement session after clear/load/new.
+    #[must_use]
+    pub fn session_transition_blocked(&self) -> bool {
+        self.is_loading
+            || self.runtime_turn_status.as_deref() == Some("in_progress")
+            || self.is_compacting
+            || self.is_purging
+            || self
+                .task_panel
+                .iter()
+                .any(|task| matches!(task.status.as_str(), "queued" | "running"))
+    }
+
+    pub fn mark_approval_policy_locked(&mut self) {
+        self.approval_policy_locked = true;
     }
 
     /// Execute hooks for a specific event with the given context
@@ -6010,21 +6098,87 @@ impl App {
         None
     }
 
-    pub fn clear_todos(&mut self) -> bool {
-        // Clear the todo list (the sidebar checklist). Retry with try_lock
-        // so /clear always resets todos even when the engine briefly holds
-        // the mutex during tool execution.
-        let todos_cleared = if let Some(mut todos) = Self::retry_lock(&self.todos, 100) {
-            todos.clear();
-            true
-        } else {
-            false
+    /// Capture the durable Work state without ever converting lock contention
+    /// into an empty snapshot.
+    pub fn work_state_snapshot(&self) -> Result<Option<SessionWorkState>, String> {
+        let todos = Self::retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; try saving again".to_string())?;
+        let plan = Self::retry_lock(&self.plan_state, 100)
+            .ok_or_else(|| "Plan state is busy; try saving again".to_string())?;
+        let state = SessionWorkState {
+            todos: todos.snapshot(),
+            plan: plan.snapshot(),
         };
-        // Also clear the plan state — /clear means a full reset.
-        if let Some(mut plan) = Self::retry_lock(&self.plan_state, 100) {
-            *plan = crate::tools::plan::PlanState::default();
-        }
-        todos_cleared
+        Ok((!state.is_empty()).then_some(state))
+    }
+
+    /// Non-blocking snapshot for the render/event loop. Automatic persistence
+    /// must skip a contended first save instead of pausing the UI or writing a
+    /// false empty state.
+    pub fn try_work_state_snapshot(&mut self) -> Result<Option<SessionWorkState>, String> {
+        let todos = self
+            .todos
+            .try_lock()
+            .map_err(|_| "To-do state is busy".to_string())?;
+        let plan = self
+            .plan_state
+            .try_lock()
+            .map_err(|_| "Plan state is busy".to_string())?;
+        let state = SessionWorkState {
+            todos: todos.snapshot(),
+            plan: plan.snapshot(),
+        };
+        let state = (!state.is_empty()).then_some(state);
+        drop(plan);
+        drop(todos);
+        self.last_known_work_state = Some(state.clone());
+        Ok(state)
+    }
+
+    /// Atomically replace the live Work state from a saved session.
+    pub fn restore_work_state(&mut self, state: Option<&SessionWorkState>) -> Result<(), String> {
+        let (restored_todos, restored_plan) = match state {
+            Some(state) => (
+                TodoList::from_snapshot(&state.todos)?,
+                PlanState::from_snapshot(&state.plan),
+            ),
+            None => (TodoList::new(), PlanState::default()),
+        };
+        let normalized_state = SessionWorkState {
+            todos: restored_todos.snapshot(),
+            plan: restored_plan.snapshot(),
+        };
+
+        let mut todos = Self::retry_lock(&self.todos, 100)
+            .ok_or_else(|| "To-do state is busy; session was not restored".to_string())?;
+        let mut plan = Self::retry_lock(&self.plan_state, 100)
+            .ok_or_else(|| "Plan state is busy; session was not restored".to_string())?;
+        *todos = restored_todos;
+        *plan = restored_plan;
+        drop(plan);
+        drop(todos);
+        self.cached_work_summary = None;
+        self.last_known_work_state =
+            Some((!normalized_state.is_empty()).then_some(normalized_state));
+        Ok(())
+    }
+
+    pub fn clear_todos(&mut self) -> bool {
+        // Acquire both stores before mutating either one. `/clear` must never
+        // report success after clearing only half of the Work surface.
+        let Some(mut todos) = Self::retry_lock(&self.todos, 100) else {
+            return false;
+        };
+        let Some(mut plan) = Self::retry_lock(&self.plan_state, 100) else {
+            return false;
+        };
+        todos.clear();
+        *plan = PlanState::default();
+        drop(plan);
+        drop(todos);
+        self.cached_work_summary = None;
+        self.last_known_work_state = Some(None);
+        true
     }
 
     pub fn update_model_compaction_budget(&mut self) {
@@ -6138,6 +6292,11 @@ impl App {
             enabled: self.auto_compact,
             token_threshold: self.compact_threshold,
             model: self.effective_model_for_budget().to_string(),
+            effective_context_window: Some(crate::route_budget::route_context_window_tokens(
+                self.api_provider,
+                self.effective_model_for_budget(),
+                self.active_route_limits,
+            )),
             ..Default::default()
         }
     }

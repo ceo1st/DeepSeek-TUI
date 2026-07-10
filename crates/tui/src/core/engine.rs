@@ -56,6 +56,7 @@ use crate::tools::subagent::{
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
+use crate::tools::workflow_trigger::{WorkflowTriggerSignals, evaluate_operate_admission};
 use crate::tools::{ToolContext, ToolRegistryBuilder};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
@@ -679,6 +680,45 @@ impl Engine {
             AppMode::Operate => prompts::OPERATE_MODE,
         }
         .trim()
+    }
+
+    /// Fail closed before a provider request when Operate cannot prove it will
+    /// leave the ordinary local Act loop and produce orchestration receipts.
+    fn operate_readiness_blocker(&self, mode: AppMode, content: &str) -> Option<String> {
+        if mode != AppMode::Operate {
+            return None;
+        }
+
+        let mut signals = WorkflowTriggerSignals::product_defaults();
+        signals.auto_start_child_limit = self
+            .api_config
+            .workflow_config()
+            .auto_start_child_limit
+            .try_into()
+            .unwrap_or(usize::MAX);
+        let admission = evaluate_operate_admission(content, &signals);
+        if admission.allows_local_execution() {
+            return None;
+        }
+
+        let readiness_gap = if !self.config.subagents_enabled
+            || !self.config.features.enabled(Feature::Subagents)
+        {
+            "the sub-agent/Workflow runtime is disabled"
+        } else if self.config.max_subagents == 0 || self.config.launch_concurrency == 0 {
+            "the worker runtime has no launch capacity"
+        } else if self.config.max_spawn_depth == 0 {
+            "worker delegation depth is zero"
+        } else if self.deepseek_client.is_none() {
+            "no active provider route is loaded for workers"
+        } else {
+            "this build does not yet host-enforce Workflow dispatch and terminal receipt verification"
+        };
+
+        Some(format!(
+            "Operate readiness blocked: {} requires Fleet/Workflow orchestration, but {readiness_gap}. No provider request or solo tool chain was started. Run `/setup report` and `/setup fleet` to inspect and record the readiness gap. This release cannot start a verified Operate workflow until host-enforced dispatch and terminal receipts are available; switch to Act only for intentionally local execution.",
+            admission.reason()
+        ))
     }
 
     pub(super) async fn emit_compaction_started(
@@ -1350,13 +1390,13 @@ impl Engine {
     #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
         enum EngineRunInput {
-            Operation(Op),
+            Operation(Box<Op>),
             SubAgentCompletion(SubAgentCompletion),
         }
 
         loop {
             let input = tokio::select! {
-                op = self.rx_op.recv() => op.map(EngineRunInput::Operation),
+                op = self.rx_op.recv() => op.map(|op| EngineRunInput::Operation(Box::new(op))),
                 completion = self.rx_subagent_completion.recv() => {
                     completion.map(EngineRunInput::SubAgentCompletion)
                 }
@@ -1369,12 +1409,14 @@ impl Engine {
                 EngineRunInput::SubAgentCompletion(completion) => {
                     self.handle_idle_subagent_completion(completion).await;
                 }
-                EngineRunInput::Operation(op) => match op {
+                EngineRunInput::Operation(op) => match *op {
                     Op::SendMessage {
                         content,
                         mode,
                         provider,
                         model,
+                        route_limits,
+                        compaction,
                         goal_objective,
                         goal_token_budget,
                         goal_status,
@@ -1398,6 +1440,8 @@ impl Engine {
                             mode,
                             provider,
                             model,
+                            route_limits,
+                            *compaction,
                             goal_objective,
                             goal_token_budget,
                             goal_status,
@@ -1845,6 +1889,8 @@ impl Engine {
                             mode,
                             Some(self.api_provider),
                             self.session.model.clone(),
+                            self.active_route_limits,
+                            self.config.compaction.clone(),
                             self.config.goal_objective.clone(),
                             self.config.goal_token_budget,
                             self.config.goal_status,
@@ -2203,6 +2249,8 @@ impl Engine {
             self.current_mode,
             Some(self.api_provider),
             self.session.model.clone(),
+            self.active_route_limits,
+            self.config.compaction.clone(),
             self.config.goal_objective.clone(),
             self.config.goal_token_budget,
             self.config.goal_status,
@@ -2324,6 +2372,8 @@ impl Engine {
         mode: AppMode,
         provider: Option<ApiProvider>,
         model: String,
+        route_limits: Option<codewhale_config::route::RouteLimits>,
+        compaction: CompactionConfig,
         goal_objective: Option<String>,
         goal_token_budget: Option<u32>,
         goal_status: GoalStatus,
@@ -2378,6 +2428,34 @@ impl Engine {
                 turn_id: turn.id.clone(),
             })
             .await;
+
+        // Operate is not allowed to silently fall through to Act for work that
+        // is not provably one-step. Until the host can prove a Workflow/Fleet
+        // dispatch plus terminal receipt, return an actionable blocker before
+        // route activation, snapshots, or any provider request.
+        if let Some(message) = self.operate_readiness_blocker(input_policy.mode, &content) {
+            let _ = self
+                .tx_event
+                .send(Event::error(ErrorEnvelope::transient(message.clone())))
+                .await;
+            let _ = self
+                .tx_event
+                .send(Event::TurnComplete {
+                    usage: turn.usage.clone(),
+                    status: TurnOutcomeStatus::Failed,
+                    error: Some(message),
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+            return;
+        }
+
+        // Apply the host-resolved route budget only after admission succeeds.
+        // The model, limits, and compaction policy arrive in one operation so
+        // no provider request can observe a partially updated route.
+        self.active_route_limits = route_limits;
+        self.config.compaction = compaction;
 
         // Snapshot the workspace BEFORE we touch a single tool. Run the git
         // work on the blocking pool so the async runtime stays responsive;
@@ -2799,6 +2877,8 @@ impl Engine {
                     mode,
                     provider,
                     model: self.session.model.clone(),
+                    route_limits: self.active_route_limits,
+                    compaction: Box::new(self.config.compaction.clone()),
                     goal_objective: None,
                     goal_token_budget: None,
                     goal_status: GoalStatus::Active,
@@ -2962,10 +3042,15 @@ impl Engine {
 
         let (status, error) = match run_purge(
             &client,
+            self.api_provider,
             &self.session.messages,
             &self.session.model,
             self.session.reasoning_effort.clone(),
-            effective_max_output_tokens_for_route(&self.session.model, self.active_route_limits),
+            effective_max_output_tokens_for_route(
+                self.api_provider,
+                &self.session.model,
+                self.active_route_limits,
+            ),
         )
         .await
         {
@@ -3894,7 +3979,9 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
 mod approval;
 mod context;
 mod handle;
+#[cfg(test)]
 pub(crate) use context::compact_tool_result_for_context;
+pub(crate) use context::compact_tool_result_for_route;
 /// Public so external hosts/wrappers can reuse the engine's input-budget math
 /// (see `context_input_budget_for_route`'s doc) instead of re-deriving it.
 pub use context::context_input_budget_for_route;

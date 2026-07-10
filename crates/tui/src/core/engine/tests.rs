@@ -60,6 +60,7 @@ fn subagent_mailbox_keeps_lifecycle_events_reliable() {
     assert!(!subagent_mailbox_message_is_best_effort(
         &MailboxMessage::TokenUsage {
             agent_id: "agent_a".to_string(),
+            provider: ApiProvider::Deepseek,
             model: "model".to_string(),
             usage: Usage::default(),
         }
@@ -146,6 +147,7 @@ fn subagent_mailbox_never_samples_lifecycle_or_usage_events() {
         &mut last_sent_at,
         &MailboxMessage::TokenUsage {
             agent_id: "agent_a".to_string(),
+            provider: ApiProvider::Deepseek,
             model: "model".to_string(),
             usage: Usage::default(),
         },
@@ -465,6 +467,224 @@ fn model_turn_event_timeout() -> Duration {
     } else {
         Duration::from_secs(10)
     }
+}
+
+fn external_user_message_op(content: &str, mode: AppMode) -> Op {
+    Op::SendMessage {
+        content: content.to_string(),
+        mode,
+        provider: None,
+        model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+        route_limits: None,
+        compaction: Box::new(CompactionConfig::default()),
+        goal_objective: None,
+        goal_token_budget: None,
+        goal_status: crate::tools::goal::GoalStatus::Active,
+        reasoning_effort: None,
+        reasoning_effort_auto: false,
+        auto_model: false,
+        allow_shell: true,
+        trust_mode: false,
+        auto_approve: false,
+        approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+        translation_enabled: false,
+        show_thinking: true,
+        allowed_tools: None,
+        dynamic_tools: Vec::new(),
+        hook_executor: None,
+        verbosity: None,
+        provenance: UserInputProvenance::ExternalUser,
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn operate_admission_blocks_unready_nontrivial_but_allows_act_and_trivial() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-act\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"local Act response\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-act\",\"choices\":[{\"index\":0,",
+        "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let engine_config = EngineConfig {
+        workspace: workspace.path().to_path_buf(),
+        snapshots_enabled: false,
+        subagents_enabled: false,
+        ..EngineConfig::default()
+    };
+    let ask = "audit every crate, implement the fixes, then verify independently";
+
+    let (operate_engine, operate_handle) = Engine::new(engine_config.clone(), &api_config);
+    let operate_task = tokio::spawn(operate_engine.run());
+    operate_handle
+        .send(external_user_message_op(ask, AppMode::Operate))
+        .await
+        .expect("send Operate turn");
+
+    let mut saw_blocker = false;
+    let mut saw_operate_complete = false;
+    let mut operate_rx = operate_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), operate_rx.recv())
+        .await
+        .expect("timed out waiting for Operate blocker")
+    {
+        match event {
+            Event::Error { envelope, .. } => {
+                saw_blocker = true;
+                assert!(
+                    envelope.recoverable,
+                    "readiness blocker must not force offline mode"
+                );
+                assert!(envelope.message.contains("Operate readiness blocked"));
+                assert!(envelope.message.contains("/setup fleet"));
+                assert!(envelope.message.contains("No provider request"));
+                assert!(
+                    envelope
+                        .message
+                        .contains("cannot start a verified Operate workflow")
+                );
+                assert!(!envelope.message.contains("start an explicit `/workflow`"));
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Failed);
+                assert!(
+                    error
+                        .as_deref()
+                        .is_some_and(|message| message.contains("/setup fleet"))
+                );
+                saw_operate_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(operate_rx);
+
+    assert!(
+        saw_blocker,
+        "Operate must surface an actionable readiness blocker"
+    );
+    assert!(
+        saw_operate_complete,
+        "blocked Operate turn must terminate cleanly"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests after Operate")
+            .is_empty(),
+        "blocked Operate must make zero provider requests"
+    );
+    operate_handle
+        .send(Op::Shutdown)
+        .await
+        .expect("shutdown Operate engine");
+    operate_task.await.expect("Operate engine task");
+
+    let (act_engine, act_handle) = Engine::new(engine_config.clone(), &api_config);
+    let act_task = tokio::spawn(act_engine.run());
+    act_handle
+        .send(external_user_message_op(ask, AppMode::Agent))
+        .await
+        .expect("send Act turn");
+
+    let mut saw_act_complete = false;
+    let mut act_rx = act_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), act_rx.recv())
+        .await
+        .expect("timed out waiting for Act completion")
+    {
+        if let Event::TurnComplete { status, error, .. } = event {
+            assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+            saw_act_complete = true;
+            break;
+        }
+    }
+    drop(act_rx);
+
+    assert!(
+        saw_act_complete,
+        "Act turn must reach provider-backed completion"
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recorded requests after Act");
+    assert_eq!(
+        requests.len(),
+        1,
+        "Act must retain its ordinary local model path"
+    );
+    act_handle
+        .send(Op::Shutdown)
+        .await
+        .expect("shutdown Act engine");
+    act_task.await.expect("Act engine task");
+
+    let (trivial_engine, trivial_handle) = Engine::new(engine_config, &api_config);
+    let trivial_task = tokio::spawn(trivial_engine.run());
+    trivial_handle
+        .send(external_user_message_op("git status", AppMode::Operate))
+        .await
+        .expect("send trivial Operate turn");
+
+    let mut saw_trivial_complete = false;
+    let mut trivial_rx = trivial_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), trivial_rx.recv())
+        .await
+        .expect("timed out waiting for trivial Operate completion")
+    {
+        if let Event::TurnComplete { status, error, .. } = event {
+            assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+            saw_trivial_complete = true;
+            break;
+        }
+    }
+    drop(trivial_rx);
+
+    assert!(
+        saw_trivial_complete,
+        "provably one-step Operate turn must retain the local path"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recorded requests after trivial Operate");
+    assert_eq!(
+        requests.len(),
+        2,
+        "trivial Operate must make the second allowed provider request"
+    );
+    trivial_handle
+        .send(Op::Shutdown)
+        .await
+        .expect("shutdown trivial Operate engine");
+    trivial_task.await.expect("trivial Operate engine task");
 }
 
 #[test]
@@ -2710,6 +2930,8 @@ async fn yolo_mode_does_not_prompt_for_model_driven_typed_ask_rule() {
             mode: AppMode::Yolo,
             provider: None,
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            route_limits: None,
+            compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
@@ -2836,6 +3058,8 @@ async fn yolo_mode_still_prompts_for_background_destructive_shell() {
             mode: AppMode::Yolo,
             provider: None,
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            route_limits: None,
+            compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
@@ -2990,6 +3214,8 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
             mode: AppMode::Yolo,
             provider: None,
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            route_limits: None,
+            compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
@@ -3124,6 +3350,8 @@ async fn yolo_mode_prompts_for_publish_like_shell_safety_floor() {
             mode: AppMode::Yolo,
             provider: None,
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            route_limits: None,
+            compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
@@ -3276,6 +3504,8 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
             mode: AppMode::Yolo,
             provider: None,
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            route_limits: None,
+            compaction: Box::new(CompactionConfig::default()),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
@@ -4575,7 +4805,9 @@ fn context_budget_uses_conservative_fallback_for_unknown_models() {
     let _lock = lock_test_env();
     let budget = context_input_budget_for_provider(ApiProvider::Openai, "auto")
         .expect("unknown/auto model ids should still get a conservative hard preflight budget");
-    let expected = 128_000usize - effective_max_output_tokens("auto") as usize - 1_024usize;
+    let expected = 128_000usize
+        - effective_max_output_tokens_for_route(ApiProvider::Openai, "auto", None) as usize
+        - 1_024usize;
     assert_eq!(budget, expected);
 }
 
@@ -4583,8 +4815,12 @@ fn context_budget_uses_conservative_fallback_for_unknown_models() {
 fn context_budget_uses_provider_effective_window_for_openai_codex() {
     let _lock = lock_test_env();
     let budget = context_input_budget_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5")
-        .expect("OpenAI Codex should use the route-effective context window");
-    let expected = 400_000usize - effective_max_output_tokens("gpt-5.5") as usize - 1_024usize;
+        .expect("OpenAI Codex should use a conservative fallback without route metadata");
+    let expected = usize::try_from(crate::config::OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS)
+        .expect("context window fits usize")
+        - crate::config::provider_capability(ApiProvider::OpenaiCodex, "gpt-5.5").max_output
+            as usize
+        - 1_024usize;
     assert_eq!(budget, expected);
 }
 
@@ -4594,10 +4830,15 @@ fn route_context_budget_uses_shared_budget_service() {
     let budget = route_context_budget_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5", 380_000)
         .expect("OpenAI Codex should produce a route budget");
 
-    assert_eq!(budget.window_tokens, 400_000);
+    assert_eq!(
+        budget.window_tokens,
+        u64::from(crate::config::OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS)
+    );
     assert_eq!(
         budget.output_cap_tokens,
-        u64::from(effective_max_output_tokens("gpt-5.5"))
+        u64::from(
+            crate::config::provider_capability(ApiProvider::OpenaiCodex, "gpt-5.5").max_output
+        )
     );
     assert_eq!(
         budget.pressure,
@@ -4637,7 +4878,11 @@ fn effective_max_output_tokens_for_route_caps_to_route_output_limit() {
     };
 
     assert_eq!(
-        effective_max_output_tokens_for_route("deepseek-v4-pro", Some(limits)),
+        effective_max_output_tokens_for_route(
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            Some(limits),
+        ),
         8_192
     );
 }
@@ -4651,7 +4896,11 @@ fn effective_max_output_tokens_for_route_caps_to_context_window() {
         output_tokens: None,
     };
 
-    let cap = effective_max_output_tokens_for_route("deepseek-v4-pro", Some(limits));
+    let cap = effective_max_output_tokens_for_route(
+        ApiProvider::Deepseek,
+        "deepseek-v4-pro",
+        Some(limits),
+    );
 
     assert!(cap < 32_000, "request cap must fit the configured window");
     assert!(
@@ -4670,9 +4919,32 @@ fn effective_max_output_tokens_for_route_keeps_tiny_window_positive() {
     };
 
     assert_eq!(
-        effective_max_output_tokens_for_route("deepseek-v4-pro", Some(limits)),
+        effective_max_output_tokens_for_route(
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            Some(limits),
+        ),
         1
     );
+}
+
+#[test]
+fn codex_route_without_output_metadata_uses_oauth_capability_floor() {
+    let _lock = lock_test_env();
+    let limits = codewhale_config::route::RouteLimits {
+        context_tokens: Some(272_000),
+        input_tokens: None,
+        output_tokens: None,
+    };
+
+    assert_eq!(
+        effective_max_output_tokens_for_route(ApiProvider::OpenaiCodex, "gpt-5.5", Some(limits)),
+        4_096
+    );
+    let budget =
+        route_context_budget_for_route(ApiProvider::OpenaiCodex, "gpt-5.5", Some(limits), 0)
+            .expect("Codex route budget");
+    assert_eq!(budget.output_cap_tokens, 4_096);
 }
 
 #[test]
@@ -4791,7 +5063,8 @@ fn internal_context_budget_tiers_reserved_output_by_window() {
     let small_window_budget =
         context_input_budget_for_provider(ApiProvider::Openai, "qwen3-32b-256k")
             .expect("a 256K-suffix model must yield Some budget via the effective-cap branch");
-    let effective_output = effective_max_output_tokens("qwen3-32b-256k") as usize;
+    let effective_output =
+        effective_max_output_tokens_for_route(ApiProvider::Openai, "qwen3-32b-256k", None) as usize;
     let expected_small = 256_000 - effective_output - 1_024;
     assert_eq!(small_window_budget, expected_small);
 }
@@ -4813,6 +5086,28 @@ fn v4_keeps_large_file_reads_but_compacts_noisy_shell_output() {
         compact_tool_result_for_context("deepseek-v3.2-128k", "read_file", &output);
     assert!(legacy_context.contains("output compacted to protect context"));
     assert!(legacy_context.len() < v4_context.len());
+}
+
+#[test]
+fn codex_tool_retention_uses_oauth_route_window_not_api_model_window() {
+    let content = "route-effective context\n".repeat(900);
+    let output = ToolResult::success(content.clone());
+    let limits = codewhale_config::route::RouteLimits {
+        context_tokens: Some(272_000),
+        input_tokens: None,
+        output_tokens: None,
+    };
+
+    let context = compact_tool_result_for_route(
+        ApiProvider::OpenaiCodex,
+        "gpt-5.5",
+        Some(limits),
+        "read_file",
+        &output,
+    );
+
+    assert!(context.contains("output compacted to protect context"));
+    assert!(context.len() < content.len());
 }
 
 #[test]

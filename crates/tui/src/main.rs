@@ -29,6 +29,7 @@ mod auto_reasoning;
 mod automation_manager;
 mod child_env;
 mod client;
+mod codex_model_cache;
 mod command_safety;
 mod commands;
 mod compaction;
@@ -7784,6 +7785,11 @@ async fn run_exec_agent(
     let compaction = CompactionConfig {
         enabled: auto_compact_enabled,
         model: effective_model.clone(),
+        effective_context_window: Some(crate::route_budget::route_context_window_tokens(
+            effective_provider,
+            &effective_model,
+            active_route_limits,
+        )),
         token_threshold: crate::route_budget::compaction_threshold_for_route_at_percent(
             effective_provider,
             &effective_model,
@@ -7837,7 +7843,7 @@ async fn run_exec_agent(
         subagents_enabled: execution_config.subagents_enabled_for_provider(effective_provider),
         features: execution_config.features(),
         auto_review_policy: execution_config.auto_review_policy(),
-        compaction,
+        compaction: compaction.clone(),
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
@@ -7946,6 +7952,8 @@ async fn run_exec_agent(
             mode,
             provider: Some(effective_provider),
             model: effective_model.clone(),
+            route_limits: active_route_limits,
+            compaction: Box::new(compaction.clone()),
             goal_objective: None,
             goal_token_budget: None,
             goal_status: crate::tools::goal::GoalStatus::Active,
@@ -8855,7 +8863,7 @@ mod doctor_setup_state_tests {
     }
 
     #[test]
-    fn doctor_setup_report_json_reports_operate_readiness() {
+    fn doctor_setup_report_json_fails_closed_without_operate_receipts() {
         let _guard = crate::test_support::lock_test_env();
         let tmp = TempDir::new().expect("tempdir");
         let (_home_guard, _codewhale_home) = prepare_env(&tmp);
@@ -8899,7 +8907,7 @@ mod doctor_setup_state_tests {
         let report = doctor_setup_report_json(&Config::default(), &workspace);
 
         assert_eq!(report["first_run_ready"], true);
-        assert_eq!(report["operate_ready"], true);
+        assert_eq!(report["operate_ready"], false);
         assert_eq!(
             report["operate_fleet"]["concurrency"]["plan_limit_probed"],
             false

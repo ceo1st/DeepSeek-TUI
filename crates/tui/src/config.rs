@@ -484,7 +484,10 @@ pub fn provider_capability(provider: ApiProvider, resolved_model: &str) -> Provi
             provider,
             resolved_model: resolved_model.to_string(),
             context_window: OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS,
-            max_output: crate::models::max_output_tokens_for_model(resolved_model).unwrap_or(4096),
+            // The OAuth cache does not publish an output ceiling. Keep the
+            // compatibility capability conservative instead of inheriting the
+            // public API model's output limit.
+            max_output: 4096,
             thinking_supported: true,
             cache_telemetry_supported: false,
             request_payload_mode: RequestPayloadMode::Responses,
@@ -2745,6 +2748,40 @@ struct RequirementsFile {
 // === Config Loading ===
 
 impl Config {
+    /// Whether an explicit config or requirements file owns approval posture.
+    /// TUI preferences may supply a default only when this is false.
+    #[must_use]
+    pub fn approval_policy_is_managed(&self) -> bool {
+        if self.approval_policy.is_some() {
+            return true;
+        }
+        self.approval_policy_is_requirements_managed()
+    }
+
+    /// Whether organization requirements, rather than a user-editable config
+    /// key, own approval posture. User config still outranks TUI settings, but
+    /// `/config approval_mode ... --save` may edit that user-owned key.
+    #[must_use]
+    pub fn approval_policy_is_requirements_managed(&self) -> bool {
+        let path = self
+            .requirements_path
+            .as_deref()
+            .map(expand_path)
+            .or_else(default_requirements_path);
+        let Some(path) = path else {
+            return false;
+        };
+        if !path.exists() {
+            return false;
+        }
+        // Fail closed if a present requirements file becomes unreadable or
+        // malformed between Config::load and App::new.
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| toml::from_str::<RequirementsFile>(&contents).ok())
+            .is_none_or(|requirements| !requirements.allowed_approval_policies.is_empty())
+    }
+
     #[must_use]
     pub fn search_provider_resolution(&self) -> SearchProviderResolution {
         if let Ok(raw) = std::env::var("DEEPSEEK_SEARCH_PROVIDER")
@@ -6304,7 +6341,7 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
         // The persistent Codex login is the OAuth credential file, analogous to
         // a stored config key. Token env overrides are scored separately by
         // active_provider_has_env_api_key.
-        return crate::oauth::auth_file_path().exists();
+        return crate::oauth::stored_credentials_present();
     }
     if matches!(provider, ApiProvider::Huggingface)
         && std::env::var("HUGGINGFACE_API_KEY")
@@ -6368,7 +6405,7 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     if provider == ApiProvider::OpenaiCodex {
         // Token env overrides are checked above; also honor the Codex CLI OAuth
         // login on disk.
-        return crate::oauth::auth_file_path().exists();
+        return crate::oauth::credentials_present();
     }
     if provider == ApiProvider::Xai && crate::xai_oauth::credentials_present() {
         // xAI supports both API keys and OAuth. A Grok-compatible token file is
@@ -6474,18 +6511,29 @@ pub(crate) fn provider_is_configured_for_active(
 /// isn't enough, since untouched providers still resolve to a
 /// `ProviderConfig::default()` there.
 fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
-    entry.api_key.is_some()
-        || entry.base_url.is_some()
-        || entry.model.is_some()
-        || entry.auth_mode.is_some()
-        || entry.auth.is_some()
+    let non_empty = |value: Option<&String>| value.is_some_and(|value| !value.trim().is_empty());
+
+    non_empty(entry.api_key.as_ref())
+        || non_empty(entry.base_url.as_ref())
+        || non_empty(entry.model.as_ref())
+        || non_empty(entry.auth_mode.as_ref())
+        || entry
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.validate().is_ok())
         || entry.context_window.is_some()
-        || entry.mode.is_some()
+        || non_empty(entry.mode.as_ref())
         || entry.max_concurrency.is_some()
-        || entry.http_headers.is_some()
-        || entry.path_suffix.is_some()
-        || entry.reasoning_stream_style.is_some()
+        || entry.http_headers.as_ref().is_some_and(|headers| {
+            headers
+                .iter()
+                .any(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
+        })
+        || non_empty(entry.path_suffix.as_ref())
+        || non_empty(entry.reasoning_stream_style.as_ref())
         || entry.insecure_skip_tls_verify.is_some()
+        || non_empty(entry.kind.as_ref())
+        || non_empty(entry.api_key_env.as_ref())
 }
 
 /// Save an API key to the appropriate place for the given provider.

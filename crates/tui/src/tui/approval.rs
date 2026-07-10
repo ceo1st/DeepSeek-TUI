@@ -73,10 +73,12 @@ impl ApprovalMode {
 
     pub fn from_config_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(ApprovalMode::Auto),
+            "auto" | "auto-review" | "auto_review" => Some(ApprovalMode::Auto),
             "bypass" | "yolo" | "dontask" | "dont_ask" | "bypass-permissions"
-            | "bypasspermissions" => Some(ApprovalMode::Bypass),
-            "suggest" | "suggested" | "on-request" | "untrusted" => Some(ApprovalMode::Suggest),
+            | "bypasspermissions" | "full-access" | "full" => Some(ApprovalMode::Bypass),
+            "suggest" | "suggested" | "on-request" | "untrusted" | "ask" => {
+                Some(ApprovalMode::Suggest)
+            }
             "never" | "deny" | "denied" => Some(ApprovalMode::Never),
             _ => None,
         }
