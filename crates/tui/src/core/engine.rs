@@ -439,6 +439,10 @@ pub struct EngineConfig {
     pub workspace_follow_symlinks: bool,
     /// Ask-only permission rules loaded from sibling `permissions.toml`.
     pub exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine,
+    /// Whether turn startup may write terminal title/taskbar OSC sequences.
+    /// Interactive TUI sessions enable this; headless and machine-readable
+    /// hosts disable it so stdout remains protocol-clean.
+    pub terminal_chrome_enabled: bool,
 }
 
 impl Default for EngineConfig {
@@ -515,6 +519,7 @@ impl Default for EngineConfig {
             tools: None,
             workspace_follow_symlinks: false,
             exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine::new(Vec::new(), Vec::new()),
+            terminal_chrome_enabled: true,
         }
     }
 }

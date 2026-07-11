@@ -259,10 +259,12 @@ impl Engine {
         force_update_plan_first: bool,
         dynamic_active_tools: Vec<&'static str>,
     ) -> (TurnOutcomeStatus, Option<String>) {
-        // Signal to the terminal / taskbar that a turn is in progress
-        // (OSC 9 ; 4 indeterminate progress + title spinner).
-        crate::tui::notifications::set_taskbar_progress_busy();
-        crate::tui::notifications::start_title_animation("CodeWhale");
+        // Only interactive TUI hosts own terminal chrome. Headless exec,
+        // app-server, and stream-json stdout must remain byte-clean.
+        if self.config.terminal_chrome_enabled {
+            crate::tui::notifications::set_taskbar_progress_busy();
+            crate::tui::notifications::start_title_animation("CodeWhale");
+        }
 
         let client = self
             .deepseek_client

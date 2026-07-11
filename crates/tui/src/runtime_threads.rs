@@ -2792,6 +2792,7 @@ impl RuntimeThreadManager {
             verbosity: cfg.verbosity.clone(),
             workspace_follow_symlinks: settings.workspace_follow_symlinks,
             exec_policy_engine: cfg.exec_policy_engine.clone(),
+            terminal_chrome_enabled: false,
         };
 
         let engine = spawn_engine(engine_cfg, &cfg);

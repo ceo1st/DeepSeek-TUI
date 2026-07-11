@@ -8305,6 +8305,7 @@ async fn run_exec_agent(
         verbosity: execution_config.verbosity.clone(),
         workspace_follow_symlinks: settings.workspace_follow_symlinks,
         exec_policy_engine: execution_config.exec_policy_engine.clone(),
+        terminal_chrome_enabled: false,
     };
 
     let engine_handle = spawn_engine(engine_config, &execution_config);
