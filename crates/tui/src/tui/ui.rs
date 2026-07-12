@@ -4341,7 +4341,9 @@ async fn run_event_loop(
                     continue;
                 }
 
-                match crate::tui::underwater::handle_launch_key(&mut app.launch, key) {
+                let launch_locale = app.ui_locale;
+                match crate::tui::underwater::handle_launch_key(&mut app.launch, key, launch_locale)
+                {
                     crate::tui::underwater::LaunchAction::None => {}
                     crate::tui::underwater::LaunchAction::NewSession => {
                         let result = begin_launch_session(app, None);
@@ -4360,7 +4362,8 @@ async fn run_event_loop(
                         }
                     }
                     crate::tui::underwater::LaunchAction::CreateWorktree(name) => {
-                        app.launch.status = Some("Creating worktree…".to_string());
+                        app.launch.status =
+                            Some(app.tr(MessageId::LaunchCreatingWorktree).into_owned());
                         match provision_launch_worktree(app.workspace.clone(), name).await {
                             Ok(workspace) => {
                                 let result = begin_launch_session(app, Some(workspace));
@@ -4379,22 +4382,27 @@ async fn run_event_loop(
                                 }
                             }
                             Err(err) => {
-                                app.launch.status = Some(format!("Worktree failed: {err}"));
+                                app.launch.status = Some(
+                                    app.tr(MessageId::LaunchWorktreeFailed)
+                                        .replace("{error}", &err.to_string()),
+                                );
                             }
                         }
                     }
                     crate::tui::underwater::LaunchAction::Resume => {
                         if app.launch.workspace_session_count == 0 {
                             app.launch.status =
-                                Some("No saved sessions for this workspace.".to_string());
+                                Some(app.tr(MessageId::LaunchNoSavedSessions).into_owned());
                         } else {
-                            app.view_stack.push(SessionPickerView::new(&app.workspace));
+                            app.view_stack
+                                .push(SessionPickerView::new(&app.workspace, app.ui_locale));
                         }
                     }
                     crate::tui::underwater::LaunchAction::Changelog => {
+                        let title = app.tr(MessageId::LaunchMenuChangelog).into_owned();
                         open_text_pager(
                             app,
-                            "Changelog".to_string(),
+                            title,
                             include_str!("../../../../CHANGELOG.md").to_string(),
                         );
                     }
@@ -4854,7 +4862,8 @@ async fn run_event_loop(
                     // never restores a different project's history by
                     // surprise (#1395). Press `a` inside the picker to
                     // broaden to every saved session.
-                    app.view_stack.push(SessionPickerView::new(&app.workspace));
+                    app.view_stack
+                        .push(SessionPickerView::new(&app.workspace, app.ui_locale));
                     continue;
                 }
                 KeyCode::Char('c') | KeyCode::Char('C')
@@ -8344,7 +8353,7 @@ fn begin_launch_session(app: &mut App, workspace: Option<PathBuf>) -> commands::
     let session_id = uuid::Uuid::new_v4().to_string();
     app.current_session_id = Some(session_id.clone());
     app.current_session_metadata = None;
-    app.session_title = Some("New Session".to_string());
+    app.session_title = Some(app.tr(MessageId::SessionsNewSessionTitle).into_owned());
     app.launch.visible = false;
     app.launch.status = None;
     app.status_message = None;
@@ -8821,6 +8830,7 @@ async fn apply_command_result(
                         crate::tui::theme_picker::ThemePickerView::new_with_treatment(
                             original,
                             app.ocean_treatment,
+                            app.ui_locale,
                         ),
                     );
                 }

@@ -36,6 +36,7 @@ pub(super) fn open_file_picker(app: &mut App) {
             &app.workspace,
             relevance,
             app.mention_walk_depth,
+            app.ui_locale,
         ));
 }
 

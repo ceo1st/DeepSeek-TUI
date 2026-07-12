@@ -506,7 +506,8 @@ fn export_turn_handoff(app: &mut App, dest: Option<&str>) -> CommandResult {
 pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
     let trimmed = arg.unwrap_or("").trim();
     if trimmed.is_empty() {
-        app.view_stack.push(SessionPickerView::new(&app.workspace));
+        app.view_stack
+            .push(SessionPickerView::new(&app.workspace, app.ui_locale));
         return CommandResult::ok();
     }
 
@@ -515,7 +516,8 @@ pub fn sessions(app: &mut App, arg: Option<&str>) -> CommandResult {
     match action.as_str() {
         "prune" => prune(app, parts.next()),
         "show" | "list" | "picker" => {
-            app.view_stack.push(SessionPickerView::new(&app.workspace));
+            app.view_stack
+                .push(SessionPickerView::new(&app.workspace, app.ui_locale));
             CommandResult::ok()
         }
         _ => CommandResult::error(format!(

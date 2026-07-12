@@ -27,6 +27,7 @@ use crate::codex_model_cache::{
     self, CodexModelCacheFreshness, CodexModelMetadata, CodexModelRoster,
 };
 use crate::config::{ApiProvider, Config, DEEPSEEK_ALIAS_REPLACEMENT};
+use crate::localization::{Locale, MessageId, tr};
 use crate::model_profile::{
     CapabilityOverride, SupportState, resolved_capability_profile_with_overrides,
 };
@@ -180,6 +181,8 @@ pub struct ModelPickerView {
     configured_providers: Vec<ApiProvider>,
     row_hitboxes: RefCell<Vec<(Rect, Pane, usize)>>,
     last_mouse_selected: Option<(Pane, usize)>,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +275,7 @@ impl ModelPickerView {
             configured_providers,
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
+            locale: app.ui_locale,
         };
         view.restore_memory(app.model_picker_memory.as_ref());
         view
@@ -1495,14 +1499,18 @@ impl ModalView for ModelPickerView {
 impl ModelPickerView {
     fn render_route(&self, area: Rect, buf: &mut Buffer) {
         self.row_hitboxes.borrow_mut().clear();
-        let inner =
-            render_underwater_surface(area, buf, format!("route · {}", self.view.title_label()));
+        let inner = render_underwater_surface(
+            area,
+            buf,
+            tr(self.locale, MessageId::RouteSurfaceTitle)
+                .replace("{view}", self.view.title_label()),
+        );
 
         // Say what the action does in model language. Provider changes are an
         // implementation detail of applying a cross-provider model row.
-        let view_action = match self.view {
-            ModelListView::Configured => "browse catalog",
-            other => other.next().title_label(),
+        let view_action: std::borrow::Cow<'static, str> = match self.view {
+            ModelListView::Configured => tr(self.locale, MessageId::RouteBrowseCatalog),
+            other => other.next().title_label().into(),
         };
         let content = render_modal_footer(
             inner,
@@ -1510,7 +1518,10 @@ impl ModelPickerView {
             &[
                 ActionHint::new("↑↓", "move"),
                 ActionHint::new("Tab", "switch"),
-                ActionHint::new("Type", "search any model"),
+                ActionHint::new(
+                    tr(self.locale, MessageId::RouteActionType),
+                    tr(self.locale, MessageId::RouteActionSearchAnyModel),
+                ),
                 ActionHint::new("Enter", "apply"),
                 ActionHint::new("A", view_action),
                 ActionHint::new("Esc", "cancel"),
@@ -1527,7 +1538,7 @@ impl ModelPickerView {
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(
-                    "─ route ",
+                    format!("─ {} ", tr(self.locale, MessageId::RoutePanelHeader)),
                     Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
                 ),
                 Span::styled(
@@ -1549,7 +1560,10 @@ impl ModelPickerView {
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  provider ", Style::default().fg(palette::WHALE_INFO)),
+                Span::styled(
+                    format!("  {} ", tr(self.locale, MessageId::RouteProviderLabel)),
+                    Style::default().fg(palette::WHALE_INFO),
+                ),
                 Span::styled(
                     self.resolved_provider()
                         .unwrap_or(self.initial_provider)
@@ -1557,7 +1571,7 @@ impl ModelPickerView {
                     Style::default().fg(palette::TEXT_PRIMARY),
                 ),
                 Span::styled(
-                    " · model-first atomic route",
+                    format!(" · {}", tr(self.locale, MessageId::RouteModelFirstAtomic)),
                     Style::default().fg(palette::TEXT_MUTED),
                 ),
             ]),

@@ -3295,7 +3295,7 @@ fn constitution_ratification_text(
                  これは行動を導くものです。承認ポリシー、サンドボックス、Shell、ネットワーク、信頼、MCP 権限、\
                  既定モード、公開、支出の権限を付与または変更することはできません。これらは実行時にあなたが管理します。\n\n\
                  縮小コアと任意モジュール\n\
-                 組み込みの 55 行コアは引き続き有効です。この草案はユーザーグローバルの長期設定だけを保存します。\
+                 組み込みのコアは引き続き有効です。この草案はユーザーグローバルの長期設定だけを保存します。\
                  重い実行/オーケストレーション教義はモードプロンプトまたは将来の任意モジュールに属します。このプレビューはモジュールを有効化せず、設定も変更しません。\n\n\
                  批准\n{ratify_how}"
             )
@@ -3329,7 +3329,7 @@ fn constitution_ratification_text(
                  它不能做什么\n\
                  它只提供行为指导，不能授予或更改审批策略、沙箱、Shell、网络、信任、MCP 权限、默认模式、发布或支出权限——这些始终由你在运行时掌控。\n\n\
                  精简核心与可选模块\n\
-                 内置 55 行核心始终生效。本草案只保存你的用户全局长期偏好。执行/编排等重型教义位于模式提示词或未来的可选模块中；此预览不会启用模块或更改其配置。\n\n\
+                 内置核心始终生效。本草案只保存你的用户全局长期偏好。执行/编排等重型教义位于模式提示词或未来的可选模块中；此预览不会启用模块或更改其配置。\n\n\
                  批准\n{ratify_how}"
             )
         }
@@ -3362,7 +3362,7 @@ fn constitution_ratification_text(
                  它不能做什麼\n\
                  它只提供行為指導，不能授予或更改審批策略、沙箱、Shell、網路、信任、MCP 權限、預設模式、發布或支出權限；這些始終由你在執行時掌控。\n\n\
                  精簡核心與可選模組\n\
-                 內建 55 行核心始終生效。本草案只保存你的使用者全域長期偏好。執行/編排等重型教義位於模式提示詞或未來的可選模組中；此預覽不會啟用模組或更改其配置。\n\n\
+                 內建核心始終生效。本草案只保存你的使用者全域長期偏好。執行/編排等重型教義位於模式提示詞或未來的可選模組中；此預覽不會啟用模組或更改其配置。\n\n\
                  批准\n{ratify_how}"
             )
         }
@@ -3401,7 +3401,7 @@ fn constitution_ratification_text(
                  Isto orienta comportamento. Não pode conceder nem alterar política de aprovação, sandbox, shell, rede, \
                  confiança, permissões MCP, modo padrão, publicação ou autoridade para gastos; isso continua sob seu controle em tempo de execução.\n\n\
                  NÚCLEO REDUZIDO E MÓDULOS OPT-IN\n\
-                 O núcleo embutido de 55 linhas continua ativo. Este rascunho só salva suas preferências permanentes globais de usuário. \
+                 O núcleo embutido continua ativo. Este rascunho só salva suas preferências permanentes globais de usuário. \
                  Doutrina pesada de execução ou orquestração pertence a prompts de modo ou módulos opt-in futuros; esta prévia não ativa módulos nem muda sua configuração.\n\n\
                  RATIFICAÇÃO\n{ratify_how}"
             )
@@ -3441,7 +3441,7 @@ fn constitution_ratification_text(
                  Orienta comportamiento. No puede conceder ni cambiar política de aprobación, sandbox, shell, red, \
                  confianza, permisos MCP, modo predeterminado, publicación o autoridad de gasto; eso sigue bajo tu control en tiempo de ejecución.\n\n\
                  NÚCLEO REDUCIDO Y MÓDULOS OPT-IN\n\
-                 El núcleo integrado de 55 líneas sigue activo. Este borrador solo guarda tus preferencias permanentes globales de usuario. \
+                 El núcleo integrado sigue activo. Este borrador solo guarda tus preferencias permanentes globales de usuario. \
                  La doctrina pesada de ejecución u orquestación pertenece a prompts de modo o módulos opt-in futuros; esta vista previa no activa módulos ni cambia su configuración.\n\n\
                  RATIFICACIÓN\n{ratify_how}"
             )
@@ -3481,7 +3481,7 @@ fn constitution_ratification_text(
                  Nó hướng dẫn hành vi. Nó không thể cấp hoặc đổi chính sách phê duyệt, sandbox, shell, mạng, \
                  độ tin cậy, quyền MCP, chế độ mặc định, xuất bản hoặc quyền chi tiêu; những thứ đó vẫn do bạn kiểm soát lúc chạy.\n\n\
                  LÕI RÚT GỌN VÀ MÔ-ĐUN OPT-IN\n\
-                 Lõi tích hợp 55 dòng vẫn hoạt động. Bản nháp này chỉ lưu tùy chọn thường trực toàn cục của người dùng. \
+                 Lõi tích hợp vẫn hoạt động. Bản nháp này chỉ lưu tùy chọn thường trực toàn cục của người dùng. \
                  Giáo điều thực thi hoặc điều phối nặng thuộc về prompt chế độ hoặc mô-đun opt-in trong tương lai; bản xem trước này không bật mô-đun hoặc đổi cấu hình của chúng.\n\n\
                  PHÊ CHUẨN\n{ratify_how}"
             )
@@ -3521,7 +3521,7 @@ fn constitution_ratification_text(
                  이것은 행동을 안내할 뿐입니다. 승인 정책, 샌드박스, 셸, 네트워크, 신뢰, MCP 권한, 기본 모드, 게시, 지출 권한을 \
                  부여하거나 바꿀 수 없습니다; 이는 여전히 런타임에서 당신이 직접 관리합니다.\n\n\
                  축소된 코어와 옵트인 모듈\n\
-                 내장된 55줄 코어는 계속 활성 상태입니다. 이 초안은 사용자 전역의 상시 선호만 저장합니다. \
+                 내장된 코어는 계속 활성 상태입니다. 이 초안은 사용자 전역의 상시 선호만 저장합니다. \
                  무거운 실행/오케스트레이션 지침은 모드 프롬프트나 향후 옵트인 모듈에 속합니다. 이 미리보기는 모듈을 활성화하지 않으며 그 설정도 바꾸지 않습니다.\n\n\
                  승인\n{ratify_how}"
             )
@@ -3565,7 +3565,7 @@ fn constitution_ratification_text(
                  network, trust, MCP permissions, default mode, publishing, or spending \
                  authority — those stay under your hand at runtime.\n\n\
                  REDUCED CORE AND OPT-IN MODULES\n\
-                 The bundled 55-line core stays active. This draft only saves your user-global \
+                 The bundled core stays active. This draft only saves your user-global \
                  standing preferences. Heavy execution or orchestration doctrine belongs in mode \
                  prompts or future opt-in modules; this preview does not enable modules or change \
                  their configuration.\n\n\
@@ -4109,7 +4109,7 @@ mod tests {
         assert!(content.contains("<codewhale_user_constitution"));
         assert!(content.contains("press G to ratify and save"));
         assert!(content.contains("REDUCED CORE AND OPT-IN MODULES"));
-        assert!(content.contains("The bundled 55-line core stays active"));
+        assert!(content.contains("The bundled core stays active"));
         assert!(content.contains("does not enable modules"));
         assert_eq!(view.state().constitution_choice, ConstitutionChoice::Unset);
 
@@ -4206,7 +4206,6 @@ mod tests {
                     ),
                 };
 
-            assert!(content.contains("55"), "{}", locale.tag());
             assert!(content.contains(heading), "{}", locale.tag());
             assert!(content.contains(module_marker), "{}", locale.tag());
             assert!(content.contains(no_enable_marker), "{}", locale.tag());
@@ -4586,7 +4585,9 @@ mod tests {
         let text = lines_to_text(view.constitution_detail_lines());
 
         assert!(text.contains("user-global preferences only"));
-        assert!(text.contains("55-line core"));
+        // The en copy no longer claims a line count for the core (#4057 wave 2
+        // reword: the shipped core outgrew "55-line").
+        assert!(text.contains("bundled core"));
         assert!(text.contains("mode prompts"));
         assert!(text.contains("future opt-ins"));
     }

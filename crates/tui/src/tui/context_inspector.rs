@@ -464,7 +464,7 @@ fn short_tool_id(id: &str) -> String {
 
 #[derive(Debug, Clone)]
 struct ContextBucket {
-    label: &'static str,
+    label: String,
     tokens: usize,
     percent: f64,
     detail: String,
@@ -482,6 +482,7 @@ pub(crate) struct ContextInspectorView {
     rows: Vec<ContextBucket>,
     selected: usize,
     hitboxes: RefCell<Vec<(u16, usize)>>,
+    locale: Locale,
 }
 
 impl ContextInspectorView {
@@ -497,6 +498,7 @@ impl ContextInspectorView {
             rows: Vec::new(),
             selected: 0,
             hitboxes: RefCell::new(Vec::new()),
+            locale: app.ui_locale,
         };
         view.refresh_from_app(app);
         view
@@ -516,28 +518,28 @@ impl ContextInspectorView {
         self.model = app.model_display_label();
         self.workspace = crate::utils::display_path(&app.workspace);
         self.threshold = app.auto_compact_threshold_percent;
+        self.locale = app.ui_locale;
         let max_f = f64::from(max.max(1));
         self.rows = vec![
             ContextBucket {
-                label: "system prompt",
+                label: tr(self.locale, MessageId::CtxInspRowSystemPrompt).into_owned(),
                 tokens: system_tokens,
                 percent: (system_tokens as f64 / max_f) * 100.0,
                 detail: full_detail.clone(),
             },
             ContextBucket {
-                label: "messages",
+                label: tr(self.locale, MessageId::CtxInspRowMessages).into_owned(),
                 tokens: message_tokens,
                 percent: (message_tokens as f64 / max_f) * 100.0,
                 detail: full_detail,
             },
             ContextBucket {
-                label: "free",
+                label: tr(self.locale, MessageId::CtxInspRowFree).into_owned(),
                 tokens: free_tokens,
                 percent: (free_tokens as f64 / max_f) * 100.0,
-                detail: format!(
-                    "{} free tokens remain before the route window is full. Auto-compact threshold: {:.0}%.",
-                    free_tokens, self.threshold
-                ),
+                detail: tr(self.locale, MessageId::CtxInspFreeTokensDetail)
+                    .replace("{free}", &free_tokens.to_string())
+                    .replace("{threshold}", &format!("{:.0}", self.threshold)),
             },
         ];
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
@@ -559,7 +561,7 @@ impl ContextInspectorView {
             return ViewAction::None;
         };
         ViewAction::Emit(ViewEvent::OpenTextPager {
-            title: format!("context · {}", row.label),
+            title: tr(self.locale, MessageId::CtxInspDrillTitle).replace("{row}", &row.label),
             content: row.detail.clone(),
         })
     }
@@ -621,21 +623,24 @@ impl ModalView for ContextInspectorView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let inner = render_underwater_surface(area, buf, "context");
+        let inner =
+            render_underwater_surface(area, buf, tr(self.locale, MessageId::CtxInspSurfaceTitle));
         let content = render_modal_footer(
             inner,
             buf,
             &[
-                ActionHint::new("↑/↓", "select"),
-                ActionHint::new("Enter", "drill down"),
-                ActionHint::new("Esc", "close"),
+                ActionHint::new("↑/↓", tr(self.locale, MessageId::CtxInspActionSelect)),
+                ActionHint::new("Enter", tr(self.locale, MessageId::CtxInspActionDrillDown)),
+                ActionHint::new("Esc", tr(self.locale, MessageId::CtxInspActionClose)),
             ],
         );
         let width = usize::from(content.width);
         let mut lines = vec![
             Line::from(vec![
                 Span::styled(
-                    format!("~{}/{} tokens", self.used, self.max),
+                    tr(self.locale, MessageId::CtxInspUsedTokens)
+                        .replace("{used}", &self.used.to_string())
+                        .replace("{max}", &self.max.to_string()),
                     Style::default()
                         .fg(palette::WHALE_INFO)
                         .add_modifier(Modifier::BOLD),
@@ -674,7 +679,8 @@ impl ModalView for ContextInspectorView {
                 ),
             ]));
             lines.push(Line::from(Span::styled(
-                format!("auto-compact at {:.0}%", self.threshold),
+                tr(self.locale, MessageId::CtxInspAutoCompactAt)
+                    .replace("{threshold}", &format!("{:.0}", self.threshold)),
                 Style::default().fg(palette::TEXT_HINT),
             )));
             lines.push(Line::from(""));
@@ -692,9 +698,11 @@ impl ModalView for ContextInspectorView {
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
-            let value = format!("{} tokens · {:.1}%", row.tokens, row.percent);
+            let value = tr(self.locale, MessageId::CtxInspRowTokens)
+                .replace("{tokens}", &row.tokens.to_string())
+                .replace("{percent}", &format!("{:.1}", row.percent));
             let label_width = width.saturating_sub(value.len() + 5);
-            let label = crate::tui::ui_text::semantic_truncate(row.label, label_width);
+            let label = crate::tui::ui_text::semantic_truncate(&row.label, label_width);
             let gap = width.saturating_sub(label.len() + value.len() + 3);
             let y = content
                 .y

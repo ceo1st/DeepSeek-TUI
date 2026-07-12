@@ -21,6 +21,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::ui_text::truncate_line_to_width;
 use crate::tui::widgets::Renderable;
@@ -96,6 +97,17 @@ impl WorkflowRowStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::SchemaFailed => "schema",
+        }
+    }
+
+    /// Localized display variant of [`Self::label`]. `label()` stays
+    /// English because it doubles as the machine-readable `status` token in
+    /// [`WorkflowPanel::to_run_json`]; this method is for rendered rows only.
+    #[must_use]
+    pub fn display_label(self, locale: Locale) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Waiting => tr(locale, MessageId::WorkflowStatusWaiting),
+            other => std::borrow::Cow::Borrowed(other.label()),
         }
     }
 
@@ -390,6 +402,9 @@ pub struct WorkflowPanel {
     /// Set when the operator requested cancel from the panel (mouse/key).
     /// Consumed by the host to drive `/workflow cancel`.
     cancel_emit: Option<String>,
+    /// UI locale for rendered copy. Defaults to English; hosts with app
+    /// access set it after construction (#4057 wave 2).
+    pub locale: Locale,
 }
 
 /// Extra fields the history card can show that are not part of the live panel
@@ -425,6 +440,7 @@ impl WorkflowPanel {
             source_path: None,
             spillover_path: None,
             cancel_emit: None,
+            locale: Locale::En,
         }
     }
 
@@ -794,7 +810,7 @@ impl WorkflowPanel {
                     "{mark} {label} ({status})",
                     mark = role_mark(row.profile.as_deref()),
                     label = short_label(&row.label, 16),
-                    status = row.status.label()
+                    status = row.status.display_label(self.locale)
                 )
             })
             .collect();
@@ -834,7 +850,7 @@ impl WorkflowPanel {
                         label = short_label(&row.label, 14),
                         track = lane_track(row, max_elapsed, 16, now_ms()),
                         elapsed = format_elapsed(row_elapsed_ms(row, now_ms())),
-                        status = row.status.label(),
+                        status = row.status.display_label(self.locale),
                     ),
                     content_width,
                 ),
@@ -847,10 +863,12 @@ impl WorkflowPanel {
             let (failed, cancelled) = self.failure_cancel_counts();
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width(
-                    &format!(
-                        "debrief: {done}/{total} settled · {failed} failed · {cancelled} cancelled · {}",
-                        self.elapsed_label()
-                    ),
+                    &tr(self.locale, MessageId::WorkflowDebrief)
+                        .replace("{done}", &done.to_string())
+                        .replace("{total}", &total.to_string())
+                        .replace("{failed}", &failed.to_string())
+                        .replace("{cancelled}", &cancelled.to_string())
+                        .replace("{elapsed}", &self.elapsed_label()),
                     content_width,
                 ),
                 Style::default().fg(palette::TEXT_MUTED),
@@ -1033,6 +1051,7 @@ impl WorkflowPanel {
                 at_ms,
             } => {
                 // New run replaces preserved completed state.
+                let locale = self.locale;
                 *self = Self::new(
                     run_id,
                     workflow_goal
@@ -1040,6 +1059,7 @@ impl WorkflowPanel {
                         .unwrap_or_else(|| "workflow".to_string()),
                     at_ms,
                 );
+                self.locale = locale;
                 self.budget_total = token_budget;
                 self.budget_remaining = token_budget;
                 self.source_path = source_path;
@@ -1469,7 +1489,7 @@ impl WorkflowPanel {
         let text = format!(
             "  {mark} {status:<9} {label} · {role} · {model} · {worktree} · {lane} · {elapsed}{schema}",
             mark = role_mark(row.profile.as_deref()),
-            status = row.status.label(),
+            status = row.status.display_label(self.locale),
             label = short_label(&row.label, 18),
             lane = lane_track(row, elapsed_ms.max(1), 10, now_ms),
         );

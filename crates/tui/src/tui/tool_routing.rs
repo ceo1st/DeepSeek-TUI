@@ -815,9 +815,10 @@ fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
                 .get("started_at_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
-                run_id, label, at_ms,
-            ));
+            let mut panel =
+                crate::tui::widgets::workflow_panel::WorkflowPanel::new(run_id, label, at_ms);
+            panel.locale = app.ui_locale;
+            app.workflow_panel = Some(panel);
         }
         if let Some(panel) = app.workflow_panel.as_mut() {
             let run_id = value
@@ -863,7 +864,10 @@ fn apply_workflow_output_to_panel(app: &mut App, output: &str) {
     }
 
     // Prefer full panel hydration from summary/phases snapshot when present.
-    if let Some(panel) = crate::tui::widgets::workflow_panel::WorkflowPanel::from_run_json(&value) {
+    if let Some(mut panel) =
+        crate::tui::widgets::workflow_panel::WorkflowPanel::from_run_json(&value)
+    {
+        panel.locale = app.ui_locale;
         app.workflow_panel = Some(panel);
         app.needs_redraw = true;
         sync_workflow_history_card_from_panel(app);

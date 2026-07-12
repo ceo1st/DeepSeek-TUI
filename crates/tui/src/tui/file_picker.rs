@@ -24,6 +24,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
@@ -129,6 +130,8 @@ pub struct FilePickerView {
     scroll: usize,
     /// Exact visible row targets from the last render for mouse parity.
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 impl FilePickerView {
@@ -138,7 +141,7 @@ impl FilePickerView {
     /// `mention_walk_depth`.
     #[cfg(test)]
     pub fn new_with_relevance(workspace_root: &Path, relevance: FilePickerRelevance) -> Self {
-        Self::new_with_relevance_and_depth(workspace_root, relevance, WALK_DEPTH)
+        Self::new_with_relevance_and_depth(workspace_root, relevance, WALK_DEPTH, Locale::En)
     }
 
     /// Build a picker with working-set relevance hints and an explicit walk
@@ -148,6 +151,7 @@ impl FilePickerView {
         workspace_root: &Path,
         relevance: FilePickerRelevance,
         walk_depth: usize,
+        locale: Locale,
     ) -> Self {
         let max_depth = if walk_depth == 0 {
             None
@@ -163,6 +167,7 @@ impl FilePickerView {
             selected: 0,
             scroll: 0,
             last_row_hitboxes: RefCell::new(Vec::new()),
+            locale,
         };
         view.refilter();
         view
@@ -366,14 +371,13 @@ impl ModalView for FilePickerView {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let match_count = self.filtered.len();
-        let inner = render_underwater_surface(
-            area,
-            buf,
-            format!(
-                "@ attach · {match_count} match{}",
-                if match_count == 1 { "" } else { "es" },
-            ),
-        );
+        let title = if match_count == 1 {
+            tr(self.locale, MessageId::FilePickerMatchSingular).into_owned()
+        } else {
+            tr(self.locale, MessageId::FilePickerMatchesPlural)
+                .replace("{count}", &match_count.to_string())
+        };
+        let inner = render_underwater_surface(area, buf, title);
 
         let content = render_modal_footer(
             inner,

@@ -569,6 +569,63 @@ fn selection_point_from_position_ignores_top_padding() {
     assert_eq!(p1.column, 0);
 }
 
+/// #4208 evidence: the in-app selection copy strips every rendering rail
+/// (user quote bar, card rails) via cache metadata, so copied text is clean
+/// regardless of which decoration the transcript grammar uses. The
+/// remaining #4208 surface is terminal-native selection with mouse capture
+/// off, which no app-side clipboard code can intercept.
+#[test]
+fn selection_to_text_excludes_transcript_rail_decorations() {
+    let mut app = create_test_app();
+    app.history = vec![
+        HistoryCell::User {
+            content: "fix the flaky pty test".to_string(),
+        },
+        HistoryCell::Assistant {
+            content: "Looking at the failing test first.".to_string(),
+            streaming: false,
+        },
+    ];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+
+    let last = app
+        .viewport
+        .transcript_cache
+        .lines()
+        .len()
+        .saturating_sub(1);
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index: 0,
+        column: 0,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index: last,
+        column: 80,
+    });
+
+    let copied = selection_to_text(&app).expect("selection yields text");
+    for rail in ['▎', '▏', '╎', '│', '┃', '╭', '╰', '●'] {
+        assert!(
+            !copied.contains(rail),
+            "copied text must exclude the {rail:?} rail: {copied:?}"
+        );
+    }
+    assert!(
+        copied.contains("fix the flaky pty test"),
+        "content survives rail stripping: {copied:?}"
+    );
+    assert!(
+        copied.contains("Looking at the failing test first."),
+        "assistant content survives: {copied:?}"
+    );
+}
+
 #[test]
 fn selection_to_text_handles_multiline_and_reversed_endpoints() {
     let mut app = create_test_app();

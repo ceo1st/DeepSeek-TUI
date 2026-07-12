@@ -27,6 +27,7 @@ use crate::config::Config;
 use crate::fleet::profile::AgentProfile;
 use crate::fleet::roster::{FleetRoster, ProfileOrigin};
 use crate::fleet::worker_runtime::roster_member_agent_type;
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{
@@ -68,15 +69,19 @@ pub struct FleetRosterView {
     /// Selected row: 0 is the pinned operator row, members follow at 1..
     selected: usize,
     detail_scroll: usize,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 impl FleetRosterView {
     #[must_use]
     pub fn new(app: &App, config: &Config) -> Self {
-        Self::from_parts(
+        let mut view = Self::from_parts(
             OperatorInfo::from_app(app),
             FleetRoster::load(&config.fleet_config(), &app.workspace),
-        )
+        );
+        view.locale = app.ui_locale;
+        view
     }
 
     fn from_parts(operator: OperatorInfo, roster: FleetRoster) -> Self {
@@ -95,6 +100,7 @@ impl FleetRosterView {
                 .collect(),
             selected: 0,
             detail_scroll: 0,
+            locale: Locale::En,
         }
     }
 
@@ -128,7 +134,7 @@ impl FleetRosterView {
         vec![
             ActionHint::new("↑/↓", "select"),
             ActionHint::new("s/Enter", "setup"),
-            ActionHint::new("w", "workers"),
+            ActionHint::new("w", tr(self.locale, MessageId::FleetRosterWorkers)),
             ActionHint::new("PgUp/PgDn", "scroll detail"),
             ActionHint::new("Esc", "close"),
         ]
@@ -205,16 +211,23 @@ impl ModalView for FleetRosterView {
         let header = vec![
             Line::from(vec![
                 Span::styled(
-                    "─ fleet ",
+                    format!("─ {} ", tr(self.locale, MessageId::FleetRosterHeaderLabel)),
                     Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
                 ),
                 Span::styled(
                     "──────────────────────── ",
                     Style::default().fg(palette::BORDER_COLOR),
                 ),
-                Span::styled("roster", Style::default().fg(palette::WHALE_INFO).bold()),
                 Span::styled(
-                    "  setup  workers ",
+                    tr(self.locale, MessageId::FleetRosterTabRoster),
+                    Style::default().fg(palette::WHALE_INFO).bold(),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}  {} ",
+                        tr(self.locale, MessageId::FleetRosterTabSetup),
+                        tr(self.locale, MessageId::FleetRosterWorkers)
+                    ),
                     Style::default().fg(palette::TEXT_MUTED),
                 ),
                 Span::styled("─".repeat(24), Style::default().fg(palette::BORDER_COLOR)),
@@ -222,11 +235,18 @@ impl ModalView for FleetRosterView {
             Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    format!("  {} members", self.members.len() + 1),
+                    format!(
+                        "  {}",
+                        tr(self.locale, MessageId::FleetRosterMembersCount)
+                            .replace("{count}", &(self.members.len() + 1).to_string())
+                    ),
                     Style::default().fg(palette::TEXT_SECONDARY),
                 ),
                 Span::styled(
-                    " · operator first · resolved routes",
+                    format!(
+                        " · {}",
+                        tr(self.locale, MessageId::FleetRosterOperatorFirst)
+                    ),
                     Style::default().fg(palette::TEXT_MUTED),
                 ),
             ]),
@@ -286,7 +306,11 @@ impl FleetRosterView {
             let pointer = if is_selected { "▸ " } else { "  " };
             let (text, base_style) = if idx == 0 {
                 (
-                    format!("{pointer}@ operator  {}", self.operator.model),
+                    format!(
+                        "{pointer}@ {}  {}",
+                        tr(self.locale, MessageId::FleetRosterOperatorRow),
+                        self.operator.model
+                    ),
                     Style::default()
                         .fg(palette::WHALE_ACCENT_PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -540,6 +564,7 @@ mod tests {
             members,
             selected: 0,
             detail_scroll: 0,
+            locale: Locale::En,
         }
     }
 

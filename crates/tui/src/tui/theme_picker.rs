@@ -20,6 +20,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette::{SELECTABLE_THEMES, ThemeId, UiTheme};
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
@@ -40,19 +41,26 @@ pub struct ThemePickerView {
     ocean_treatment: crate::tui::ocean::OceanTreatment,
     row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     last_mouse_selected: Option<usize>,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 impl ThemePickerView {
     #[cfg(test)]
     #[must_use]
     pub fn new(original_name: String) -> Self {
-        Self::new_with_treatment(original_name, crate::tui::ocean::OceanTreatment::Ombre)
+        Self::new_with_treatment(
+            original_name,
+            crate::tui::ocean::OceanTreatment::Ombre,
+            Locale::En,
+        )
     }
 
     #[must_use]
     pub fn new_with_treatment(
         original_name: String,
         ocean_treatment: crate::tui::ocean::OceanTreatment,
+        locale: Locale,
     ) -> Self {
         // If the persisted name matches one of the entries, start there;
         // otherwise fall back to "System" so the cursor lands on a valid row.
@@ -67,6 +75,7 @@ impl ThemePickerView {
             ocean_treatment,
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
+            locale,
         }
     }
 
@@ -212,7 +221,8 @@ impl ModalView for ThemePickerView {
         // after Enter. We keep the live `surface_bg` (not the shared ink) and
         // the bare `Clear` so the preview backdrop reads as intended.
         let live = self.ui_theme_for(self.current());
-        let inner = render_underwater_surface(area, buf, "theme · live preview");
+        let inner =
+            render_underwater_surface(area, buf, tr(self.locale, MessageId::ThemeSurfaceTitle));
 
         let content = render_modal_footer(
             inner,
@@ -232,11 +242,11 @@ impl ModalView for ThemePickerView {
         lines.push(Line::from(""));
 
         let treatment = if matches!(self.current(), ThemeId::Terminal) {
-            "Treatment  Ombre unavailable — Terminal owns the background"
+            tr(self.locale, MessageId::ThemeTreatmentOmbreUnavailable)
         } else if self.ocean_treatment.is_flat() {
-            "Treatment  Flat — active"
+            tr(self.locale, MessageId::ThemeTreatmentFlatActive)
         } else {
-            "Treatment  Ombre — active"
+            tr(self.locale, MessageId::ThemeTreatmentOmbreActive)
         };
         lines.push(Line::from(Span::styled(
             treatment,
@@ -507,6 +517,7 @@ mod tests {
         let flat = ThemePickerView::new_with_treatment(
             "dark".to_string(),
             crate::tui::ocean::OceanTreatment::Flat,
+            Locale::En,
         );
         let mut flat_buf = ratatui::buffer::Buffer::empty(area);
         flat.render(area, &mut flat_buf);
@@ -520,6 +531,7 @@ mod tests {
         let terminal = ThemePickerView::new_with_treatment(
             "terminal".to_string(),
             crate::tui::ocean::OceanTreatment::Ombre,
+            Locale::En,
         );
         let mut terminal_buf = ratatui::buffer::Buffer::empty(area);
         terminal.render(area, &mut terminal_buf);

@@ -6,6 +6,8 @@
 //! one place prevents the default UI from drifting back into a header +
 //! sidebar + dashboard + footer composition with four owners for one fact.
 
+use std::borrow::Cow;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
@@ -16,8 +18,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::tui::{
     app::{App, AppMode},
+    approval::ApprovalMode,
     views::ModalKind,
 };
 
@@ -30,12 +34,12 @@ pub enum ShellTier {
     Wide,
 }
 
-const LAUNCH_ROWS: [(&str, &str); 5] = [
-    ("New session", "Enter"),
-    ("New worktree", "Ctrl+N"),
-    ("Resume session", "Ctrl+R"),
-    ("Changelog", "Ctrl+L"),
-    ("Quit", "Ctrl+Q"),
+const LAUNCH_ROWS: [(MessageId, &str); 5] = [
+    (MessageId::LaunchMenuNewSession, "Enter"),
+    (MessageId::LaunchMenuNewWorktree, "Ctrl+N"),
+    (MessageId::LaunchMenuResumeSession, "Ctrl+R"),
+    (MessageId::LaunchMenuChangelog, "Ctrl+L"),
+    (MessageId::LaunchMenuQuit, "Ctrl+Q"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +55,11 @@ pub enum LaunchAction {
 /// Translate launch-menu input into one product action. Direct reliable keys
 /// and row navigation share this path, so the printed key column cannot drift
 /// away from the handler.
-pub fn handle_launch_key(launch: &mut crate::tui::app::LaunchState, key: KeyEvent) -> LaunchAction {
+pub fn handle_launch_key(
+    launch: &mut crate::tui::app::LaunchState,
+    key: KeyEvent,
+    locale: Locale,
+) -> LaunchAction {
     if let Some(input) = launch.worktree_input.as_mut() {
         return match key.code {
             KeyCode::Esc => {
@@ -113,12 +121,11 @@ pub fn handle_launch_key(launch: &mut crate::tui::app::LaunchState, key: KeyEven
         0 => LaunchAction::NewSession,
         1 if launch.worktree_available => {
             launch.worktree_input = Some(String::new());
-            launch.status =
-                Some("Name the branch/worktree, or press Enter for an automatic name.".to_string());
+            launch.status = Some(tr(locale, MessageId::LaunchWorktreePrompt).into_owned());
             LaunchAction::None
         }
         1 => {
-            launch.status = Some("New worktree requires a Git repository.".to_string());
+            launch.status = Some(tr(locale, MessageId::LaunchWorktreeNeedsGit).into_owned());
             LaunchAction::None
         }
         2 => LaunchAction::Resume,
@@ -216,14 +223,14 @@ impl ShellPhase {
     }
 
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: Locale) -> Cow<'static, str> {
         match self {
-            Self::Idle => "idle",
-            Self::Typing => "draft",
-            Self::Working => "working",
-            Self::Waiting | Self::Approval => "waiting on you",
-            Self::Done => "done",
-            Self::Failed => "failed",
+            Self::Idle => tr(locale, MessageId::PhaseIdle),
+            Self::Typing => tr(locale, MessageId::PhaseDraft),
+            Self::Working => tr(locale, MessageId::PhaseWorking),
+            Self::Waiting | Self::Approval => tr(locale, MessageId::PhaseWaitingOnYou),
+            Self::Done => tr(locale, MessageId::PhaseDone),
+            Self::Failed => tr(locale, MessageId::PhaseFailed),
         }
     }
 
@@ -248,10 +255,11 @@ fn completion_elapsed_ms(app: &App) -> Option<u128> {
         .filter(|elapsed| *elapsed < COMPLETION_BREATH_MS)
 }
 
-fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, &'static str) {
+fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, Cow<'static, str>) {
+    let locale = app.ui_locale;
     match phase {
-        ShellPhase::Idle => ("·", phase.label()),
-        ShellPhase::Typing => ("›", phase.label()),
+        ShellPhase::Idle => ("·", phase.label(locale)),
+        ShellPhase::Typing => ("›", phase.label(locale)),
         ShellPhase::Working => {
             let frame = if app.low_motion || !app.fancy_animations {
                 WORKING_BUBBLE_FRAMES[4]
@@ -263,43 +271,48 @@ fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, &'static str) {
                 let index = (elapsed.as_millis() / 300) as usize % WORKING_BUBBLE_FRAMES.len();
                 WORKING_BUBBLE_FRAMES[index]
             };
-            (frame, phase.label())
+            (frame, phase.label(locale))
         }
-        ShellPhase::Waiting | ShellPhase::Approval => ("◆", phase.label()),
+        ShellPhase::Waiting | ShellPhase::Approval => ("◆", phase.label(locale)),
         ShellPhase::Done => match completion_elapsed_ms(app) {
             Some(elapsed) if elapsed < COMPLETION_RELEASE_MS => {
                 let index = ((elapsed / 140) as usize + 4).min(WORKING_BUBBLE_FRAMES.len() - 1);
-                (WORKING_BUBBLE_FRAMES[index], "finishing")
+                (
+                    WORKING_BUBBLE_FRAMES[index],
+                    tr(locale, MessageId::PhaseFinishing),
+                )
             }
-            _ => ("✓", phase.label()),
+            _ => ("✓", phase.label(locale)),
         },
-        ShellPhase::Failed => ("✕", phase.label()),
+        ShellPhase::Failed => ("✕", phase.label(locale)),
     }
 }
 
-fn mode_label(mode: AppMode) -> &'static str {
+fn mode_label(locale: Locale, mode: AppMode) -> Cow<'static, str> {
     match mode {
-        AppMode::Agent | AppMode::Auto | AppMode::Yolo => "act",
-        AppMode::Plan => "plan",
-        AppMode::Operate => "operate",
+        AppMode::Agent | AppMode::Auto | AppMode::Yolo => tr(locale, MessageId::ChipModeAct),
+        AppMode::Plan => tr(locale, MessageId::ChipModePlan),
+        AppMode::Operate => tr(locale, MessageId::ChipModeOperate),
     }
 }
 
-fn permission_label(app: &App) -> &'static str {
+/// Permission chip words. This maps from the typed [`ApprovalMode`] state —
+/// never from the English `permission_chip_label()` strings — so localizing
+/// (or rewording) the upstream chip labels can never silently break the chip.
+fn permission_label(app: &App) -> Cow<'static, str> {
+    let locale = app.ui_locale;
     if app.mode == AppMode::Plan {
-        "read only"
-    } else {
-        match app.approval_mode.permission_chip_label() {
-            "Ask" => "ask",
-            "Auto-Review" => "auto",
-            // Keep the effective permission explicit. `bypass` is an
-            // implementation detail and, more importantly, can imply that
-            // repository law no longer applies. Full Access never bypasses
-            // constitution rules.
-            "Full Access" => "Full Access",
-            "Never" => "never",
-            _ => "ask",
-        }
+        return tr(locale, MessageId::ChipPermissionReadOnly);
+    }
+    match app.approval_mode {
+        ApprovalMode::Suggest => tr(locale, MessageId::ChipPermissionAsk),
+        ApprovalMode::Auto => tr(locale, MessageId::ChipPermissionAuto),
+        // Keep the effective permission explicit. `bypass` is an
+        // implementation detail and, more importantly, can imply that
+        // repository law no longer applies. Full Access never bypasses
+        // constitution rules.
+        ApprovalMode::Bypass => tr(locale, MessageId::ChipPermissionFullAccess),
+        ApprovalMode::Never => tr(locale, MessageId::ChipPermissionNever),
     }
 }
 
@@ -393,18 +406,25 @@ pub fn render_launch_screen(area: Rect, buf: &mut Buffer, app: &App) {
     }
 
     let rows_start = if area.height >= 16 { 4 } else { 3 };
-    for (index, (base_label, key)) in LAUNCH_ROWS.iter().enumerate() {
+    for (index, (label_id, key)) in LAUNCH_ROWS.iter().enumerate() {
         let y = rows_start + u16::try_from(index).unwrap_or(0);
         if y >= area.height.saturating_sub(3) {
             break;
         }
         let selected = app.launch.selected == index;
-        let mut label = (*base_label).to_string();
+        let mut label = tr(app.ui_locale, *label_id).into_owned();
         if index == 1 && !app.launch.worktree_available {
-            label.push_str(" · unavailable");
+            label.push_str(&format!(
+                " · {}",
+                tr(app.ui_locale, MessageId::LaunchMenuUnavailable)
+            ));
         }
         if index == 2 {
-            label.push_str(&format!(" · {} saved", app.launch.workspace_session_count));
+            label.push_str(&format!(
+                " · {}",
+                tr(app.ui_locale, MessageId::LaunchMenuSavedCount)
+                    .replace("{count}", &app.launch.workspace_session_count.to_string())
+            ));
         }
         let prefix = if selected { "  ▸ " } else { "    " };
         let key_width = key.width();
@@ -448,16 +468,21 @@ pub fn render_launch_screen(area: Rect, buf: &mut Buffer, app: &App) {
     );
     let prompt = if let Some(input) = app.launch.worktree_input.as_deref() {
         format!(
-            "worktree name  {}{}",
+            "{}  {}{}",
+            tr(app.ui_locale, MessageId::LaunchWorktreeNameLabel),
             input,
             if app.low_motion { "_" } else { "▌" }
         )
     } else if let Some(status) = app.launch.status.as_deref() {
         status.to_string()
     } else if area.width < 60 {
-        "j/k:move · Enter:open".to_string()
+        format!(
+            "j/k:{} · Enter:{}",
+            tr(app.ui_locale, MessageId::LaunchHintMove),
+            tr(app.ui_locale, MessageId::LaunchHintOpen)
+        )
     } else {
-        "Tip: -w <path> opens a workspace; -r <session-id> resumes directly".to_string()
+        tr(app.ui_locale, MessageId::LaunchTipFlags).into_owned()
     };
     render_launch_line(
         area,
@@ -473,16 +498,17 @@ pub fn render_launch_screen(area: Rect, buf: &mut Buffer, app: &App) {
         )],
     );
 
+    let saved_sessions = if app.launch.workspace_session_count == 1 {
+        tr(app.ui_locale, MessageId::LaunchSavedSessionSingular).into_owned()
+    } else {
+        tr(app.ui_locale, MessageId::LaunchSavedSessionsPlural)
+            .replace("{count}", &app.launch.workspace_session_count.to_string())
+    };
     let status = format!(
-        "{} · {} · {} saved session{}",
+        "{} · {} · {}",
         app.model_display_label(),
-        mode_label(app.mode),
-        app.launch.workspace_session_count,
-        if app.launch.workspace_session_count == 1 {
-            ""
-        } else {
-            "s"
-        }
+        mode_label(app.ui_locale, app.mode),
+        saved_sessions
     );
     render_launch_line(
         area,
@@ -530,7 +556,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         ),
         Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
         Span::styled(
-            mode_label(app.mode),
+            mode_label(app.ui_locale, app.mode),
             Style::default().fg(match app.mode {
                 AppMode::Plan => app.ui_theme.mode_plan,
                 AppMode::Operate => app.ui_theme.mode_operate,
@@ -553,7 +579,8 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     let mut right = Vec::new();
     if tier == ShellTier::Wide && running_agents > 0 {
         right.push(Span::styled(
-            format!("agents {running_agents}"),
+            tr(app.ui_locale, MessageId::FooterAgentsPlural)
+                .replace("{count}", &running_agents.to_string()),
             Style::default().fg(app.ui_theme.text_muted),
         ));
         right.push(Span::styled(
@@ -605,7 +632,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
             ),
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
             Span::styled(
-                mode_label(app.mode),
+                mode_label(app.ui_locale, app.mode),
                 Style::default().fg(app.ui_theme.accent_primary),
             ),
         ];
@@ -660,12 +687,13 @@ pub fn render_footer(area: Rect, buf: &mut Buffer, app: &mut App) {
     let mut left = vec![
         Span::styled(marker, phase_style),
         Span::raw(" "),
-        Span::styled(phase_label, phase_style),
+        Span::styled(phase_label.clone(), phase_style),
     ];
     if tier != ShellTier::Compact
         && phase != ShellPhase::Done
-        && let Some(toast) = status_toast
-            .filter(|toast| !toast.text.trim().is_empty() && toast.text.trim() != phase_label)
+        && let Some(toast) = status_toast.filter(|toast| {
+            !toast.text.trim().is_empty() && toast.text.trim() != phase_label.as_ref()
+        })
     {
         left.push(Span::styled(
             " · ",
@@ -688,10 +716,15 @@ pub fn render_footer(area: Rect, buf: &mut Buffer, app: &mut App) {
         ));
     }
 
+    let hint_keys = tr(app.ui_locale, MessageId::FooterHintKeys);
+    let hint_output = tr(app.ui_locale, MessageId::FooterHintOutput);
+    let hint_context = tr(app.ui_locale, MessageId::FooterHintContext);
     let right_text = match tier {
-        ShellTier::Compact => "Alt+?:keys",
-        ShellTier::Normal => "v:output · Alt+?:keys",
-        ShellTier::Wide => "v:output · Alt+C:context · Alt+?:keys",
+        ShellTier::Compact => format!("Alt+?:{hint_keys}"),
+        ShellTier::Normal => format!("v:{hint_output} · Alt+?:{hint_keys}"),
+        ShellTier::Wide => {
+            format!("v:{hint_output} · Alt+C:{hint_context} · Alt+?:{hint_keys}")
+        }
     };
     let right_width = right_text.width();
     let available = usize::from(area.width);
@@ -737,12 +770,16 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         app.workspace_context.as_deref(),
     );
     let workspace = crate::utils::display_path(&app.workspace);
-    let branch = identity.branch.as_deref().unwrap_or("no git");
+    let branch = identity.branch.as_deref().map_or_else(
+        || tr(app.ui_locale, MessageId::EmptyStateNoGit),
+        |branch| Cow::Owned(branch.to_string()),
+    );
     let context = if tier == ShellTier::Compact {
         format!("codewhale · {branch}")
     } else {
         format!(
-            "codewhale · {workspace} · {branch} · mcp {}",
+            "codewhale · {workspace} · {branch} · {} {}",
+            tr(app.ui_locale, MessageId::EmptyStateMcpLabel),
             app.mcp_configured_count
         )
     };
@@ -754,11 +791,12 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     )));
     if area.height >= 6 {
         lines.push(Line::from(""));
-        let fleet = if tier == ShellTier::Compact {
-            "Fleet  /fleet setup"
+        let fleet_label = if tier == ShellTier::Compact {
+            tr(app.ui_locale, MessageId::EmptyStateFleetLabel)
         } else {
-            "Fleet setup  /fleet setup"
+            tr(app.ui_locale, MessageId::EmptyStateFleetSetupLabel)
         };
+        let fleet = format!("{fleet_label}  /fleet setup");
         let inset = " ".repeat(width.saturating_sub(fleet.width()) / 2);
         lines.push(Line::from(Span::styled(
             format!("{inset}{fleet}"),
@@ -881,14 +919,16 @@ mod tests {
         assert_eq!(
             handle_launch_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Locale::En,
             ),
             LaunchAction::NewSession
         );
         assert_eq!(
             handle_launch_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                Locale::En,
             ),
             LaunchAction::Resume
         );
@@ -897,7 +937,8 @@ mod tests {
         assert_eq!(
             handle_launch_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+                Locale::En,
             ),
             LaunchAction::Changelog
         );
@@ -910,7 +951,8 @@ mod tests {
         assert_eq!(
             handle_launch_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                Locale::En,
             ),
             LaunchAction::None
         );
@@ -918,7 +960,8 @@ mod tests {
             assert_eq!(
                 handle_launch_key(
                     &mut state,
-                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                    Locale::En,
                 ),
                 LaunchAction::None
             );
@@ -926,7 +969,8 @@ mod tests {
         assert_eq!(
             handle_launch_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Locale::En,
             ),
             LaunchAction::CreateWorktree("repair-pty".to_string())
         );
@@ -939,7 +983,8 @@ mod tests {
         assert_eq!(
             handle_launch_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                Locale::En,
             ),
             LaunchAction::None
         );
@@ -969,17 +1014,15 @@ mod tests {
 
         app.runtime_turn_status = None;
         app.plan_prompt_pending = true;
-        assert_eq!(
-            phase_marker(&app, ShellPhase::from_app(&app)),
-            ("◆", "waiting on you")
-        );
+        let (marker, label) = phase_marker(&app, ShellPhase::from_app(&app));
+        assert_eq!(marker, "◆");
+        assert_eq!(label, "waiting on you");
 
         app.plan_prompt_pending = false;
         app.runtime_turn_status = Some("failed".to_string());
-        assert_eq!(
-            phase_marker(&app, ShellPhase::from_app(&app)),
-            ("✕", "failed")
-        );
+        let (marker, label) = phase_marker(&app, ShellPhase::from_app(&app));
+        assert_eq!(marker, "✕");
+        assert_eq!(label, "failed");
     }
 
     #[test]
@@ -995,10 +1038,14 @@ mod tests {
         assert_eq!(label, "finishing");
 
         app.ocean_completion_started_at = Some(Instant::now() - Duration::from_millis(700));
-        assert_eq!(phase_marker(&app, ShellPhase::Done), ("✓", "done"));
+        let (marker, label) = phase_marker(&app, ShellPhase::Done);
+        assert_eq!(marker, "✓");
+        assert_eq!(label, "done");
 
         app.low_motion = true;
         app.ocean_completion_started_at = Some(Instant::now());
-        assert_eq!(phase_marker(&app, ShellPhase::Done), ("✓", "done"));
+        let (marker, label) = phase_marker(&app, ShellPhase::Done);
+        assert_eq!(marker, "✓");
+        assert_eq!(label, "done");
     }
 }

@@ -3190,9 +3190,7 @@ impl App {
             self.status_message = Some(format!("Failed to save feature-intro flag: {err}"));
             // Still show the nudge; the flag write may simply retry next launch.
         }
-        self.status_message = Some(
-            "Fleet is ready · /fleet opens roles · /fleet setup customizes routes".to_string(),
-        );
+        self.status_message = Some(self.tr(MessageId::FleetReadyNotice).into_owned());
         self.needs_redraw = true;
     }
 
@@ -4298,6 +4296,7 @@ impl App {
                     .or_else(|| workflow_id.clone())
                     .unwrap_or_else(|| "workflow".to_string());
                 let mut panel = WorkflowPanel::new(run_id.clone(), label, *at_ms);
+                panel.locale = self.ui_locale;
                 panel.budget_total = *token_budget;
                 panel.budget_remaining = *token_budget;
                 self.workflow_panel = Some(panel);
@@ -4306,6 +4305,7 @@ impl App {
                 // No panel yet and event is not a start — seed a shell panel
                 // so late events still surface rather than being dropped.
                 let mut panel = WorkflowPanel::new("workflow", "workflow", 0);
+                panel.locale = self.ui_locale;
                 panel.apply_event(event);
                 self.workflow_panel = Some(panel);
             }

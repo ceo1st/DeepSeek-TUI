@@ -972,7 +972,8 @@ impl Renderable for ComposerWidget<'_> {
                 ]))
             } else if !self.slash_menu_entries.is_empty() {
                 Some(Line::from(Span::styled(
-                    " enter:run · tab:complete · ↑↓:select · esc:keep typing ",
+                    self.app
+                        .tr(crate::localization::MessageId::ComposerSlashMenuHint),
                     Style::default().fg(self.app.ui_theme.text_hint),
                 )))
             } else if !input_text.trim().is_empty() {
@@ -1519,7 +1520,7 @@ impl<'a> ApprovalWidget<'a> {
                 format!(
                     " {} ",
                     if repo_law {
-                        Cow::Borrowed("REPO LAW")
+                        tr(locale, MessageId::ApprovalRepoLawBadge)
                     } else {
                         stakes_badge_text(stakes, locale)
                     }
@@ -1532,7 +1533,11 @@ impl<'a> ApprovalWidget<'a> {
             Span::raw("  "),
             Span::styled(
                 if repo_law {
-                    format!("Repository constitution · {}", self.request.tool_name)
+                    format!(
+                        "{} · {}",
+                        tr(locale, MessageId::ApprovalRepoLawTitle),
+                        self.request.tool_name
+                    )
                 } else {
                     self.request.tool_name.clone()
                 },
@@ -1552,7 +1557,7 @@ impl<'a> ApprovalWidget<'a> {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    "Repository law requires confirmation — even in Full Access.",
+                    tr(locale, MessageId::ApprovalRepoLawWarning),
                     Style::default()
                         .fg(palette::WHALE_ERROR)
                         .add_modifier(Modifier::BOLD),
@@ -1560,7 +1565,10 @@ impl<'a> ApprovalWidget<'a> {
             ]));
             body.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("Rule  ", Style::default().fg(palette::TEXT_HINT)),
+                Span::styled(
+                    tr(locale, MessageId::ApprovalRepoLawRuleLabel),
+                    Style::default().fg(palette::TEXT_HINT),
+                ),
                 Span::styled(
                     self.request.description.clone(),
                     Style::default().fg(palette::TEXT_SECONDARY),
@@ -1758,12 +1766,12 @@ impl Renderable for ApprovalWidget<'_> {
             let summary = format!(
                 " {} — {}  [Tab to expand] ",
                 if repo_law {
-                    "Repository constitution"
+                    tr(self.view.locale(), MessageId::ApprovalRepoLawTitle)
                 } else {
-                    self.request.tool_name.as_str()
+                    Cow::Borrowed(self.request.tool_name.as_str())
                 },
                 if repo_law {
-                    Cow::Borrowed("REPO LAW")
+                    tr(self.view.locale(), MessageId::ApprovalRepoLawBadge)
                 } else {
                     stakes_badge_text(stakes, self.view.locale())
                 },

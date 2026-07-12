@@ -9,7 +9,7 @@ use std::fmt::Write;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::localization::Locale;
+use crate::localization::{Locale, MessageId, tr};
 use crate::tui::app::HuntVerdict;
 
 use ratatui::{
@@ -218,11 +218,21 @@ fn render_compact_top_work_strip(
             task.status.as_str(),
             "running" | "queued" | "waiting" | "needs_user"
         );
-        let controls = if stoppable { " open stop" } else { " open" };
-        let prefix = format!("Tasks {} · ", app.task_panel.len());
+        let open_word = tr(app.ui_locale, MessageId::SidebarOpenControl);
+        let stop_word = tr(app.ui_locale, MessageId::SidebarStopControl);
+        let controls = if stoppable {
+            format!(" {open_word} {stop_word}")
+        } else {
+            format!(" {open_word}")
+        };
+        let prefix = format!(
+            "{} {} · ",
+            tr(app.ui_locale, MessageId::SidebarTasksLabel),
+            app.task_panel.len()
+        );
         let label_width = usize::from(area.width)
             .saturating_sub(
-                UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(controls),
+                UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(controls.as_str()),
             )
             .max(1);
         let label = truncate_line_to_width(&task.prompt_summary, label_width);
@@ -232,7 +242,7 @@ fn render_compact_top_work_strip(
             Style::default().fg(app.ui_theme.text_body),
         )));
         let (show, stop) = background_task_click_actions(task);
-        let stop_width = UnicodeWidthStr::width("stop");
+        let stop_width = UnicodeWidthStr::width(stop_word.as_ref());
         let visible_width = UnicodeWidthStr::width(text.as_str()).min(area.width as usize);
         let stop_action = stoppable.then_some(SidebarRowAction::PrefillCommand(stop));
         let stop_zone_start_col = stop_action.as_ref().map(|_| {
@@ -259,7 +269,11 @@ fn render_compact_top_work_strip(
             .iter()
             .filter(|candidate| candidate.status == TodoStatus::Completed)
             .count();
-        let prefix = format!("To-do {completed}/{} · ", summary.checklist_items.len());
+        let prefix = format!(
+            "{} {completed}/{} · ",
+            tr(app.ui_locale, MessageId::SidebarTodoLabel),
+            summary.checklist_items.len()
+        );
         let label = truncate_line_to_width(
             &item.content,
             usize::from(area.width)
@@ -306,9 +320,10 @@ fn render_top_tasks(f: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .any(|task| matches!(task.status.as_str(), "waiting" | "needs_user"));
     let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let tasks_label = tr(app.ui_locale, MessageId::SidebarTasksLabel);
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            "▾ Tasks",
+            format!("▾ {tasks_label}"),
             Style::default().fg(app.ui_theme.accent_primary).bold(),
         ),
         Span::styled(
@@ -317,7 +332,7 @@ fn render_top_tasks(f: &mut Frame, area: Rect, app: &mut App) {
         ),
     ])];
     let mut hover_rows = Vec::new();
-    let mut hover_lines = vec!["Tasks".to_string()];
+    let mut hover_lines = vec![tasks_label.into_owned()];
     for (visible_index, task) in tasks.into_iter().take(2).enumerate() {
         let (mark, mark_color, label_color) = match task.status.as_str() {
             "waiting" | "needs_user" => ("◆", app.ui_theme.error_fg, app.ui_theme.error_fg),
@@ -344,16 +359,18 @@ fn render_top_tasks(f: &mut Frame, area: Rect, app: &mut App) {
         let duration = task.duration_ms.map(format_duration_ms).unwrap_or_default();
         let duration_width = UnicodeWidthStr::width(duration.as_str());
         let stoppable = matches!(task.status.as_str(), "running" | "waiting" | "needs_user");
+        let open_word = tr(app.ui_locale, MessageId::SidebarOpenControl);
+        let stop_word = tr(app.ui_locale, MessageId::SidebarStopControl);
         let controls = if area.width < 60 && stoppable {
-            " open stop"
+            format!(" {open_word} {stop_word}")
         } else if area.width < 60 {
-            " open"
+            format!(" {open_word}")
         } else if stoppable {
-            " [↗ open] [× stop]"
+            format!(" [↗ {open_word}] [× {stop_word}]")
         } else {
-            " [↗ open]"
+            format!(" [↗ {open_word}]")
         };
-        let controls_width = UnicodeWidthStr::width(controls);
+        let controls_width = UnicodeWidthStr::width(controls.as_str());
         let summary_width = width
             .saturating_sub(3 + UnicodeWidthStr::width(mark) + duration_width + controls_width + 2)
             .max(1);
@@ -378,8 +395,12 @@ fn render_top_tasks(f: &mut Frame, area: Rect, app: &mut App) {
         let display_text = spans_to_text(&line.spans);
         let (show, stop) = background_task_click_actions(task);
         let display_width = UnicodeWidthStr::width(display_text.as_str());
-        let stop_label = if area.width < 60 { "stop" } else { "[× stop]" };
-        let stop_width = UnicodeWidthStr::width(stop_label);
+        let stop_label = if area.width < 60 {
+            stop_word.clone().into_owned()
+        } else {
+            format!("[× {stop_word}]")
+        };
+        let stop_width = UnicodeWidthStr::width(stop_label.as_str());
         let visible_width = display_width.min(area.width as usize);
         let stop_action = stoppable.then_some(SidebarRowAction::PrefillCommand(stop));
         let stop_zone_start_col = stop_action.as_ref().map(|_| {

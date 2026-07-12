@@ -15,6 +15,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::session_manager::{
     SavedSession, SessionManager, SessionMetadata, extract_title, extract_user_prompt,
@@ -77,13 +78,15 @@ pub struct SessionPickerView {
     /// Screen rows owned by the visible session list. Keeping this local to
     /// the view gives mouse and keyboard the same selection/resume contract.
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
+    /// UI locale captured from the app at construction (#4057 wave 2).
+    locale: Locale,
 }
 
 impl SessionPickerView {
     /// Construct a picker scoped to `workspace`. Sessions belonging to
     /// other workspaces are hidden by default — press `a` inside the
     /// picker to expand to all workspaces (#1395).
-    pub fn new(workspace: &Path) -> Self {
+    pub fn new(workspace: &Path, locale: Locale) -> Self {
         let sessions = SessionManager::default_location()
             .and_then(|manager| manager.list_sessions())
             .unwrap_or_default();
@@ -109,6 +112,7 @@ impl SessionPickerView {
             workspace_scope: Some(canonical_or_self(workspace.to_path_buf())),
             show_all_workspaces: false,
             last_row_hitboxes: RefCell::new(Vec::new()),
+            locale,
         };
         view.apply_sort_and_filter();
         view.refresh_preview();
@@ -131,11 +135,11 @@ impl SessionPickerView {
     pub fn toggle_all_workspaces(&mut self) {
         self.show_all_workspaces = !self.show_all_workspaces;
         let label = if self.show_all_workspaces {
-            "showing sessions from every workspace"
+            tr(self.locale, MessageId::SessionsShowingAllWorkspaces)
         } else {
-            "scoped to this workspace"
+            tr(self.locale, MessageId::SessionsScopedToWorkspace)
         };
-        self.status = Some(label.to_string());
+        self.status = Some(label.into_owned());
         self.selected = 0;
         self.apply_sort_and_filter();
     }
@@ -549,12 +553,12 @@ impl ModalView for SessionPickerView {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.rename_mode = true;
                 self.rename_input.clear();
-                self.status = Some("New title: ".to_string());
+                self.status = Some(tr(self.locale, MessageId::SessionsNewTitlePrompt).into_owned());
                 ViewAction::None
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 self.confirm_delete = true;
-                self.status = Some("Delete session? (y/n)".to_string());
+                self.status = Some(tr(self.locale, MessageId::SessionsDeletePrompt).into_owned());
                 ViewAction::None
             }
             KeyCode::Char(c) if self.select_visible_shortcut(c) => ViewAction::None,
@@ -572,15 +576,16 @@ impl ModalView for SessionPickerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let surface = render_underwater_surface(area, buf, "sessions");
+        let surface =
+            render_underwater_surface(area, buf, tr(self.locale, MessageId::SessionsSurfaceTitle));
         let full_hints = [
-            ActionHint::new("Enter", "resume"),
-            ActionHint::new("/", "search"),
-            ActionHint::new("s", "sort"),
-            ActionHint::new("r", "rename"),
-            ActionHint::new("a", "all workspaces"),
-            ActionHint::new("d", "delete"),
-            ActionHint::new("Esc", "close"),
+            ActionHint::new("Enter", tr(self.locale, MessageId::SessionsActionResume)),
+            ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
+            ActionHint::new("s", tr(self.locale, MessageId::SessionsActionSort)),
+            ActionHint::new("r", tr(self.locale, MessageId::SessionsActionRename)),
+            ActionHint::new("a", tr(self.locale, MessageId::SessionsActionAllWorkspaces)),
+            ActionHint::new("d", tr(self.locale, MessageId::SessionsActionDelete)),
+            ActionHint::new("Esc", tr(self.locale, MessageId::SessionsActionClose)),
         ];
         // The two bordered panes spend five rows on chrome before either can
         // show a content row. When the body cannot afford that, this room
@@ -593,9 +598,9 @@ impl ModalView for SessionPickerView {
                 surface,
                 buf,
                 &[
-                    ActionHint::new("Enter", "resume"),
-                    ActionHint::new("/", "search"),
-                    ActionHint::new("Esc", "close"),
+                    ActionHint::new("Enter", tr(self.locale, MessageId::SessionsActionResume)),
+                    ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
+                    ActionHint::new("Esc", tr(self.locale, MessageId::SessionsActionClose)),
                 ],
             );
             let header_rows = 1 + usize::from(self.confirm_delete || self.status.is_some());
@@ -626,6 +631,7 @@ impl ModalView for SessionPickerView {
                 self.rename_mode,
                 &self.rename_input,
                 self.status.as_deref(),
+                self.locale,
             );
             *self.last_row_hitboxes.borrow_mut() = (0..visible_rows)
                 .filter_map(|row| {
@@ -664,7 +670,7 @@ impl ModalView for SessionPickerView {
             (chunks[0], chunks[1])
         };
 
-        let list_block = section_block(" sessions (1-9) ");
+        let list_block = section_block(&tr(self.locale, MessageId::SessionsPaneTitle));
         let list_inner = list_block.inner(list_area);
         let header_rows = 1 + usize::from(self.confirm_delete || self.status.is_some());
         let footer_rows = usize::from(!self.filtered.is_empty());
@@ -696,6 +702,7 @@ impl ModalView for SessionPickerView {
             self.rename_mode,
             &self.rename_input,
             self.status.as_deref(),
+            self.locale,
         );
         *self.last_row_hitboxes.borrow_mut() = (0..visible_rows)
             .filter_map(|row| {
@@ -713,7 +720,7 @@ impl ModalView for SessionPickerView {
             .wrap(Wrap { trim: false })
             .render(list_content, buf);
 
-        let history_block = section_block(" history (PgUp/PgDn) ");
+        let history_block = section_block(&tr(self.locale, MessageId::SessionsHistoryPaneTitle));
         let history_inner = history_block.inner(history_area);
         self.update_history_viewport(history_inner.height as usize);
         history_block.render(history_area, buf);
@@ -752,14 +759,18 @@ fn build_list_lines(
     rename_mode: bool,
     rename_input: &str,
     status: Option<&str>,
+    locale: Locale,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let header = if search_mode {
         format!("/{search_input}")
     } else if rename_mode {
-        format!("New title: {rename_input}_")
+        format!(
+            "{}{rename_input}_",
+            tr(locale, MessageId::SessionsNewTitlePrompt)
+        )
     } else {
-        format!("scope and sort · {sort_label}")
+        tr(locale, MessageId::SessionsScopeSortHeader).replace("{sort}", sort_label)
     };
     lines.push(Line::from(Span::styled(
         truncate(&header, width),
@@ -768,7 +779,7 @@ fn build_list_lines(
 
     if confirm_delete {
         lines.push(Line::from(Span::styled(
-            "Confirm delete (y/n)",
+            tr(locale, MessageId::SessionsConfirmDelete),
             Style::default()
                 .fg(palette::STATUS_WARNING)
                 .add_modifier(Modifier::BOLD),
@@ -782,11 +793,11 @@ fn build_list_lines(
 
     if sessions.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No saved sessions yet.",
+            tr(locale, MessageId::SessionsEmptyTitle),
             Style::default().fg(palette::TEXT_MUTED),
         )));
         lines.push(Line::from(Span::styled(
-            "Send a message to start one; it is saved automatically.",
+            tr(locale, MessageId::SessionsEmptyHint),
             Style::default().fg(palette::TEXT_HINT),
         )));
         return lines;
@@ -1146,6 +1157,7 @@ mod tests {
             workspace_scope,
             show_all_workspaces: false,
             last_row_hitboxes: RefCell::new(Vec::new()),
+            locale: Locale::En,
         };
         view.apply_sort_and_filter();
         view
@@ -1263,7 +1275,19 @@ mod tests {
         )];
         let width = 24;
         let lines = build_list_lines(
-            &sessions, 0, width, 0, 5, false, "", "recent", false, false, "", None,
+            &sessions,
+            0,
+            width,
+            0,
+            5,
+            false,
+            "",
+            "recent",
+            false,
+            false,
+            "",
+            None,
+            Locale::En,
         );
 
         for line in lines {
@@ -1282,7 +1306,19 @@ mod tests {
             test_session(2, "second session"),
         ];
         let lines = build_list_lines(
-            &sessions, 1, 80, 0, 5, false, "", "recent", false, false, "", None,
+            &sessions,
+            1,
+            80,
+            0,
+            5,
+            false,
+            "",
+            "recent",
+            false,
+            false,
+            "",
+            None,
+            Locale::En,
         );
 
         let selected_line = lines
@@ -1487,6 +1523,7 @@ mod tests {
             false,
             "",
             None,
+            Locale::En,
         );
 
         let rendered = lines
@@ -1519,6 +1556,7 @@ mod tests {
             false,
             "",
             None,
+            Locale::En,
         );
 
         let rendered = lines
@@ -1538,7 +1576,19 @@ mod tests {
             test_session(2, "second session"),
         ];
         let lines = build_list_lines(
-            &sessions, 0, 80, 0, 5, false, "", "recent", false, false, "", None,
+            &sessions,
+            0,
+            80,
+            0,
+            5,
+            false,
+            "",
+            "recent",
+            false,
+            false,
+            "",
+            None,
+            Locale::En,
         );
 
         let rendered = lines
@@ -1689,6 +1739,7 @@ mod tests {
             workspace_scope: None,
             show_all_workspaces: true,
             last_row_hitboxes: RefCell::new(Vec::new()),
+            locale: Locale::En,
         };
 
         view.selected = 6;
