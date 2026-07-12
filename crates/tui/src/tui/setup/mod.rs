@@ -1013,7 +1013,9 @@ impl GuidedCommunication {
             (Locale::Vi, Self::Direct) => {
                 "Nói thẳng về điểm chặn, rủi ro và bất định; tránh câu chữ trang trí."
             }
-            (Locale::Ko, Self::Concise) => "업데이트는 간결하게 유지하고, 중요한 트레이드오프만 짧게 설명한다.",
+            (Locale::Ko, Self::Concise) => {
+                "업데이트는 간결하게 유지하고, 중요한 트레이드오프만 짧게 설명한다."
+            }
             (Locale::Ko, Self::Teaching) => {
                 "사용자가 시스템을 이해할 수 있을 만큼 핵심 추론과 트레이드오프를 설명한다."
             }
@@ -3595,7 +3597,9 @@ fn model_draft_invitation_line(locale: Locale, model_label: &str) -> String {
             format!("A {model_label} có thể soạn. Bạn phê chuẩn. Không lưu gì nếu chưa có bạn.")
         }
         Locale::Ko => {
-            format!("A {model_label}이(가) 초안을 작성할 수 있습니다. 승인은 당신이 합니다. 당신 없이는 아무것도 저장되지 않습니다.")
+            format!(
+                "A {model_label}이(가) 초안을 작성할 수 있습니다. 승인은 당신이 합니다. 당신 없이는 아무것도 저장되지 않습니다."
+            )
         }
         _ => format!("A {model_label} can draft it. You ratify it. Nothing saves without you."),
     }

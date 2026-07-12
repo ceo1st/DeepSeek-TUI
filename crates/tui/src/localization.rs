@@ -995,6 +995,9 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdExitDescription,
     MessageId::CmdExportDescription,
     MessageId::CmdFeedbackDescription,
+    MessageId::CmdForkDescription,
+    MessageId::CmdGoalDescription,
+    MessageId::CmdThemeDescription,
     MessageId::CmdHfDescription,
     MessageId::CmdHelpDescription,
     MessageId::CmdProfileDescription,
@@ -1702,6 +1705,19 @@ pub fn normalize_configured_locale(input: &str) -> Option<&'static str> {
     parse_locale(&normalized).map(Locale::tag)
 }
 
+/// Human-facing list of accepted `locale` setting values, derived from the
+/// shipped packs so config hints and error messages cannot go stale as new
+/// locales land. `separator` is `", "` for prose and `" | "` for hints.
+#[must_use]
+pub fn configured_locale_values(separator: &str) -> String {
+    let mut out = String::from("auto");
+    for locale in Locale::shipped() {
+        out.push_str(separator);
+        out.push_str(locale.tag());
+    }
+    out
+}
+
 pub fn resolve_locale(setting: &str) -> Locale {
     resolve_locale_with_env(setting, |key| std::env::var(key).ok())
 }
@@ -1870,6 +1886,69 @@ mod tests {
             assert!(
                 missing_message_ids(*locale).is_empty(),
                 "{} is missing messages",
+                locale.tag()
+            );
+        }
+    }
+
+    fn raw_locale_keys(locale: Locale) -> std::collections::BTreeSet<String> {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(locale_json_source(
+            locale,
+        ))
+        .unwrap_or_else(|err| panic!("{} locale json should parse: {err}", locale.tag()))
+        .keys()
+        .cloned()
+        .collect()
+    }
+
+    /// `missing_message_ids` is blind to keys that exist in en but not in a
+    /// "complete" pack — the English fallback returns the English string, so
+    /// nothing looks missing. Keep the enum, en.json, and ALL_MESSAGE_IDS in
+    /// exact sync so every other parity gate actually sees every message.
+    #[test]
+    fn message_id_list_english_pack_stay_in_exact_sync() {
+        let en = raw_locale_keys(Locale::En);
+        let ids: std::collections::BTreeSet<String> =
+            ALL_MESSAGE_IDS.iter().map(|id| format!("{id:?}")).collect();
+        assert_eq!(
+            ids.len(),
+            ALL_MESSAGE_IDS.len(),
+            "ALL_MESSAGE_IDS contains duplicates"
+        );
+        let unlisted: Vec<_> = en.difference(&ids).collect();
+        assert!(
+            unlisted.is_empty(),
+            "en.json keys absent from ALL_MESSAGE_IDS — every parity test is blind to them: {unlisted:?}"
+        );
+        let untranslatable: Vec<_> = ids.difference(&en).collect();
+        assert!(
+            untranslatable.is_empty(),
+            "ALL_MESSAGE_IDS entries without an en.json string: {untranslatable:?}"
+        );
+    }
+
+    /// Raw key-set parity for every pack that claims completeness, in both
+    /// directions. This is the test that fails when a new en key ships
+    /// without translations instead of silently falling back to English.
+    #[test]
+    fn shipped_complete_packs_have_raw_key_parity_with_english() {
+        let en = raw_locale_keys(Locale::En);
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            let pack = raw_locale_keys(*locale);
+            let missing: Vec<_> = en.difference(&pack).collect();
+            assert!(
+                missing.is_empty(),
+                "{} claims completeness but lacks {} key(s); the English fallback hides these at runtime: {missing:?}",
+                locale.tag(),
+                missing.len()
+            );
+            let extra: Vec<_> = pack.difference(&en).collect();
+            assert!(
+                extra.is_empty(),
+                "{} defines key(s) en.json lacks: {extra:?}",
                 locale.tag()
             );
         }

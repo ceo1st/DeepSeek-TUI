@@ -209,7 +209,7 @@
     "SetupActionHotbar": "Hotbar 設定",
     "SetupActionRemote": "遠端入口",
     "SetupStepOperateFleetTitle": "Operate 與 Fleet",
-    "SetupStepOperateFleetWhy": "檢視目前供應商、執行姿態、成員表與並行設定是否能支撐持久多 worker 工作。方案限制偵測仍需明確操作。",
+    "SetupStepOperateFleetWhy": "Operate 可立即使用內建團隊。未設定自訂路由的角色會使用本工作階段的模型；Fleet 設定僅用於自訂。",
     "SetupStepHotbarTitle": "Hotbar",
     "SetupStepHotbarWhy": "核心設定路徑安全後，再設定常用路線與指令捷徑。",
     "SetupStepRemoteRuntimeTitle": "遠端執行時",
@@ -453,5 +453,5 @@
     "HotbarActionModeOperateName": "Operate 模式",
     "HotbarActionModeOperateDescription": "管理 Fleet 工作節點、子代理與工作流程。",
     "AppModeOperate": "Operate",
-    "AppModeOperateHint": "編排 Fleet/子代理/工作流程 — 派發、等待、驗證、交接"
+    "AppModeOperateHint": "協調 Fleet 完成多步驟工作。"
 }

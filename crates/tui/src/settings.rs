@@ -751,7 +751,8 @@ impl Settings {
             "locale" | "language" => {
                 let Some(locale) = normalize_configured_locale(value) else {
                     anyhow::bail!(
-                        "Failed to update setting: invalid locale '{value}'. Expected: auto, en, ja, zh-Hans, pt-BR, es-419."
+                        "Failed to update setting: invalid locale '{value}'. Expected: {}.",
+                        crate::localization::configured_locale_values(", ")
                     );
                 };
                 self.locale = locale.to_string();

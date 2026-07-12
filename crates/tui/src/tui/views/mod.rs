@@ -2040,8 +2040,23 @@ fn config_hint_for_key(key: &str) -> &'static str {
         | "paste_burst_detection" => "on/off, true/false, yes/no, 1/0",
         "composer_density" | "transcript_spacing" => "compact | comfortable | spacious",
         "tool_collapse" => "compact | expanded | calm",
-        "theme" => "system | dark | light | grayscale",
-        "locale" => "auto | en | ja | zh-Hans | pt-BR",
+        // Derived from the shipped theme/locale registries so these hints
+        // cannot go stale as new entries land (they previously advertised
+        // 4 of 12 themes and 4 of 8 locales).
+        "theme" => {
+            static THEME_HINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            THEME_HINT.get_or_init(|| {
+                crate::palette::SELECTABLE_THEMES
+                    .iter()
+                    .map(|id| id.name())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+        }
+        "locale" => {
+            static LOCALE_HINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            LOCALE_HINT.get_or_init(|| crate::localization::configured_locale_values(" | "))
+        }
         "background_color" => "#RRGGBB | default",
         "ocean_treatment" => "ombre | flat",
         "base_url" => "global DeepSeek/root fallback; e.g. https://api.deepseek.com/beta",
