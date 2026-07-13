@@ -6729,6 +6729,7 @@ fn capture_turn_started_metadata(app: &mut App, event: &EngineEvent) {
         route,
     } = event
     {
+        app.ocean_completion_started_at = None;
         app.active_turn = Some(ActiveTurnMetadata {
             turn_id: turn_id.clone(),
             created_at: *created_at,

@@ -217,7 +217,7 @@ fn provider_scoped_cost(
     // These exact first-party routes document that cache hits receive no
     // discount, so the offering's input rate is authoritative. Do not infer
     // this for arbitrary catalog rows: an omitted cache rate may be unknown.
-    let cache_read_uses_input_rate = matches!(
+    let cache_uses_input_rate = matches!(
         (provider, model_lower.as_str()),
         (ApiProvider::Openai, "gpt-5.5-pro")
             | (ApiProvider::Arcee, "trinity-large-thinking")
@@ -225,9 +225,15 @@ fn provider_scoped_cost(
     );
     if token_usage.cache_read > 0
         && pricing.cache_read_per_million.is_none()
-        && cache_read_uses_input_rate
+        && cache_uses_input_rate
     {
         pricing.cache_read_per_million = pricing.input_per_million;
+    }
+    if token_usage.cache_write > 0
+        && pricing.cache_write_per_million.is_none()
+        && cache_uses_input_rate
+    {
+        pricing.cache_write_per_million = pricing.input_per_million;
     }
     let Some(amount) = pricing.estimate_cost(token_usage) else {
         return AvailableCost::default();
@@ -596,7 +602,13 @@ mod tests {
 
     #[test]
     fn documented_no_cache_discount_uses_input_without_generalizing_missing_rates() {
-        let u = usage(1_000_000, 0, 250_000);
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            prompt_cache_hit_tokens: Some(250_000),
+            prompt_cache_write_tokens: Some(100_000),
+            ..Default::default()
+        };
         let turns = [
             TurnInput {
                 turn_id: "documented-no-discount".into(),
@@ -624,7 +636,13 @@ mod tests {
 
     #[test]
     fn anthropic_sonnet_5_uses_the_recorded_turn_time() {
-        let u = usage(1_000_000, 500_000, 250_000);
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            prompt_cache_hit_tokens: Some(250_000),
+            prompt_cache_write_tokens: Some(100_000),
+            ..Default::default()
+        };
         let intro_at: DateTime<Utc> = "2026-08-31T23:59:59Z".parse().expect("intro time");
         let standard_at: DateTime<Utc> = "2026-09-01T00:00:00Z".parse().expect("standard time");
         let turns = [
@@ -654,11 +672,11 @@ mod tests {
         let card = Scorecard::from_turns(&turns);
 
         assert!(!card.per_turn[0].cost_unpriced);
-        assert!((card.per_turn[0].cost_usd - 6.55).abs() < 1e-12);
+        assert!((card.per_turn[0].cost_usd - 6.60).abs() < 1e-12);
         assert_eq!(card.per_turn[0].created_at.as_ref(), Some(&intro_at));
         assert!(card.per_turn[0].cost_cny_unpriced);
         assert!(!card.per_turn[1].cost_unpriced);
-        assert!((card.per_turn[1].cost_usd - 9.825).abs() < 1e-12);
+        assert!((card.per_turn[1].cost_usd - 9.90).abs() < 1e-12);
         assert!(card.per_turn[1].cost_cny_unpriced);
         assert!(card.per_turn[2].cost_unpriced);
     }

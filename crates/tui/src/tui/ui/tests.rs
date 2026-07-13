@@ -7203,6 +7203,7 @@ fn local_cancel_marks_late_stream_events_for_suppression() {
 fn turn_started_route_is_captured_before_cancel_suppression() {
     let mut app = create_test_app();
     app.suppress_stream_events_until_turn_complete = true;
+    app.ocean_completion_started_at = Some(Instant::now());
     app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
     let created_at = chrono::Utc::now();
     let event = EngineEvent::TurnStarted {
@@ -7225,6 +7226,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
     assert_eq!(route.model, "gpt-5.5");
     assert!(route.auto_model);
     assert!(app.pending_turn_route.is_none());
+    assert!(app.ocean_completion_started_at.is_none());
 }
 
 #[test]

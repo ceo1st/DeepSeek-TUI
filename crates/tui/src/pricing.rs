@@ -8,7 +8,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use codewhale_config::pricing::{OfferingPricing, TokenUsage};
 
-use crate::config::ApiProvider;
+use crate::config::{ApiProvider, DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC};
 use crate::models::Usage;
 
 /// Cost display currency.
@@ -411,11 +411,7 @@ pub fn calculate_turn_cost_estimate_for_route(
     if !billing.shows_money() {
         return None;
     }
-    if usage.prompt_cache_write_tokens.unwrap_or(0) > 0
-        && let Some(estimate) = crate::provider_lake::catalog_offering_for_model(provider, model)
-            .as_ref()
-            .and_then(|offering| catalog_cost_estimate_from_offering(offering, usage))
-    {
+    if let Some(estimate) = provider_catalog_cache_write_estimate(provider, model, usage) {
         return Some(estimate);
     }
     calculate_turn_cost_estimate_from_usage(model, usage)
@@ -448,7 +444,38 @@ pub(crate) fn calculate_turn_cost_estimate_for_provider_at(
     if provider == ApiProvider::OpenaiCodex {
         return None;
     }
-    let pricing = pricing_for_model_at(model, recorded_at)?;
+    let normalized_model = model.trim();
+    let model_lower = normalized_model.to_ascii_lowercase();
+    let direct_deepseek = matches!(
+        provider,
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic
+    );
+    let catalog_model = if direct_deepseek
+        && matches!(model_lower.as_str(), "deepseek-chat" | "deepseek-reasoner")
+    {
+        let retirement = DateTime::parse_from_rfc3339(DEEPSEEK_ALIAS_RETIREMENT_UTC)
+            .ok()?
+            .with_timezone(&Utc);
+        if recorded_at >= retirement {
+            return None;
+        }
+        DEEPSEEK_ALIAS_REPLACEMENT
+    } else {
+        normalized_model
+    };
+    let offering = crate::provider_lake::catalog_offering_for_model(provider, catalog_model)?;
+    // Sonnet 5 has an explicit recorded-time window, including its cache-write
+    // tier. Other models should retain the provider catalog override added in
+    // #4318 when their recorded usage contains cache creation tokens.
+    let time_scoped_sonnet =
+        provider == ApiProvider::Anthropic && catalog_model.eq_ignore_ascii_case("claude-sonnet-5");
+    if !time_scoped_sonnet
+        && usage.prompt_cache_write_tokens.unwrap_or(0) > 0
+        && let Some(estimate) = catalog_cost_estimate_from_offering(&offering, usage)
+    {
+        return Some(estimate);
+    }
+    let pricing = pricing_for_model_at(catalog_model, recorded_at)?;
     Some(CostEstimate {
         usd: calculate_turn_cost_from_usage_with_pricing(pricing.usd, usage),
         cny: pricing
@@ -456,6 +483,19 @@ pub(crate) fn calculate_turn_cost_estimate_for_provider_at(
             .map(|pricing| calculate_turn_cost_from_usage_with_pricing(pricing, usage))
             .unwrap_or(0.0),
     })
+}
+
+fn provider_catalog_cache_write_estimate(
+    provider: ApiProvider,
+    model: &str,
+    usage: &Usage,
+) -> Option<CostEstimate> {
+    if usage.prompt_cache_write_tokens.unwrap_or(0) == 0 {
+        return None;
+    }
+    crate::provider_lake::catalog_offering_for_model(provider, model)
+        .as_ref()
+        .and_then(|offering| catalog_cost_estimate_from_offering(offering, usage))
 }
 
 /// Project provider-normalized turn usage into canonical billable token
@@ -764,6 +804,81 @@ mod tests {
             catalog_cost_estimate_from_offering(&offering, &usage).expect("catalog cost estimate");
         assert!((estimate.usd - 0.000_382).abs() < 1e-15);
         assert_eq!(estimate.cny, 0.0);
+    }
+
+    #[test]
+    fn recorded_time_provider_cost_keeps_catalog_cache_write_tier() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            prompt_cache_hit_tokens: Some(0),
+            prompt_cache_miss_tokens: Some(0),
+            prompt_cache_write_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+
+        let estimate = calculate_turn_cost_estimate_for_provider_at(
+            ApiProvider::Openrouter,
+            "qwen/qwen3.7-plus",
+            &usage,
+            Utc::now(),
+        )
+        .expect("provider catalog write price");
+
+        assert!((estimate.usd - 0.40).abs() < f64::EPSILON);
+        assert_eq!(estimate.cny, 0.0);
+    }
+
+    #[test]
+    fn recorded_time_provider_cost_rejects_foreign_model_ids() {
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            ..Default::default()
+        };
+
+        assert!(
+            calculate_turn_cost_estimate_for_provider_at(
+                ApiProvider::Ollama,
+                "gpt-5.5",
+                &usage,
+                Utc::now(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn recorded_time_provider_cost_bounds_deepseek_compatibility_aliases() {
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            ..Default::default()
+        };
+        let before_retirement: DateTime<Utc> =
+            "2026-07-24T15:58:59Z".parse().expect("pre-retirement time");
+        let at_retirement: DateTime<Utc> = DEEPSEEK_ALIAS_RETIREMENT_UTC
+            .parse()
+            .expect("retirement time");
+
+        assert!(
+            calculate_turn_cost_estimate_for_provider_at(
+                ApiProvider::Deepseek,
+                "deepseek-chat",
+                &usage,
+                before_retirement,
+            )
+            .is_some()
+        );
+        assert!(
+            calculate_turn_cost_estimate_for_provider_at(
+                ApiProvider::Deepseek,
+                "deepseek-reasoner",
+                &usage,
+                at_retirement,
+            )
+            .is_none()
+        );
     }
 
     #[test]
