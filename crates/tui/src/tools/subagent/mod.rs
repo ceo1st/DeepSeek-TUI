@@ -1471,7 +1471,6 @@ pub struct SubAgentCompletion {
 /// role text cannot override the worker's actual route and instructions.
 #[derive(Clone, Debug)]
 pub struct SubAgentForkContext {
-    pub system: Option<SystemPrompt>,
     pub messages: Vec<Message>,
     pub structured_state_block: Option<String>,
 }
@@ -5104,10 +5103,7 @@ fn build_subagent_system_prompt(
     prompt
 }
 
-fn subagent_request_system_prompt(
-    subagent_system_prompt: &str,
-    _fork_context: Option<&SubAgentForkContext>,
-) -> SystemPrompt {
+fn subagent_request_system_prompt(subagent_system_prompt: &str) -> SystemPrompt {
     // Forking inherits conversation context, not the parent's identity. A
     // child can have a different provider/model/profile, so its own resolved
     // role prompt must stay at system precedence.
@@ -6007,14 +6003,13 @@ async fn run_subagent(
     let fork_context = fork_context_enabled
         .then_some(runtime.fork_context.as_ref())
         .flatten();
-    let request_system = subagent_request_system_prompt(&system_prompt, fork_context);
+    let request_system = subagent_request_system_prompt(&system_prompt);
     let mut messages =
         build_initial_subagent_messages(&prompt, &assignment, &agent_type, fork_context);
     let (runtime_for_tools, mut child_completion_rx) = runtime_for_nested_agent_tools(
         runtime,
         &agent_id,
         SubAgentForkContext {
-            system: Some(request_system.clone()),
             messages: messages.clone(),
             structured_state_block: None,
         },

@@ -1673,7 +1673,6 @@ fn spawn_request_parses_token_budget_override() {
 
 #[test]
 fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
-    let parent_system = SystemPrompt::Text("parent system".to_string());
     let parent_message = Message {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
@@ -1682,7 +1681,6 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
         }],
     };
     let fork_context = SubAgentForkContext {
-        system: Some(parent_system.clone()),
         messages: vec![parent_message.clone()],
         structured_state_block: Some("## Fork State\n- Mode: `AGENT`".to_string()),
     };
@@ -1696,7 +1694,7 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
     );
 
     assert_eq!(
-        subagent_request_system_prompt("child system", Some(&fork_context)),
+        subagent_request_system_prompt("child system"),
         SystemPrompt::Text("child system".to_string())
     );
     assert_eq!(messages.first(), Some(&parent_message));
@@ -5693,7 +5691,6 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
     let (root_tx, mut root_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
     let direct_child_runtime = runtime_with_depth(1, Some(root_tx));
     let fork_context = SubAgentForkContext {
-        system: None,
         messages: Vec::new(),
         structured_state_block: None,
     };
