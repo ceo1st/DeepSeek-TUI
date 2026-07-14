@@ -292,7 +292,7 @@ pub fn flush_and_sync(writer: &mut std::io::BufWriter<std::fs::File>) -> std::io
 ///
 /// Dispatches to the platform-appropriate opener:
 /// - macOS: `open`
-/// - Linux: `xdg-open`
+/// - Linux / BSD: `xdg-open`
 /// - Windows: `cmd /C start ""`
 /// - Other: returns an error.
 ///
@@ -321,7 +321,13 @@ fn browser_open_command(url: &str) -> Result<Command> {
         Ok(command)
     }
 
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "ohos")),
+        target_os = "netbsd",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     {
         let mut command = Command::new("xdg-open");
         command.arg(url);
@@ -338,7 +344,11 @@ fn browser_open_command(url: &str) -> Result<Command> {
     #[cfg(not(any(
         target_os = "macos",
         all(target_os = "linux", not(target_env = "ohos")),
-        target_os = "windows"
+        target_os = "windows",
+        target_os = "netbsd",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
     )))]
     Err(anyhow::anyhow!(
         "browser opening is unsupported on this platform"
@@ -965,6 +975,16 @@ mod project_mapping_tests {
                     .collect::<Vec<_>>(),
                 vec!["https://example.com"]
             );
+        }
+
+        #[cfg(any(
+            target_os = "netbsd",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            assert_eq!(command.get_program(), "xdg-open");
         }
 
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]

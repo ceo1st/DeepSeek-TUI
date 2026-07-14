@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 ))]
 use std::process::{Command, Stdio};
 #[cfg(any(
-    test,
     target_os = "macos",
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
@@ -27,7 +26,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 #[cfg(any(
-    test,
     target_os = "macos",
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
@@ -35,7 +33,6 @@ use anyhow::{Context, Result, bail};
 use arboard::{Clipboard, ImageData};
 use base64::Engine as _;
 #[cfg(any(
-    test,
     target_os = "macos",
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
@@ -71,7 +68,10 @@ impl PastedImage {
 
 /// Clipboard payloads supported by the TUI.
 #[cfg_attr(
-    all(any(target_env = "ohos", target_os = "android"), not(test)),
+    all(
+        any(target_env = "ohos", target_os = "android", target_os = "netbsd"),
+        not(test)
+    ),
     allow(dead_code)
 )]
 pub enum ClipboardContent {
@@ -82,14 +82,12 @@ pub enum ClipboardContent {
 /// Clipboard reader/writer helper.
 pub struct ClipboardHandler {
     #[cfg(any(
-        test,
         target_os = "macos",
         target_os = "windows",
         all(target_os = "linux", not(target_env = "ohos"))
     ))]
     clipboard: Option<Clipboard>,
     #[cfg(any(
-        test,
         target_os = "macos",
         target_os = "windows",
         all(target_os = "linux", not(target_env = "ohos"))
@@ -108,14 +106,12 @@ impl ClipboardHandler {
     pub fn new() -> Self {
         Self {
             #[cfg(any(
-                test,
                 target_os = "macos",
                 target_os = "windows",
                 all(target_os = "linux", not(target_env = "ohos"))
             ))]
             clipboard: None,
             #[cfg(any(
-                test,
                 target_os = "macos",
                 target_os = "windows",
                 all(target_os = "linux", not(target_env = "ohos"))
@@ -135,7 +131,6 @@ impl ClipboardHandler {
     /// handler stays in fallback/no-op mode and `read`/`write_text` fall
     /// through to their OSC 52 and pbcopy/powershell fallbacks.
     #[cfg(any(
-        test,
         target_os = "macos",
         target_os = "windows",
         all(target_os = "linux", not(target_env = "ohos"))
@@ -167,7 +162,6 @@ impl ClipboardHandler {
         }
 
         #[cfg(any(
-            test,
             target_os = "macos",
             target_os = "windows",
             all(target_os = "linux", not(target_env = "ohos"))
@@ -378,7 +372,6 @@ fn clipboard_images_dir_for_home(workspace: &Path, home: Option<&Path>) -> PathB
 /// Encode an RGBA `ImageData` from arboard as PNG and persist it. Returns
 /// the resulting path along with metadata used to render the paste hint.
 #[cfg(any(
-    test,
     target_os = "macos",
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
@@ -390,7 +383,6 @@ fn save_image_as_png(workspace: &Path, image: &ImageData) -> Result<PastedImage>
 /// Lower-level variant that writes into an explicit directory. Exposed so the
 /// unit tests don't have to scribble inside the user's real home directory.
 #[cfg(any(
-    test,
     target_os = "macos",
     target_os = "windows",
     all(target_os = "linux", not(target_env = "ohos"))
@@ -439,10 +431,21 @@ fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // ImageData from arboard is only available on these platforms.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     use std::borrow::Cow;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     fn solid_rgba(width: u16, height: u16, rgba: [u8; 4]) -> ImageData<'static> {
         let mut bytes = Vec::with_capacity((width as usize) * (height as usize) * 4);
         for _ in 0..(width as usize * height as usize) {
@@ -456,6 +459,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "ohos"))
+    ))]
     fn save_image_as_png_writes_valid_png() {
         let dir = tempfile::tempdir().unwrap();
         let img = solid_rgba(8, 4, [255, 0, 0, 255]);
