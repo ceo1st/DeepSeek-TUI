@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Seal } from "@/components/seal";
+import { FaqSearch } from "@/components/faq-search";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -732,34 +733,7 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
       </section>
 
       <section className="mx-auto max-w-[1400px] px-6 pb-20">
-        <div className="space-y-0 hairline-t hairline-b">
-          {items.map((item, i) => (
-            <details key={i} className="group hairline-b last:border-b-0">
-              <summary className="px-0 py-5 cursor-pointer flex items-start gap-4 hover:text-indigo transition-colors">
-                <span className="font-mono text-indigo tabular text-sm pt-0.5 shrink-0">
-                  {String(i + 1).padStart(2, "0")}
-                </span>
-                <span className="font-display text-lg leading-snug flex-1">{item.q}</span>
-                <span className="font-mono text-ink-mute text-sm group-open:rotate-45 transition-transform shrink-0">+</span>
-              </summary>
-              <div className="pb-5 pl-10 pr-4">
-                <div className={`text-ink-soft leading-relaxed ${isZh ? "leading-[1.9] tracking-wide" : ""}`}>
-                  {item.a}
-                </div>
-                {item.sources && item.sources.length > 0 && (
-                  <div className="mt-3 flex items-center gap-2 flex-wrap">
-                    <span className="font-mono text-[0.66rem] text-ink-mute uppercase tracking-wider">
-                      {isZh ? "来源" : "Sources"}:
-                    </span>
-                    {item.sources.map((s) => (
-                      <span key={s} className="font-mono text-[0.7rem] text-indigo">{s}</span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </details>
-          ))}
-        </div>
+        <FaqSearch items={items} locale={locale} />
 
         <div className="mt-12 text-center">
           <p className="text-ink-soft text-sm mb-4">

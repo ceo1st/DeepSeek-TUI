@@ -267,6 +267,31 @@ code.inline {
   border-radius: 2px;
 }
 
+
+/* ---------- search ---------- */
+.search-input {
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: 1rem;
+  padding: 0.75rem 2.5rem 0.75rem 1rem;
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--hairline);
+  transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+.search-input::placeholder { color: var(--ink-mute); }
+.search-input:focus {
+  outline: none;
+  border-color: var(--indigo);
+  box-shadow: 0 0 0 3px var(--indigo-pale);
+}
+
+mark.search-highlight {
+  background: var(--indigo-pale);
+  color: var(--indigo-deep);
+  padding: 0.02em 0.08em;
+  border-radius: 2px;
+}
+
 /* ---------- nav link ---------- */
 .nav-link {
   font-family: var(--font-mono), monospace;
