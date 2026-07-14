@@ -508,6 +508,14 @@ impl Settings {
     /// "saved" never silently reports a tmux, SSH, or accessibility override.
     pub(crate) fn load_persisted() -> Result<Self> {
         let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
+        Self::load_persisted_from_candidates(primary, legacy_home, legacy_config_dir)
+    }
+
+    fn load_persisted_from_candidates(
+        primary: Option<PathBuf>,
+        legacy_home: Option<PathBuf>,
+        legacy_config_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let write_path = primary
             .as_ref()
             .cloned()
@@ -3093,24 +3101,27 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let primary = tmp.path().join(".codewhale").join("settings.toml");
         let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
-        let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
-        let _home = EnvVarRestore::set("HOME", tmp.path());
-        let _xdg = EnvVarRestore::set("XDG_CONFIG_HOME", tmp.path().join("platform-config"));
-        #[cfg(windows)]
-        let _appdata = EnvVarRestore::set("APPDATA", tmp.path().join("platform-config"));
-        #[cfg(windows)]
-        let _local_appdata = EnvVarRestore::set("LOCALAPPDATA", tmp.path().join("platform-config"));
-        #[cfg(windows)]
-        let _userprofile = EnvVarRestore::set("USERPROFILE", tmp.path());
-        let legacy_config_dir = dirs::config_dir()
-            .expect("config dir")
+        let _codewhale_home =
+            EnvVarRestore::set("CODEWHALE_HOME", primary.parent().expect("primary parent"));
+        let legacy_config_dir = tmp
+            .path()
+            .join("platform-config")
             .join("deepseek")
             .join("settings.toml");
         std::fs::create_dir_all(legacy_config_dir.parent().expect("parent"))
             .expect("legacy config dir");
         std::fs::write(&legacy_config_dir, "low_motion = true\n").expect("legacy settings");
 
-        let loaded = Settings::load_persisted().expect("load persisted settings");
+        // Exercise the same load and migration path with explicit candidates.
+        // `dirs::config_dir()` uses the Win32 known-folder API on Windows, so
+        // APPDATA/XDG environment overrides cannot isolate that process-global
+        // location in a parallel test runner.
+        let loaded = Settings::load_persisted_from_candidates(
+            Some(primary.clone()),
+            None,
+            Some(legacy_config_dir),
+        )
+        .expect("load persisted settings");
 
         assert!(loaded.low_motion, "legacy settings should still be read");
         assert!(
