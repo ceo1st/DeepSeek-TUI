@@ -453,5 +453,11 @@
     "HotbarActionModeOperateName": "Operate 模式",
     "HotbarActionModeOperateDescription": "管理 Fleet 工作節點、子代理與工作流程。",
     "AppModeOperate": "Operate",
-    "AppModeOperateHint": "協調 Fleet 完成多步驟工作。"
+    "AppModeOperateHint": "協調 Fleet 完成多步驟工作。",
+    "LinksProjectTitle": "Codewhale 與社群：",
+    "LinksDocumentation": "文件：",
+    "LinksCommunity": "社群與貢獻：",
+    "LinksGitHub": "GitHub：",
+    "LinksManagedApp": "託管應用程式預覽：",
+    "LinksManagedAppNote": "託管應用程式使用獨立登入，不會連接目前的本機工作階段。"
 }

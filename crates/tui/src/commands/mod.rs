@@ -1042,6 +1042,12 @@ mod tests {
         for cmd in ["/links", "/dashboard", "/api", "/lianjie"] {
             let result = execute(cmd, &mut app);
             let msg = result.message.expect("links commands should return text");
+            assert!(msg.contains("https://codewhale.net/en/docs"));
+            assert!(msg.contains("https://codewhale.net/en/community"));
+            assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+            assert!(msg.contains("https://app.codewhale.net"));
+            assert!(msg.contains("separate sign-in"));
+            assert!(msg.contains("not connected to the current local session"));
             assert!(msg.contains("https://platform.deepseek.com"));
             assert!(result.action.is_none());
         }
