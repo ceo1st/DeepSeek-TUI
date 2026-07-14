@@ -3817,7 +3817,9 @@ max_concurrent = 4
 
     #[test]
     fn config_approval_mode_valid_values() {
+        let dir = tempfile::tempdir().expect("isolated config dir");
         let mut app = create_test_app();
+        app.config_path = Some(dir.path().join("config.toml"));
         // Test auto
         let result = config_command(&mut app, Some("approval_mode auto"));
         assert!(result.message.is_some());
@@ -3916,7 +3918,9 @@ max_concurrent = 4
 
     #[test]
     fn config_approval_mode_invalid_value() {
+        let dir = tempfile::tempdir().expect("isolated config dir");
         let mut app = create_test_app();
+        app.config_path = Some(dir.path().join("config.toml"));
         let result = config_command(&mut app, Some("approval_mode invalid"));
         assert!(result.message.is_some());
         let msg = result.message.unwrap();

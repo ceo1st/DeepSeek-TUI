@@ -1387,7 +1387,9 @@ mcp_config_path = "disk-mcp.json"
     #[test]
     fn status_item_only_apply_does_not_require_engine_sync() {
         let _lock = lock_test_env();
+        let dir = tempfile::tempdir().expect("isolated config dir");
         let mut app = app();
+        app.config_path = Some(dir.path().join("config.toml"));
         let mut config = Config::default();
         let mut doc = build_document(&app, &config).expect("document");
         doc.config.status_items = vec![StatusItemValue::Cost, StatusItemValue::Model];

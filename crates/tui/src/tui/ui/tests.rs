@@ -1968,6 +1968,9 @@ fn create_test_app() -> App {
     // Pin locale and currency for deterministic tests regardless of host locale.
     app.cost_currency = crate::pricing::CostCurrency::Usd;
     app.ui_locale = crate::localization::Locale::En;
+    // Keep transcript tests independent of a concurrently swapped persisted
+    // settings home. Tests for hidden reasoning opt out explicitly.
+    app.show_thinking = true;
     // Pin the route identity too: App::new consults the developer's real
     // saved settings (provider/model maps, auto-model, route limits), so on
     // a machine with customized settings the context-window tests computed

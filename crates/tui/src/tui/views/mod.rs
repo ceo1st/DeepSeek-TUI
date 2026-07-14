@@ -2818,7 +2818,11 @@ impl ModalView for ConfigView {
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
             *self.last_choice_hitboxes.borrow_mut() = Vec::new();
             let footer_text = if edit.choices.is_some() {
-                " ↑/↓ choose · Enter apply · Esc cancel · 1-9 jump ".to_string()
+                if inner.width < 56 || inner.height <= 8 {
+                    " ↑/↓ choose · Enter apply · Esc ".to_string()
+                } else {
+                    " ↑/↓ choose · Enter apply · Esc cancel · 1-9 jump ".to_string()
+                }
             } else {
                 self.tr(MessageId::ConfigEditFooter).to_string()
             };
@@ -2873,9 +2877,17 @@ impl ModalView for ConfigView {
                 // Large catalogs (providers and themes) remain bounded by the
                 // terminal. Keep the active option centered and mouse-hitbox
                 // only the slice that is actually visible.
-                let option_budget = usize::from(inner.height)
-                    .saturating_sub(reserved_footer_lines + lines.len() + 1)
-                    .max(1);
+                let selected_detail = choices
+                    .get(edit.selected_choice)
+                    .map(|choice| config_choice_detail(&edit.key, choice))
+                    .unwrap_or("");
+                let available_rows =
+                    usize::from(inner.height).saturating_sub(reserved_footer_lines + lines.len());
+                // At the minimum supported height, the choices themselves are
+                // the primary object. Shed the explanatory detail before any
+                // option; larger surfaces keep one row for that detail.
+                let detail_rows = usize::from(!selected_detail.is_empty() && available_rows > 3);
+                let option_budget = available_rows.saturating_sub(detail_rows).max(1);
                 let visible_options = option_budget.min(choices.len());
                 let max_start = choices.len().saturating_sub(visible_options);
                 let start = edit
@@ -2908,17 +2920,16 @@ impl ModalView for ConfigView {
                 }
                 *self.last_choice_hitboxes.borrow_mut() = hitboxes;
 
-                if let Some(choice) = choices.get(edit.selected_choice) {
-                    let detail = config_choice_detail(&edit.key, choice);
-                    if !detail.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            crate::tui::ui_text::semantic_truncate(
-                                detail,
-                                usize::from(inner.width),
-                            ),
-                            Style::default().fg(palette::TEXT_MUTED),
-                        )));
-                    }
+                if !selected_detail.is_empty()
+                    && lines.len() + reserved_footer_lines < usize::from(inner.height)
+                {
+                    lines.push(Line::from(Span::styled(
+                        crate::tui::ui_text::semantic_truncate(
+                            selected_detail,
+                            usize::from(inner.width),
+                        ),
+                        Style::default().fg(palette::TEXT_MUTED),
+                    )));
                 }
             } else {
                 lines.push(render_config_editor_value_line(edit, self.locale));
@@ -3964,10 +3975,19 @@ mod tests {
     }
 
     fn create_test_app() -> App {
+        static NEXT_CONFIG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let config_id = NEXT_CONFIG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let isolated_config_path = std::env::temp_dir().join(format!(
+            "codewhale-config-view-test-{}-{config_id}.toml",
+            std::process::id()
+        ));
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: PathBuf::from("."),
-            config_path: None,
+            // ConfigView consults the app's persisted config. Point generic
+            // tests at a unique absent file so developer or concurrent test
+            // settings cannot silently change which controls are editable.
+            config_path: Some(isolated_config_path),
             config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
@@ -4900,12 +4920,11 @@ base_url = "https://api.xiaomimimo.com/v1"
     fn config_view_enter_and_ctrl_u_emit_config_updated() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
-
-        // Navigate to the "model" row (index 2, after provider and base_url)
-        for _ in 0..2 {
-            view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        }
-        assert_eq!(view.rows[view.selected].key, "model");
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "stream_chunk_timeout_secs")
+            .expect("stream timeout row");
 
         let start = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(start, ViewAction::None));
@@ -4919,7 +4938,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             .expect("editing should remain active after Ctrl+U");
         assert!(cleared.buffer.is_empty());
 
-        for ch in "deepseek-v4-flash".chars() {
+        for ch in "55".chars() {
             let action = view.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
             assert!(matches!(action, ViewAction::None));
         }
@@ -4931,8 +4950,8 @@ base_url = "https://api.xiaomimimo.com/v1"
                 value,
                 persist,
             }) => {
-                assert_eq!(key, "model");
-                assert_eq!(value, "deepseek-v4-flash");
+                assert_eq!(key, "stream_chunk_timeout_secs");
+                assert_eq!(value, "55");
                 assert!(!persist);
             }
             other => panic!("expected config update emit, got {other:?}"),
@@ -5095,11 +5114,13 @@ base_url = "https://api.xiaomimimo.com/v1"
             row: y,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(matches!(second, ViewAction::None));
-        assert!(
-            view.editing.is_some(),
-            "second click should activate editing"
-        );
+        match second {
+            ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::ExecuteCommand { command },
+            }) => assert_eq!(command, "/model"),
+            other => panic!("second click should open the model picker, got {other:?}"),
+        }
+        assert!(view.editing.is_none());
     }
 
     #[test]
@@ -5174,6 +5195,11 @@ base_url = "https://api.xiaomimimo.com/v1"
         let mut app = create_test_app();
         app.ui_locale = Locale::En;
         let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "base_url")
+            .expect("base_url row");
         let _ = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(view.editing.is_some());
 
