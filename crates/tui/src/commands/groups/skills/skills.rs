@@ -8,7 +8,7 @@ use crate::skills::install::{
     self, DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL, InstallOutcome, InstallSource,
     RegistryFetchResult, SkillSyncOutcome, SyncResult, UpdateResult,
 };
-use crate::tui::app::App;
+use crate::tui::app::{App, AppAction};
 use crate::tui::history::HistoryCell;
 
 use crate::commands::CommandResult;
@@ -287,11 +287,12 @@ fn list_skills(app: &mut App, arg: Option<&str>) -> CommandResult {
 pub(in crate::commands) fn run_skill_by_name(
     app: &mut App,
     name: &str,
-    _arg: Option<&str>,
+    arg: Option<&str>,
 ) -> Option<CommandResult> {
     let registry = discover_visible_skills(app);
-    if registry.get(name).is_some() {
-        Some(activate_skill(app, name))
+    let lookup_name = if name == "new" { "skill-creator" } else { name };
+    if registry.get(lookup_name).is_some() {
+        Some(activate_skill_with_task(app, name, arg))
     } else {
         None
     }
@@ -320,7 +321,21 @@ fn run_skill(app: &mut App, name: Option<&str>) -> CommandResult {
         _ => {}
     }
 
-    activate_skill(app, raw)
+    let task = (!rest.is_empty()).then_some(rest);
+    activate_skill_with_task(app, head, task)
+}
+
+/// Activate a skill and, when the invocation includes a task, send that task
+/// immediately. `AppAction::SendMessage` is converted into a `QueuedMessage`
+/// by the UI, where `app.active_skill` is consumed and attached to this turn.
+fn activate_skill_with_task(app: &mut App, name: &str, task: Option<&str>) -> CommandResult {
+    let mut result = activate_skill(app, name);
+    if !result.is_error
+        && let Some(task) = task.map(str::trim).filter(|task| !task.is_empty())
+    {
+        result.action = Some(AppAction::SendMessage(task.to_string()));
+    }
+    result
 }
 
 fn activate_skill(app: &mut App, name: &str) -> CommandResult {

@@ -1398,4 +1398,96 @@ mod tests {
         let result = execute("/help", &mut app);
         assert!(!result.is_error);
     }
+
+    fn write_test_skill(root: &Path, name: &str) {
+        let skill_dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Test {name} skill\n---\nFollow the test instructions."
+            ),
+        )
+        .expect("skill fixture");
+    }
+
+    #[test]
+    fn task_bearing_skill_invocations_send_the_task_on_the_activated_turn() {
+        for invocation in ["$foo do X", "/foo do X", "/skill foo do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "foo");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("Skill 'foo' activated")),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: foo")),
+                "{invocation} did not arm foo for the dispatched task"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_dollar_skill_still_arms_the_next_message() {
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "foo");
+
+        let result = execute("$foo", &mut app);
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.action.is_none());
+        assert!(
+            app.active_skill
+                .as_deref()
+                .is_some_and(|instruction| instruction.contains("# Skill: foo"))
+        );
+    }
+
+    #[test]
+    fn shorthand_can_invoke_a_skill_named_install_without_stealing_management_commands() {
+        for invocation in ["$install do X", "/install do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "install");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: install")),
+                "{invocation} did not activate the install skill"
+            );
+        }
+
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "install");
+        let result = execute("/skill install", &mut app);
+        assert!(result.is_error, "management subcommand should show usage");
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("/skill install"))
+        );
+        assert!(result.action.is_none());
+        assert!(app.active_skill.is_none());
+    }
 }
