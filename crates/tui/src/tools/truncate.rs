@@ -258,6 +258,17 @@ pub fn maybe_spillover(
 /// the per-turn context budget. The full output is preserved on
 /// disk; the model can `read_file` it back if it needs the tail.
 pub const SPILLOVER_HEAD_BYTES: usize = 32 * 1024;
+/// Inline tail retained alongside the head so compiler summaries and final
+/// test failures are not systematically hidden by truncation.
+pub const SPILLOVER_TAIL_BYTES: usize = 8 * 1024;
+
+fn retained_tail(content: &str, max_bytes: usize) -> &str {
+    let floor = content.len().saturating_sub(max_bytes);
+    let start = (floor..=content.len())
+        .find(|&index| content.is_char_boundary(index))
+        .unwrap_or(content.len());
+    &content[start..]
+}
 
 /// Apply spillover to a tool result in place. If the result's
 /// content exceeds [`SPILLOVER_THRESHOLD_BYTES`], writes the full
@@ -342,6 +353,8 @@ fn apply_spillover_inner(
         }
     };
     let (head, path) = outcome;
+    let tail = retained_tail(&original_content, SPILLOVER_TAIL_BYTES);
+    let digest = crate::hashing::sha256_hex(original_content.as_bytes());
     let path_str = path.display().to_string();
 
     let mut artifact_path = None;
@@ -361,7 +374,12 @@ fn apply_spillover_inner(
                     &original_content,
                 );
                 let transcript_ref = crate::artifacts::TranscriptArtifactRef::from(&record);
-                result.content = crate::artifacts::render_transcript_artifact_ref(&transcript_ref);
+                let reference = crate::artifacts::render_transcript_artifact_ref(&transcript_ref);
+                result.content = format!(
+                    "{reference}\n\n[retained head: {} bytes]\n{head}\n\n[retained tail: {} bytes]\n{tail}",
+                    head.len(),
+                    tail.len(),
+                );
                 artifact_path = Some((absolute_path, relative_path, record));
             }
             Err(err) => {
@@ -385,7 +403,10 @@ fn apply_spillover_inner(
             head_kib = head.len() / 1024,
             total_kib = total / 1024,
         );
-        result.content = format!("{head}{footer}");
+        result.content = format!(
+            "{head}\n\n[retained tail: {} bytes]\n{tail}{footer}",
+            tail.len()
+        );
     }
 
     let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
@@ -478,6 +499,29 @@ fn apply_spillover_inner(
                 );
             }
         }
+    }
+    if let Some(obj) = result
+        .metadata
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        obj.insert("truncated".into(), serde_json::Value::Bool(true));
+        obj.insert(
+            "content_digest".into(),
+            serde_json::Value::String(format!("sha256:{digest}")),
+        );
+        obj.insert(
+            "original_byte_count".into(),
+            serde_json::Value::Number(serde_json::Number::from(total as u64)),
+        );
+        obj.insert(
+            "retained_head_bytes".into(),
+            serde_json::Value::Number(serde_json::Number::from(head.len() as u64)),
+        );
+        obj.insert(
+            "retained_tail_bytes".into(),
+            serde_json::Value::Number(serde_json::Number::from(tail.len() as u64)),
+        );
     }
     artifact_path
         .map(|(absolute_path, _, _)| absolute_path)
@@ -811,6 +855,15 @@ mod tests {
                 .and_then(serde_json::Value::as_str)
                 .expect("spillover_path key present");
             assert_eq!(stamped, path.display().to_string());
+            assert_eq!(metadata["truncated"], true);
+            assert_eq!(metadata["original_byte_count"], 200 * 1024);
+            assert_eq!(metadata["retained_head_bytes"], SPILLOVER_HEAD_BYTES);
+            assert_eq!(metadata["retained_tail_bytes"], SPILLOVER_TAIL_BYTES);
+            assert!(
+                metadata["content_digest"]
+                    .as_str()
+                    .is_some_and(|digest| digest.starts_with("sha256:"))
+            );
         });
     }
 
@@ -850,6 +903,8 @@ mod tests {
                     .contains("path:         artifacts/art_call-big.txt")
             );
             assert!(!result.content.contains("Output truncated:"));
+            assert!(result.content.contains("[retained head:"));
+            assert!(result.content.contains("[retained tail:"));
 
             let metadata = result.metadata.expect("metadata stamped");
             assert_eq!(
@@ -870,6 +925,9 @@ mod tests {
                     .and_then(serde_json::Value::as_str),
                 Some("session-123")
             );
+            assert_eq!(metadata["original_byte_count"], big.len());
+            assert_eq!(metadata["retained_head_bytes"], SPILLOVER_HEAD_BYTES);
+            assert_eq!(metadata["retained_tail_bytes"], SPILLOVER_TAIL_BYTES);
         });
     }
 

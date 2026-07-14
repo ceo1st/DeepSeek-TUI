@@ -131,6 +131,12 @@ impl Harness {
         self.pty.write_bytes(bytes.as_ref())
     }
 
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        self.pty.resize(rows, cols)?;
+        self.frame.resize(rows, cols);
+        Ok(())
+    }
+
     pub fn paste(&mut self, text: &str) -> Result<()> {
         self.pty.write_bytes(&super::paste::bracketed(text))
     }

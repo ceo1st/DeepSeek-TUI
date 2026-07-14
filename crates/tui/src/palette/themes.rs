@@ -126,14 +126,22 @@ pub const UI_THEME: UiTheme = UiTheme {
     mode_plan: MODE_PLAN,
     mode_operate: MODE_OPERATE,
     status_ready: TEXT_MUTED,
-    status_working: WHALE_INFO,
+    status_working: Color::Rgb(
+        WHALE_ACCENT_SECONDARY_RGB.0,
+        WHALE_ACCENT_SECONDARY_RGB.1,
+        WHALE_ACCENT_SECONDARY_RGB.2,
+    ),
     status_warning: STATUS_WARNING,
     diff_added_fg: DIFF_ADDED,
     diff_deleted_fg: Color::Rgb(WHALE_ERROR_RGB.0, WHALE_ERROR_RGB.1, WHALE_ERROR_RGB.2),
     diff_added_bg: DIFF_ADDED_BG,
     diff_deleted_bg: DIFF_DELETED_BG,
     tool_running: ACCENT_TOOL_LIVE,
-    tool_success: TEXT_DIM,
+    tool_success: Color::Rgb(
+        WHALE_WORKING_GREEN_RGB.0,
+        WHALE_WORKING_GREEN_RGB.1,
+        WHALE_WORKING_GREEN_RGB.2,
+    ),
     tool_failed: ACCENT_TOOL_ISSUE,
 };
 
@@ -161,22 +169,26 @@ pub const LIGHT_UI_THEME: UiTheme = UiTheme {
     error_surface: Color::Rgb(254, 229, 229),
     error_border: Color::Rgb(240, 120, 130),
     error_text: Color::Rgb(120, 20, 30),
-    warning: Color::Rgb(180, 83, 9),        // amber
-    success: Color::Rgb(21, 128, 61),       // green
-    info: Color::Rgb(53, 120, 229),         // blue
-    mode_agent: Color::Rgb(53, 120, 229),   // blue
-    mode_yolo: Color::Rgb(200, 40, 60),     // red
-    mode_plan: Color::Rgb(180, 83, 9),      // amber
+    warning: Color::Rgb(180, 83, 9), // amber
+    success: Color::Rgb(
+        LIGHT_SUCCESS_FG_RGB.0,
+        LIGHT_SUCCESS_FG_RGB.1,
+        LIGHT_SUCCESS_FG_RGB.2,
+    ), // readable green foreground
+    info: Color::Rgb(53, 120, 229),  // blue
+    mode_agent: Color::Rgb(53, 120, 229), // blue
+    mode_yolo: Color::Rgb(200, 40, 60), // red
+    mode_plan: Color::Rgb(180, 83, 9), // amber
     mode_operate: Color::Rgb(124, 58, 237), // violet
     status_ready: LIGHT_TEXT_MUTED,
-    status_working: Color::Rgb(53, 120, 229),   // blue
-    status_warning: Color::Rgb(180, 83, 9),     // amber
-    diff_added_fg: Color::Rgb(22, 101, 52),     // green
-    diff_deleted_fg: Color::Rgb(200, 40, 60),   // red
-    diff_added_bg: Color::Rgb(223, 247, 231),   // light green
+    status_working: Color::Rgb(79, 180, 160), // teal live work
+    status_warning: Color::Rgb(180, 83, 9),   // amber
+    diff_added_fg: Color::Rgb(22, 101, 52),   // green
+    diff_deleted_fg: Color::Rgb(200, 40, 60), // red
+    diff_added_bg: Color::Rgb(223, 247, 231), // light green
     diff_deleted_bg: Color::Rgb(254, 229, 229), // light red
-    tool_running: Color::Rgb(53, 120, 229),     // blue
-    tool_success: LIGHT_TEXT_HINT,
+    tool_running: Color::Rgb(53, 120, 229),   // blue
+    tool_success: Color::Rgb(21, 128, 61),
     tool_failed: Color::Rgb(200, 40, 60), // red
 };
 
@@ -212,14 +224,14 @@ pub const SOLARIZED_LIGHT_UI_THEME: UiTheme = UiTheme {
     mode_plan: SOLARIZED_ORANGE,
     mode_operate: Color::Rgb(0x6C, 0x71, 0xC4), // solarized violet
     status_ready: SOLARIZED_CYAN,
-    status_working: SOLARIZED_BLUE,
+    status_working: SOLARIZED_CYAN,
     status_warning: SOLARIZED_YELLOW,
     diff_added_fg: SOLARIZED_GREEN,
     diff_deleted_fg: SOLARIZED_RED,
     diff_added_bg: SOLARIZED_DIFF_ADDED_BG,
     diff_deleted_bg: SOLARIZED_DIFF_DELETED_BG,
     tool_running: SOLARIZED_BLUE,
-    tool_success: SOLARIZED_CYAN,
+    tool_success: SOLARIZED_GREEN,
     tool_failed: SOLARIZED_RED,
 };
 
@@ -913,6 +925,19 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn every_selectable_theme_separates_live_workers_from_completed_work() {
+        for theme_id in SELECTABLE_THEMES {
+            let ui = theme_id.ui_theme();
+            assert_ne!(
+                ui.info,
+                ui.success,
+                "theme '{}' makes live workers indistinguishable from completed work",
+                theme_id.name(),
+            );
         }
     }
 }

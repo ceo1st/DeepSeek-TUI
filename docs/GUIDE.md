@@ -171,7 +171,7 @@ CodeWhale works best when you let investigation and implementation happen in
 separate steps for unfamiliar code. For small, well-understood changes, a
 single implementation request is fine.
 
-Next: [MODES.md](MODES.md) explains when to use Plan, Agent, and YOLO.
+Next: [MODES.md](MODES.md) explains when to use Plan, Act, and the Operate preview.
 
 ## 4. Understanding the Interface
 
@@ -219,8 +219,8 @@ CodeWhale has three visible TUI modes:
 | Mode | Use it for | Default posture |
 | --- | --- | --- |
 | Plan | Exploration, design, and review before changes | Read-only investigation |
-| Agent | Normal multi-step coding work | Tool use with approval gates |
-| YOLO | Trusted repos where you want automatic execution | Auto-approval and trust |
+| Act | Normal multi-step coding work | Tool use with approval gates |
+| Operate (preview) | Fleet-backed orchestration | Explicit preview; not in the Tab cycle |
 
 Switch modes from the TUI with the mode picker:
 
@@ -232,8 +232,8 @@ Or switch directly:
 
 ```text
 /mode plan
-/mode agent
-/mode yolo
+/mode act
+/mode operate
 ```
 
 Plan mode is the safest place to start in an unfamiliar repository. It is for
@@ -244,12 +244,12 @@ approach, verification plan, risks, and handoff notes. Empty sections are
 visible when the agent uses the rich artifact shape, so you can ask for a
 revision instead of accepting an under-specified plan.
 
-Agent mode is the default for most contribution work. It lets CodeWhale read,
+Act mode is the default for most contribution work. It lets CodeWhale read,
 run checks, and edit files while keeping risky actions behind approval gates.
 
-YOLO mode is for trusted workspaces where you intentionally want the model to
-act without stopping for approvals. Do not use it in a repository you do not
-trust.
+For trusted workspaces where you intentionally want actions to proceed without
+approval prompts, select the Full Access permission posture with `Shift+Tab`.
+Do not use Full Access in a repository you do not trust.
 
 Modes are separate from model routing. `Tab` cycles visible modes when the
 composer is idle, while `/model auto` controls model and thinking selection for
@@ -324,8 +324,8 @@ Examples of tool-backed work include:
 
 Tool use is governed by mode, approvals, and sandbox policy. The exact behavior
 depends on the current mode and config, but the basic rule is simple: start in
-Plan for read-only exploration, use Agent for normal changes, and reserve YOLO
-for trusted automation.
+Plan for read-only exploration, use Act for normal changes, and reserve Full
+Access for trusted automation.
 
 The workspace boundary matters. CodeWhale is expected to work in the directory
 you launched it from or the workspace you configured. Be explicit when a task
@@ -474,8 +474,8 @@ open when configuring a non-default route.
 
 ### Which mode should I use first?
 
-Use Plan for unfamiliar code, Agent for normal implementation, and YOLO only
-for trusted repositories where automatic execution is acceptable.
+Use Plan for unfamiliar code, Act for normal implementation, and Full Access
+only for trusted repositories where automatic execution is acceptable.
 
 ### Why does CodeWhale ask before running commands?
 

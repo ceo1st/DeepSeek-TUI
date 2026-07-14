@@ -1,17 +1,21 @@
 //! `/theme` picker with live preview.
 //!
-//! Modeled after `feedback_picker`. Differences:
-//! - The option list comes from `palette::SELECTABLE_THEMES`.
+//! Built on [`crate::tui::settings_picker`]: navigation, filtering ownership,
+//! and transactional preview/commit/rollback live in the shared controller.
+//! Ocean-specific chrome (swatches, underwater surface, treatment copy) stays
+//! here so the framework contract does not flatten visual character.
+//!
+//! Semantics preserved from the pre-framework picker:
 //! - Up/Down emit a `ConfigUpdated{persist:false}` so the host swaps
-//!   `app.ui_theme` immediately and the whole TUI re-paints under the
-//!   modal — the user sees the candidate theme before committing.
+//!   `app.ui_theme` immediately and the whole TUI re-paints under the modal.
 //! - Enter persists (`persist:true`); Esc emits one more
 //!   `ConfigUpdated{persist:false}` to restore the original theme name
 //!   that was active when the picker opened.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -22,16 +26,17 @@ use ratatui::{
 
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette::{SELECTABLE_THEMES, ThemeId, UiTheme};
+use crate::tui::settings_picker::{
+    PickerNavResult, SettingAvailability, SettingOption, SettingValues, SettingsPickerController,
+    SettingsPickerLayout, handle_nav_key,
+};
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_panel_scroll_rail, render_underwater_surface,
 };
 
 pub struct ThemePickerView {
-    selected: usize,
-    /// Settings name of the theme that was active when the picker opened.
-    /// Used to revert on Esc.
-    original_name: String,
+    controller: SettingsPickerController,
     /// Cached UiTheme for `ThemeId::System`, captured once at construction
     /// so the per-frame render doesn't re-invoke `UiTheme::detect()` (which
     /// reads `COLORFGBG`) on every keystroke.
@@ -43,6 +48,30 @@ pub struct ThemePickerView {
     last_mouse_selected: Option<usize>,
     /// UI locale captured from the app at construction (#4057 wave 2).
     locale: Locale,
+}
+
+fn theme_options(original_name: &str) -> Vec<SettingOption> {
+    let current = original_name.trim().to_ascii_lowercase();
+    SELECTABLE_THEMES
+        .iter()
+        .copied()
+        .map(|id| {
+            let name = id.name();
+            SettingOption::builder(name, id.display_name())
+                .summary(id.tagline())
+                .detail(id.tagline())
+                .help("Pick a theme — preview is live; Enter saves to settings.toml.")
+                .values(SettingValues::new(
+                    Cow::Owned(current.clone()),
+                    Cow::Borrowed("system"),
+                    Cow::Borrowed(name),
+                ))
+                .availability(SettingAvailability::Available)
+                .tab("themes")
+                .prefer_list_when_narrow(true)
+                .build()
+        })
+        .collect()
 }
 
 impl ThemePickerView {
@@ -62,15 +91,18 @@ impl ThemePickerView {
         ocean_treatment: crate::tui::ocean::OceanTreatment,
         locale: Locale,
     ) -> Self {
-        // If the persisted name matches one of the entries, start there;
-        // otherwise fall back to "System" so the cursor lands on a valid row.
-        let selected = SELECTABLE_THEMES
+        let options = theme_options(&original_name);
+        let mut controller = SettingsPickerController::new(options, original_name.clone());
+        // Land on the persisted theme when it matches a selectable id.
+        let normalized = original_name.trim().to_ascii_lowercase();
+        if let Some(source) = SELECTABLE_THEMES
             .iter()
-            .position(|id| id.name() == original_name.trim().to_ascii_lowercase())
-            .unwrap_or(0);
+            .position(|id| id.name() == normalized)
+        {
+            let _ = controller.select_source_index(source);
+        }
         Self {
-            selected,
-            original_name,
+            controller,
             system_ui_theme: UiTheme::detect(),
             ocean_treatment,
             row_hitboxes: RefCell::new(Vec::new()),
@@ -79,11 +111,37 @@ impl ThemePickerView {
         }
     }
 
+    /// Construct behind type erasure before returning to the async event loop.
+    /// Keeping the concrete picker out of that already-large future prevents
+    /// transient modal values from inflating the main-thread stack frame.
+    #[must_use]
+    pub fn boxed_with_treatment(
+        original_name: String,
+        ocean_treatment: crate::tui::ocean::OceanTreatment,
+        locale: Locale,
+    ) -> Box<dyn ModalView> {
+        Box::new(Self::new_with_treatment(
+            original_name,
+            ocean_treatment,
+            locale,
+        ))
+    }
+
     fn current(&self) -> ThemeId {
-        SELECTABLE_THEMES
-            .get(self.selected)
-            .copied()
+        self.controller
+            .selected_id()
+            .and_then(|name| {
+                SELECTABLE_THEMES
+                    .iter()
+                    .copied()
+                    .find(|id| id.name() == name)
+            })
             .unwrap_or(ThemeId::System)
+    }
+
+    #[cfg(test)]
+    fn selected(&self) -> usize {
+        self.controller.selected_source_index().unwrap_or(0)
     }
 
     /// Resolve a theme to a `UiTheme`, returning the cached `System`
@@ -115,17 +173,28 @@ impl ThemePickerView {
     fn revert_event(&self) -> ViewAction {
         ViewAction::EmitAndClose(ViewEvent::ConfigUpdated {
             key: "theme".to_string(),
-            value: self.original_name.clone(),
+            value: self.controller.original_id().to_string(),
             persist: false,
         })
     }
 
-    fn move_up(&mut self) {
-        self.selected = (self.selected + SELECTABLE_THEMES.len() - 1) % SELECTABLE_THEMES.len();
+    fn action_from_nav(&self, result: PickerNavResult) -> ViewAction {
+        match result {
+            PickerNavResult::Preview => self.preview_event(),
+            PickerNavResult::Commit => self.commit_event(),
+            PickerNavResult::Cancel => self.revert_event(),
+            PickerNavResult::ItemAction | PickerNavResult::None => ViewAction::None,
+        }
     }
 
-    fn move_down(&mut self) {
-        self.selected = (self.selected + 1) % SELECTABLE_THEMES.len();
+    fn move_up(&mut self) -> ViewAction {
+        let result = self.controller.move_up();
+        self.action_from_nav(result)
+    }
+
+    fn move_down(&mut self) -> ViewAction {
+        let result = self.controller.move_down();
+        self.action_from_nav(result)
     }
 }
 
@@ -141,14 +210,12 @@ impl ModalView for ThemePickerView {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.move_up();
                 self.last_mouse_selected = None;
-                self.preview_event()
+                self.move_up()
             }
             MouseEventKind::ScrollDown => {
-                self.move_down();
                 self.last_mouse_selected = None;
-                self.preview_event()
+                self.move_down()
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let clicked = self.row_hitboxes.borrow().iter().find_map(|(rect, idx)| {
@@ -156,13 +223,14 @@ impl ModalView for ThemePickerView {
                         .then_some(*idx)
                 });
                 if let Some(idx) = clicked {
-                    let commit = self.last_mouse_selected == Some(idx) && self.selected == idx;
-                    self.selected = idx;
+                    let commit = self.last_mouse_selected == Some(idx)
+                        && self.controller.selected_source_index() == Some(idx);
+                    let nav = self.controller.select_source_index(idx);
                     self.last_mouse_selected = Some(idx);
                     if commit {
                         self.commit_event()
                     } else {
-                        self.preview_event()
+                        self.action_from_nav(nav)
                     }
                 } else {
                     ViewAction::None
@@ -173,43 +241,10 @@ impl ModalView for ThemePickerView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
-        match key.code {
-            KeyCode::Esc => self.revert_event(),
-            KeyCode::Enter => self.commit_event(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                self.preview_event()
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                self.preview_event()
-            }
-            KeyCode::Home => {
-                self.selected = 0;
-                self.preview_event()
-            }
-            KeyCode::End => {
-                self.selected = SELECTABLE_THEMES.len().saturating_sub(1);
-                self.preview_event()
-            }
-            // Number shortcuts: '1'..='9' jump to that row (1-indexed).
-            // '0' is rejected explicitly — saturating_sub would otherwise
-            // collapse it onto row 0, which is unintuitive.
-            KeyCode::Char(c)
-                if matches!(c, '1'..='9')
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                let idx = (c as usize) - ('1' as usize);
-                if idx < SELECTABLE_THEMES.len() {
-                    self.selected = idx;
-                    self.preview_event()
-                } else {
-                    ViewAction::None
-                }
-            }
-            _ => ViewAction::None,
-        }
+        // Theme picker keeps digit-jump / vim keys; search typing stays off so
+        // `j`/`k` and `1`..=`9` retain their navigation meaning.
+        let result = handle_nav_key(&mut self.controller, key, false);
+        self.action_from_nav(result)
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -233,6 +268,9 @@ impl ModalView for ThemePickerView {
                 ActionHint::new("Esc", "revert"),
             ],
         );
+
+        // Theme rows prefer list-when-narrow; layout still drives scroll math.
+        let _layout = SettingsPickerLayout::resolve(content, 34, self.controller.selected_option());
 
         let mut lines: Vec<Line> = Vec::with_capacity(SELECTABLE_THEMES.len() + 5);
         lines.push(Line::from(Span::styled(
@@ -258,21 +296,24 @@ impl ModalView for ThemePickerView {
         let visible_rows = usize::from(content.height)
             .saturating_sub(header_rows)
             .max(1);
-        let max_start = SELECTABLE_THEMES.len().saturating_sub(visible_rows);
-        let start = self
-            .selected
+        let source_count = self.controller.visible().len();
+        let selected_visible = self.controller.selected_visible();
+        let max_start = source_count.saturating_sub(visible_rows);
+        let start = selected_visible
             .saturating_sub(visible_rows.saturating_sub(1))
             .min(max_start);
         let content = render_panel_scroll_rail(
             content,
             buf,
-            SELECTABLE_THEMES.len().saturating_add(header_rows),
+            source_count.saturating_add(header_rows),
             start,
             visible_rows,
             true,
         );
 
-        for (idx, id) in SELECTABLE_THEMES
+        for (visible_idx, &source_idx) in self
+            .controller
+            .visible()
             .iter()
             .enumerate()
             .skip(start)
@@ -281,9 +322,12 @@ impl ModalView for ThemePickerView {
             let row_y = content.y.saturating_add(lines.len() as u16);
             self.row_hitboxes
                 .borrow_mut()
-                .push((Rect::new(content.x, row_y, content.width, 1), idx));
-            let id = *id;
-            let is_selected = idx == self.selected;
+                .push((Rect::new(content.x, row_y, content.width, 1), source_idx));
+            let id = SELECTABLE_THEMES
+                .get(source_idx)
+                .copied()
+                .unwrap_or(ThemeId::System);
+            let is_selected = visible_idx == selected_visible;
             let row_style = if is_selected {
                 Style::default()
                     .fg(live.text_body)
@@ -322,7 +366,7 @@ impl ModalView for ThemePickerView {
 
             let mut spans: Vec<Span> = Vec::with_capacity(8);
             spans.push(Span::styled(format!(" {pointer} "), row_style));
-            spans.push(Span::styled(format!("{}. ", idx + 1), number_style));
+            spans.push(Span::styled(format!("{}. ", visible_idx + 1), number_style));
             spans.push(Span::styled(
                 format!("{:<22}", id.display_name()),
                 row_style,
@@ -347,6 +391,7 @@ impl ModalView for ThemePickerView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -373,7 +418,7 @@ mod tests {
     #[test]
     fn unknown_persisted_name_falls_back_to_first_row() {
         let v = ThemePickerView::new("not-a-real-theme".to_string());
-        assert_eq!(v.selected, 0);
+        assert_eq!(v.selected(), 0);
         assert_eq!(v.current(), ThemeId::System);
     }
 
@@ -409,7 +454,7 @@ mod tests {
         };
         let preview = v.handle_mouse(click);
         assert!(matches!(preview, ViewAction::Emit(_)));
-        assert_eq!(v.selected, idx);
+        assert_eq!(v.selected(), idx);
         let commit = v.handle_mouse(click);
         assert!(matches!(commit, ViewAction::EmitAndClose(_)));
     }
@@ -483,10 +528,10 @@ mod tests {
     #[test]
     fn digit_zero_is_rejected_not_remapped_to_row_zero() {
         let mut v = ThemePickerView::new("dracula".to_string());
-        let before = v.selected;
+        let before = v.selected();
         let action = v.handle_key(key(KeyCode::Char('0')));
         assert!(matches!(action, ViewAction::None));
-        assert_eq!(v.selected, before, "'0' should not move the cursor");
+        assert_eq!(v.selected(), before, "'0' should not move the cursor");
     }
 
     #[test]
@@ -550,7 +595,7 @@ mod tests {
         let mut view = ThemePickerView::new("system".to_string());
 
         for (index, expected) in SELECTABLE_THEMES.iter().copied().enumerate() {
-            view.selected = index;
+            let _ = view.controller.select_source_index(index);
             assert_eq!(view.current(), expected);
             assert_eq!(selected_name(&view.preview_event()), Some(expected.name()));
 
@@ -648,5 +693,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn theme_picker_uses_shared_settings_controller() {
+        let v = ThemePickerView::new("dracula".to_string());
+        assert_eq!(v.controller.original_id(), "dracula");
+        assert_eq!(v.controller.selected_id(), Some("dracula"));
+        assert_eq!(v.controller.visible().len(), SELECTABLE_THEMES.len());
     }
 }

@@ -152,11 +152,33 @@ pub struct WorkerRuntimeProfile {
     /// `max_spawn_depth > 0`; each level decrements it. Clamped to the workspace
     /// ceiling.
     pub max_spawn_depth: u32,
+    /// Finite model-turn budget for this role.
+    #[serde(default = "default_general_max_steps")]
+    pub max_steps: u32,
     /// Whether the worker runs detached (background) or inline (foreground).
     pub background: bool,
 }
 
 impl WorkerRuntimeProfile {
+    /// Maximum model turns for read-mostly workers.
+    pub const READ_ONLY_MAX_STEPS: u32 = 60;
+    /// Maximum model turns for workers that may implement changes.
+    pub const GENERAL_MAX_STEPS: u32 = 120;
+
+    /// Return the finite model-turn budget appropriate for this role.
+    #[must_use]
+    pub const fn default_max_steps(role: SubAgentType) -> u32 {
+        match role {
+            SubAgentType::Explore
+            | SubAgentType::Review
+            | SubAgentType::Plan
+            | SubAgentType::Verifier => Self::READ_ONLY_MAX_STEPS,
+            SubAgentType::Implementer | SubAgentType::General | SubAgentType::Custom => {
+                Self::GENERAL_MAX_STEPS
+            }
+        }
+    }
+
     /// The default profile for a role — the per-role posture. Mirrors the role
     /// stances documented in `docs/SUBAGENTS.md` (explore/plan/review are
     /// read-only; verifier runs tests; implementer/general write).
@@ -179,7 +201,7 @@ impl WorkerRuntimeProfile {
             SubAgentType::Custom => (PermissionSet::read_only(), ShellPolicy::None),
         };
         Self {
-            role,
+            role: role.clone(),
             permissions,
             shell,
             tools: ToolScope::Inherit,
@@ -188,6 +210,7 @@ impl WorkerRuntimeProfile {
             reasoning_effort: None,
             denied_tools: Vec::new(),
             max_spawn_depth: codewhale_config::DEFAULT_SPAWN_DEPTH,
+            max_steps: Self::default_max_steps(role.clone()),
             background: true,
         }
     }
@@ -252,6 +275,7 @@ impl WorkerRuntimeProfile {
                 .or_else(|| self.reasoning_effort.clone()),
             denied_tools,
             max_spawn_depth,
+            max_steps: requested.max_steps,
             background: requested.background,
         }
     }
@@ -261,6 +285,10 @@ impl WorkerRuntimeProfile {
     pub fn can_spawn_child(&self) -> bool {
         self.max_spawn_depth > 0
     }
+}
+
+const fn default_general_max_steps() -> u32 {
+    WorkerRuntimeProfile::GENERAL_MAX_STEPS
 }
 
 impl Default for WorkerRuntimeProfile {
@@ -323,6 +351,25 @@ mod tests {
             ShellPolicy::Full,
             "verifier runs the test suite"
         );
+    }
+
+    #[test]
+    fn role_step_budgets_are_finite_and_profile_owned() {
+        for role in [
+            SubAgentType::Explore,
+            SubAgentType::Review,
+            SubAgentType::Plan,
+            SubAgentType::Verifier,
+            SubAgentType::Implementer,
+            SubAgentType::General,
+            SubAgentType::Custom,
+        ] {
+            assert!(WorkerRuntimeProfile::for_role(role.clone()).max_steps > 0);
+            assert_eq!(
+                WorkerRuntimeProfile::for_role(role.clone()).max_steps,
+                WorkerRuntimeProfile::default_max_steps(role)
+            );
+        }
     }
 
     #[test]

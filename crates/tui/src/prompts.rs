@@ -8,7 +8,7 @@
 //! This keeps each concern in its own file and makes prompt tuning
 //! a single-file operation.
 
-use crate::models::SystemPrompt;
+use crate::models::{SystemBlock, SystemPrompt};
 use crate::project_context::{ProjectContext, load_project_context_with_parents};
 use crate::tui::app::AppMode;
 use std::path::{Path, PathBuf};
@@ -419,7 +419,7 @@ static PROMPT_OVERRIDE_NOTICES: LazyLock<Mutex<Vec<String>>> =
 /// Context passed to an embedder-provided static prompt composer.
 ///
 /// This hook only replaces the byte-stable base/personality prompt segment.
-/// Mode deltas, approval policy, tool taxonomy, Context Management, and the
+/// Mode deltas, approval policy, tool taxonomy, Core Execution, and the
 /// Compaction Relay stay owned by CodeWhale's system prompt assembly.
 #[non_exhaustive]
 #[derive(Debug)]
@@ -506,8 +506,8 @@ pub fn set_static_prompt_composer_override(
 // custom embedder build.
 //
 // Scope is deliberately narrow: only the byte-stable base prompt segment is
-// user-overridable. Mode deltas, approval policy, tool taxonomy, Context
-// Management, and the Compaction Relay stay owned by the runtime assembly (see
+// user-overridable. Mode deltas, approval policy, tool taxonomy, Core
+// Execution, and the Compaction Relay stay owned by the runtime assembly (see
 // `StaticPromptCtx`), so an override cannot strip safety-relevant guidance.
 // A missing or empty file is a no-op — the bundled constant is used — so this
 // is fully backward compatible.
@@ -909,6 +909,10 @@ pub const GOAL_CONTINUATION_PROMPT: &str = include_str!("prompts/continuation.md
 /// can override the user's current request (#725).
 pub const MEMORY_GUIDANCE: &str = include_str!("prompts/memory_guidance.md");
 
+/// Lean execution layer shared by the default agent runtime. Product/UI
+/// tutorials remain outside the model-facing coding contract.
+pub const CORE_EXECUTION_PROFILE_PROMPT: &str = include_str!("prompts/core_execution.md");
+
 // ── Legacy prompt constants (kept for backwards compatibility) ────────
 
 /// Legacy base prompt (agent.txt — now decomposed into constitution.md + overlays).
@@ -1108,7 +1112,7 @@ pub fn system_prompt_for_mode_with_context(
 ///   1. mode prompt (compile-time constant)
 ///   2. project context / fallback (workspace-static)
 ///   3. skills block (skills-dir-static)
-///   4. `## Context Management` (compile-time constant, Agent/Yolo only)
+///   4. `## Core Execution` (compile-time constant)
 ///   5. compaction relay template (compile-time constant)
 ///   6. relay block — file-backed; rewritten by `/compact` and on exit
 ///
@@ -1270,125 +1274,180 @@ pub fn system_prompt_for_mode_with_context_skills_session_and_approval(
         full_prompt = format!("{full_prompt}\n\n{block}");
     }
 
-    // 4. Context Management — included in all modes.
-    {
-        full_prompt.push_str(
-            "\n\n## Context Management\n\n\
-             When the conversation gets long (you'll see a context usage indicator), you can:\n\
-             1. Use `/compact` to summarize earlier context and free up space\n\
-             2. The system will preserve important information (files you're working on, recent messages, tool results)\n\
-             3. After compaction, you'll see a summary of what was discussed and can continue seamlessly\n\n\
-             If you notice context is getting long (>60% during sustained work), proactively suggest using `/compact` or Ctrl+L to the user. If auto_compact is enabled, the engine can compact before the next send once the configured threshold is crossed.\n\n\
-             ### Prompt-cache awareness\n\n\
-             DeepSeek caches the longest *byte-stable prefix* of every request and charges roughly 100× less for cache-hit tokens than miss tokens. The system prompt above is layered most-static-first specifically so the prefix stays stable turn-over-turn. To keep cache hits high:\n\
-             - **Working set location:** the current repo working set is stored on new user messages inside a `<turn_meta>` block. Treat it as high-priority turn metadata, not as a stable system-prompt section.\n\
-             - **Append, don't reorder.** New context goes at the end (latest user / tool messages). Reshuffling earlier messages or rewriting their content invalidates the cache for everything after the change.\n\
-             - **Don't paraphrase quoted content.** If you've already read a file, refer to it by path or line range instead of re-quoting it with different formatting.\n\
-             - **Use `/compact` as a hard reset, not a tweak.** Compaction is meant for when the cache is already losing — it intentionally rewrites the prefix to a shorter summary. Don't trigger it for small wins.\n\
-             - **Read once, refer back.** Re-reading the same file produces a different tool-result envelope than the prior read; it's cheaper to scroll back than to re-fetch.\n\
-             - **Footer chip:** the `cache hit %` chip turns red below 40% and yellow below 80%. If it's been red for several turns, that's a signal to consolidate."
-        );
-    }
+    // 4. Lean, runtime-only coding discipline. Context pressure, prompt-cache
+    // accounting, footer presentation, and automatic compaction are host
+    // responsibilities; teaching their UI to the model dilutes the task.
+    full_prompt.push_str("\n\n");
+    full_prompt.push_str(CORE_EXECUTION_PROFILE_PROMPT.trim());
 
     // 5. Compaction relay template — so the model knows the format to use
     //    when writing `.codewhale/handoff.md` on exit / `/compact`.
     full_prompt.push_str("\n\n");
     full_prompt.push_str(COMPACT_TEMPLATE);
 
-    // ── Volatile-content boundary ─────────────────────────────────────────
-    // Everything below drifts mid-session and busts the prefix cache for
-    // bytes that follow. All static layers (mode, project context, env,
-    // skills, context management, compact template) live above this line
-    // so DeepSeek's KV prefix cache can hit on the entire system prompt
-    // regardless of per-session edits to memory, goals, or instructions.
+    // ── Volatile-content boundary → WorldState fragments ──────────────────
+    // Constitution (`full_prompt`) stays the cache-stable Blocks[0] prefix.
+    // Everything below drifts mid-session and is assembled as marked
+    // WorldState fragments so an env/memory/goal/handoff change can
+    // `render_diff` without rebuilding unrelated material.
 
-    // 6. Environment block — platform, shell, pwd, locale.
-    //
-    // Placed below the volatile-content boundary. The original comment claimed
-    // "workspace path is fixed for the run" → static-cacheable, which is true
-    // for the terminal use case (one process owns one workspace for its
-    // lifetime). It is **not** true for embedders that swap workspaces between
-    // sessions (the Op::SyncSession path, multi-engine pools, IDE
-    // integrations binding the engine to a per-tab workspace, etc.):
-    // `pwd` drifts session-to-session and drags the entire static prefix
-    // out of cache reuse. Moving the block below the volatile boundary keeps
-    // mode / project / skills / context-mgmt / compact-template byte-stable
-    // across sessions while preserving the pwd info the model needs for
-    // `exec_shell` and structured search tools.
-    full_prompt = format!(
-        "{full_prompt}\n\n{}",
-        render_environment_block(workspace, session_context.locale_tag),
-    );
-
-    // 6a. Configured `instructions = [...]` files (#454). Loaded
-    // and concatenated in declared order. Placed below the volatile boundary
-    // because these files are workspace-scoped and may differ between
-    // sessions; any edit to them would otherwise bust the prefix cache for
-    // all subsequent static layers.
-    if let Some(sources) = instructions
-        && let Some(block) = render_instructions_block(sources)
-    {
-        full_prompt = format!("{full_prompt}\n\n{block}");
-    }
-
-    // 6b. User memory block (#489). Placed below the volatile boundary
-    // because memory entries are editable mid-session via `/memory` or
-    // `# foo` quick-add. When they change, they only invalidate the
-    // trailing relay block — the static prefix above stays cached.
+    // Workspace fragment: environment + mid-session memory/goal facts.
+    let mut workspace_parts = vec![render_environment_block(
+        workspace,
+        session_context.locale_tag,
+    )];
     if let Some(memory_block) = session_context.user_memory_block
         && !memory_block.trim().is_empty()
     {
-        full_prompt = format!("{full_prompt}\n\n{memory_block}\n\n{MEMORY_GUIDANCE}");
+        workspace_parts.push(format!("{memory_block}\n\n{MEMORY_GUIDANCE}"));
     }
-
-    // 6c. Current session goal. Also volatile: users set / change goals
-    // during a session via `/goal`. Placed below the boundary for the
-    // same reason as memory.
     if let Some(goal_objective) = session_context.goal_objective
         && !goal_objective.trim().is_empty()
     {
-        full_prompt = format!(
-            "{full_prompt}\n\n## Current Goal\n\n<session_goal>\n{}\n</session_goal>",
+        workspace_parts.push(format!(
+            "## Current Goal\n\n<session_goal>\n{}\n</session_goal>",
             goal_objective.trim()
-        );
+        ));
     }
+    let workspace_body = workspace_parts.join("\n\n");
 
-    // 7. Previous-session relay (file-backed, rewritten by `/compact`).
-    if let Some(handoff_block) = load_handoff_block(workspace) {
-        full_prompt = format!("{full_prompt}\n\n{handoff_block}");
+    // Permissions fragment: configured `instructions = [...]` files (#454).
+    let permissions_body = instructions.and_then(render_instructions_block);
+
+    // Route fragment: active model / verbosity / translation posture.
+    let route_body = render_route_fragment(&session_context);
+
+    // Token-budget / continuity fragment: prior-session handoff relay.
+    let token_budget_body = load_handoff_block(workspace);
+
+    let world_state = world_state_from_session_facts(
+        Some(workspace_body.as_str()),
+        permissions_body.as_deref(),
+        Some(route_body.as_str()),
+        None, // AgentTopology is updated by runtime callers when available.
+        None, // Skills stay in the constitution prefix (skills-dir-static).
+        token_budget_body.as_deref(),
+    );
+
+    let mut blocks = crate::model_context::WorldStateSnapshot {
+        constitution: full_prompt,
+        world_state,
     }
+    .to_system_blocks();
 
-    // 7a. Authority recap — the final tier reminder before user messages.
-    // Uses recency bias constructively: this is the last content the model
-    // sees before the user's turn, reinforcing the Constitutional hierarchy.
-    let authority_recap = effective_authority_recap();
-    full_prompt = format!("{full_prompt}\n\n{authority_recap}");
-
-    // 8. Locale-native closing reinforcement (#1118 follow-up #2). The
-    // opening preamble alone wasn't enough — community feedback (the
-    // WeChat thread about XML-tagged bilingual bookends) flagged that as
-    // English context accumulates turn-over-turn, the model's recency
-    // bias pulls thinking back to English. Putting the same directive at
-    // the END of the system prompt — right before the user's next
-    // message — uses recency bias *in our favor*: the model sees the
-    // native-script "keep thinking in Chinese / Japanese / Portuguese"
-    // rule immediately before it generates `reasoning_content` for the
-    // turn. English (and unknown) locales return `None` and the prompt
-    // stays byte-identical to the pre-bookend behavior.
+    // Trailers keep recency bias after WorldState: authority, then locale.
+    blocks.push(SystemBlock {
+        block_type: "text".to_string(),
+        text: effective_authority_recap().trim().to_string(),
+        cache_control: None,
+    });
     if let Some(closer) = session_context
         .show_thinking
         .then(|| locale_reinforcement_closer(session_context.locale_tag))
         .flatten()
     {
-        full_prompt = format!("{full_prompt}\n\n{closer}");
+        blocks.push(SystemBlock {
+            block_type: "text".to_string(),
+            text: closer.trim().to_string(),
+            cache_control: None,
+        });
     } else if !session_context.show_thinking {
-        full_prompt = format!(
-            "{full_prompt}\n\n{}",
-            hidden_thinking_language_instruction(session_context.locale_tag)
-        );
+        blocks.push(SystemBlock {
+            block_type: "text".to_string(),
+            text: hidden_thinking_language_instruction(session_context.locale_tag)
+                .trim()
+                .to_string(),
+            cache_control: None,
+        });
     }
 
-    SystemPrompt::Text(full_prompt)
+    SystemPrompt::Blocks(blocks)
+}
+
+/// Flatten a system prompt to joined text (tests + debug inspectors).
+#[must_use]
+pub fn system_prompt_flat_text(prompt: &SystemPrompt) -> String {
+    match prompt {
+        SystemPrompt::Text(text) => text.clone(),
+        SystemPrompt::Blocks(blocks) => blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    }
+}
+
+fn render_route_fragment(session_context: &PromptSessionContext<'_>) -> String {
+    let verbosity = session_context
+        .verbosity
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default");
+    format!(
+        "model: {}\nverbosity: {}\ntranslation: {}\nshow_thinking: {}",
+        session_context.model_id.trim(),
+        verbosity,
+        if session_context.translation_enabled {
+            "on"
+        } else {
+            "off"
+        },
+        if session_context.show_thinking {
+            "on"
+        } else {
+            "off"
+        },
+    )
+}
+
+/// Assemble a cache-stable constitution prefix with a typed WorldState layer.
+///
+/// This is the Codex-parity assembly point: constitution stays byte-stable for
+/// prefix caching; volatile concerns live in `WorldState` fragments with
+/// markers, caps, and `render_diff` retain-unchanged behavior. Callers that
+/// still need a flat string can use [`WorldStateSnapshot::render_text`].
+pub fn system_prompt_with_world_state(
+    constitution: impl Into<String>,
+    world_state: crate::model_context::WorldState,
+) -> SystemPrompt {
+    let snapshot = crate::model_context::WorldStateSnapshot {
+        constitution: constitution.into(),
+        world_state,
+    };
+    SystemPrompt::Blocks(snapshot.to_system_blocks())
+}
+
+/// Build a WorldState from the common volatile session facts.
+///
+/// Does not load constitution — callers keep that as the stable base.
+pub fn world_state_from_session_facts(
+    workspace_body: Option<&str>,
+    permissions_body: Option<&str>,
+    route_body: Option<&str>,
+    agent_topology_body: Option<&str>,
+    skills_tools_body: Option<&str>,
+    token_budget_body: Option<&str>,
+) -> crate::model_context::WorldState {
+    let mut state = crate::model_context::WorldState::new();
+    if let Some(body) = workspace_body.filter(|s| !s.trim().is_empty()) {
+        state = state.with_workspace(body);
+    }
+    if let Some(body) = permissions_body.filter(|s| !s.trim().is_empty()) {
+        state = state.with_permissions(body);
+    }
+    if let Some(body) = route_body.filter(|s| !s.trim().is_empty()) {
+        state = state.with_route(body);
+    }
+    if let Some(body) = agent_topology_body.filter(|s| !s.trim().is_empty()) {
+        state = state.with_agent_topology(body);
+    }
+    if let Some(body) = skills_tools_body.filter(|s| !s.trim().is_empty()) {
+        state = state.with_skills_tools(body);
+    }
+    if let Some(body) = token_budget_body.filter(|s| !s.trim().is_empty()) {
+        state = state.with_token_budget(body);
+    }
+    state
 }
 
 /// Build a system prompt with explicit project context
@@ -1898,16 +1957,15 @@ mod tests {
     #[test]
     fn authority_recap_appears_in_full_prompt() {
         let tmp = tempdir().expect("tempdir");
-        let text = match system_prompt_for_mode_with_context_skills_session_and_approval(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext::default(),
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let text = system_prompt_flat_text(
+            &system_prompt_for_mode_with_context_skills_session_and_approval(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext::default(),
+            ),
+        );
         assert!(
             text.contains("## Authority Recap"),
             "full system prompt must contain the authority recap"
@@ -1936,16 +1994,13 @@ mod tests {
         );
         write_test_skill(&configured_dir, "configured-skill", "configured skill");
 
-        let text = match system_prompt_for_mode_with_context_and_skills(
+        let text = system_prompt_flat_text(&system_prompt_for_mode_with_context_and_skills(
             &workspace,
             None,
             Some(&configured_dir),
             None,
             None,
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        ));
 
         assert!(text.contains("workspace-skill"));
         assert!(text.contains("configured-skill"));
@@ -2108,27 +2163,26 @@ mod tests {
         // base-prompt body. Cache stability and attention precedence
         // both depend on this ordering.
         let tmp = tempdir().expect("tempdir");
-        let text = match system_prompt_for_mode_with_context_skills_session_and_approval(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "zh-Hans",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let text = system_prompt_flat_text(
+            &system_prompt_for_mode_with_context_skills_session_and_approval(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "zh-Hans",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ),
+        );
         let preamble_marker = "## 语言要求";
         let base_marker = "You are CodeWhale";
         let preamble_pos = text
@@ -2180,27 +2234,26 @@ mod tests {
         // matching the empirical finding from the WeChat thread that
         // motivated the closer.
         let tmp = tempdir().expect("tempdir");
-        let text = match system_prompt_for_mode_with_context_skills_session_and_approval(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "zh-Hans",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let text = system_prompt_flat_text(
+            &system_prompt_for_mode_with_context_skills_session_and_approval(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "zh-Hans",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ),
+        );
         let preamble_pos = text
             .find("## 语言要求")
             .expect("zh-Hans preamble must be in prompt");
@@ -2225,27 +2278,26 @@ mod tests {
     #[test]
     fn hidden_thinking_uses_english_reasoning_without_locale_bookends() {
         let tmp = tempdir().expect("tempdir");
-        let text = match system_prompt_for_mode_with_context_skills_session_and_approval(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "zh-Hans",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: false,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let text = system_prompt_flat_text(
+            &system_prompt_for_mode_with_context_skills_session_and_approval(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "zh-Hans",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: false,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ),
+        );
 
         assert!(
             text.contains("## Hidden Thinking Language"),
@@ -2280,27 +2332,26 @@ mod tests {
         // English locale → no preamble injected. Asserts the
         // "preamble is opt-in for non-English" invariant.
         let tmp = tempdir().expect("tempdir");
-        let text = match system_prompt_for_mode_with_context_skills_session_and_approval(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let text = system_prompt_flat_text(
+            &system_prompt_for_mode_with_context_skills_session_and_approval(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ),
+        );
         assert!(
             !text.contains("语言要求"),
             "English locale must not get a zh preamble: {text:?}"
@@ -2380,27 +2431,25 @@ mod tests {
     #[test]
     fn environment_block_is_inserted_into_system_prompt() {
         let tmp = tempdir().expect("tempdir");
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: true,
-                locale_tag: "ja",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: true,
+                    locale_tag: "ja",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
         assert!(prompt.contains("## Environment"));
         assert!(prompt.contains("- lang: ja"));
         assert!(prompt.contains("- codewhale_version:"));
@@ -2431,19 +2480,17 @@ mod tests {
             )
             .expect("save user constitution");
 
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            &workspace,
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                project_context_pack_enabled: false,
-                ..PromptSessionContext::default()
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                &workspace,
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    project_context_pack_enabled: false,
+                    ..PromptSessionContext::default()
+                },
+            ));
 
         let base_at = prompt.find("### Whose word wins").expect("base prompt");
         let user_block_at = prompt
@@ -2496,19 +2543,17 @@ mod tests {
             .save_to(&codewhale_home.join(codewhale_config::setup_state::SETUP_STATE_FILE_NAME))
             .expect("save setup state");
 
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            &workspace,
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                project_context_pack_enabled: false,
-                ..PromptSessionContext::default()
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                &workspace,
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    project_context_pack_enabled: false,
+                    ..PromptSessionContext::default()
+                },
+            ));
 
         assert!(!prompt.contains("<codewhale_user_constitution"));
         assert!(!prompt.contains("This file should stay inactive."));
@@ -2530,19 +2575,17 @@ mod tests {
         let _codewhale_home =
             crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", codewhale_home.as_os_str());
 
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            &workspace,
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                project_context_pack_enabled: false,
-                ..PromptSessionContext::default()
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                &workspace,
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    project_context_pack_enabled: false,
+                    ..PromptSessionContext::default()
+                },
+            ));
 
         assert!(!prompt.contains("<codewhale_user_constitution"));
     }
@@ -2572,27 +2615,25 @@ mod tests {
     #[test]
     fn memory_guidance_absent_when_no_memory_block() {
         let tmp = tempdir().expect("tempdir");
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
         assert!(
             !prompt.contains("Memory Hygiene"),
             "memory guidance must not leak into sessions without a memory block"
@@ -2603,27 +2644,25 @@ mod tests {
     fn memory_guidance_appended_after_memory_block() {
         let tmp = tempdir().expect("tempdir");
         let block = "## User Memory\n\n- prefers Rust\n";
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: Some(block),
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: Some(block),
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
         let mem_at = prompt.find("User Memory").expect("user memory present");
         let guide_at = prompt.find("Memory Hygiene").expect("guidance present");
         assert!(
@@ -2663,27 +2702,25 @@ mod tests {
     fn project_context_pack_can_be_disabled() {
         let tmp = tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("README.md"), "# Pack test").expect("write readme");
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
         assert!(!prompt.contains("<project_context_pack>"));
     }
 
@@ -2694,27 +2731,25 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".deepseek")).expect("mkdir");
         std::fs::write(tmp.path().join(".deepseek").join("handoff.md"), "handoff")
             .expect("handoff");
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: true,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: true,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
         assert!(prompt.contains("<project_context_pack>"));
         assert!(
             prompt.find("<project_context_pack>").expect("pack")
@@ -2734,10 +2769,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = match system_prompt_for_mode_with_context(workspace, None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
 
         assert!(prompt.contains(HANDOFF_BLOCK_MARKER));
         assert!(prompt.contains("Finish #32."));
@@ -2747,10 +2779,8 @@ mod tests {
     #[test]
     fn missing_handoff_does_not_inject_block() {
         let tmp = tempdir().expect("tempdir");
-        let prompt = match system_prompt_for_mode_with_context(tmp.path(), None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context(tmp.path(), None));
         assert!(!prompt.contains(HANDOFF_BLOCK_MARKER));
     }
 
@@ -2760,10 +2790,8 @@ mod tests {
         let dir = tmp.path().join(".deepseek");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("handoff.md"), "   \n\n  ").unwrap();
-        let prompt = match system_prompt_for_mode_with_context(tmp.path(), None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context(tmp.path(), None));
         assert!(!prompt.contains(HANDOFF_BLOCK_MARKER));
     }
 
@@ -2980,10 +3008,8 @@ mod tests {
     #[test]
     fn compact_template_is_included_in_full_prompt() {
         let tmp = tempdir().expect("tempdir");
-        let prompt = match system_prompt_for_mode_with_context(tmp.path(), None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context(tmp.path(), None));
         assert!(prompt.contains("## Compaction Relay"));
         // #429: structured Markdown template. Goal/Constraints/Progress
         // (Done/InProgress/Blocked)/Key Decisions/Next step.
@@ -3000,27 +3026,25 @@ mod tests {
     #[test]
     fn session_goal_is_injected_below_compact_template() {
         let tmp = tempdir().expect("tempdir");
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            tmp.path(),
-            Some("## Repo Working Set\nsrc/lib.rs"),
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: Some("Fix transcript corruption"),
-                project_context_pack_enabled: true,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                Some("## Repo Working Set\nsrc/lib.rs"),
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: Some("Fix transcript corruption"),
+                    project_context_pack_enabled: true,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
 
         let goal_pos = prompt.find("<session_goal>").expect("goal block");
         let compact_pos = prompt.find("## Compaction Relay").expect("compact block");
@@ -3037,27 +3061,25 @@ mod tests {
     #[test]
     fn empty_session_goal_is_not_injected() {
         let tmp = tempdir().expect("tempdir");
-        let prompt = match system_prompt_for_mode_with_context_skills_and_session(
-            tmp.path(),
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: Some("   "),
-                project_context_pack_enabled: true,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: None,
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: Some("   "),
+                    project_context_pack_enabled: true,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: None,
+                    skills_scan_codewhale_only: false,
+                },
+            ));
 
         assert!(!prompt.contains("<session_goal>"));
         assert!(!prompt.contains("## Current Goal"));
@@ -3402,14 +3424,8 @@ mod tests {
         let _skills_dir = EnvVarGuard::remove("DEEPSEEK_SKILLS_DIR");
         let workspace = workspace_tmp.path();
 
-        let a = match system_prompt_for_mode_with_context(workspace, None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
-        let b = match system_prompt_for_mode_with_context(workspace, None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let a = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
+        let b = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
         assert_byte_identical(
             "system_prompt_for_mode_with_context() on empty workspace",
             &a,
@@ -3431,14 +3447,14 @@ mod tests {
         let workspace = tmp.path();
         let summary = "## Repo Working Set\nWorkspace: /tmp/x\n";
 
-        let a = match system_prompt_for_mode_with_context(workspace, Some(summary)) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
-        let b = match system_prompt_for_mode_with_context(workspace, Some(summary)) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let a = system_prompt_flat_text(&system_prompt_for_mode_with_context(
+            workspace,
+            Some(summary),
+        ));
+        let b = system_prompt_flat_text(&system_prompt_for_mode_with_context(
+            workspace,
+            Some(summary),
+        ));
         assert_byte_identical(
             "system_prompt_for_mode_with_context with constant working_set summary",
             &a,
@@ -3471,14 +3487,8 @@ mod tests {
         )
         .unwrap();
 
-        let a = match system_prompt_for_mode_with_context(workspace, None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
-        let b = match system_prompt_for_mode_with_context(workspace, None) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let a = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
+        let b = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
         assert_byte_identical(
             "system_prompt_for_mode_with_context with constant handoff file",
             &a,
@@ -3491,7 +3501,7 @@ mod tests {
     #[test]
     fn handoff_appears_after_static_blocks_without_working_set() {
         // Cache-prefix invariant: the relay block must come after static
-        // `## Context Management` and the compaction relay template
+        // `## Core Execution` and the compaction relay template
         // (`## Compaction Relay`). Working-set metadata is per-turn user
         // metadata now, not a system-prompt tail block.
         let tmp = tempdir().expect("tempdir");
@@ -3501,14 +3511,14 @@ mod tests {
         std::fs::write(handoff_dir.join("handoff.md"), "# handoff body\n").unwrap();
 
         let summary = "## Repo Working Set\nWorkspace: /tmp/x\n";
-        let prompt = match system_prompt_for_mode_with_context(workspace, Some(summary)) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt = system_prompt_flat_text(&system_prompt_for_mode_with_context(
+            workspace,
+            Some(summary),
+        ));
 
-        let context_pos = prompt
-            .find("## Context Management")
-            .expect("Context Management section present in Agent mode");
+        let execution_pos = prompt
+            .find("## Core Execution")
+            .expect("Core Execution section present in Agent mode");
         let compact_pos = prompt
             .find("## Compaction Relay")
             .expect("compaction relay template present");
@@ -3521,8 +3531,8 @@ mod tests {
         );
 
         assert!(
-            context_pos < handoff_pos,
-            "## Context Management must precede the relay block"
+            execution_pos < handoff_pos,
+            "## Core Execution must precede the relay block"
         );
         assert!(
             compact_pos < handoff_pos,
@@ -3652,16 +3662,14 @@ mod tests {
         std::fs::write(&extra, "EXTRA_INSTRUCTIONS_MARKER_BODY").unwrap();
 
         let extra_source: super::InstructionSource = extra.clone().into();
-        let prompt = match super::system_prompt_for_mode_with_context_and_skills(
-            workspace,
-            None,
-            None,
-            Some(std::slice::from_ref(&extra_source)),
-            None,
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt =
+            system_prompt_flat_text(&super::system_prompt_for_mode_with_context_and_skills(
+                workspace,
+                None,
+                None,
+                Some(std::slice::from_ref(&extra_source)),
+                None,
+            ));
 
         assert!(
             prompt.contains("EXTRA_INSTRUCTIONS_MARKER_BODY"),
@@ -3677,27 +3685,26 @@ mod tests {
     fn verbosity_concise_appends_discipline_block() {
         let tmp = tempdir().expect("tempdir");
         let workspace = tmp.path();
-        let prompt = match super::system_prompt_for_mode_with_context_skills_session_and_approval(
-            workspace,
-            None,
-            None,
-            None,
-            PromptSessionContext {
-                user_memory_block: None,
-                goal_objective: None,
-                project_context_pack_enabled: false,
-                locale_tag: "en",
-                translation_enabled: false,
-                model_id: "codewhale",
-                context_window_override: None,
-                show_thinking: true,
-                verbosity: Some(" Concise "),
-                skills_scan_codewhale_only: false,
-            },
-        ) {
-            SystemPrompt::Text(text) => text,
-            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-        };
+        let prompt = system_prompt_flat_text(
+            &super::system_prompt_for_mode_with_context_skills_session_and_approval(
+                workspace,
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    show_thinking: true,
+                    verbosity: Some(" Concise "),
+                    skills_scan_codewhale_only: false,
+                },
+            ),
+        );
 
         assert!(
             prompt.contains("## Concise Output Discipline"),
@@ -3720,6 +3727,130 @@ mod tests {
     }
 
     #[test]
+    fn live_prompt_path_returns_world_state_blocks_with_markers() {
+        let tmp = tempdir().expect("tempdir");
+        let prompt = system_prompt_for_mode_with_context_skills_session_and_approval(
+            tmp.path(),
+            None,
+            None,
+            None,
+            PromptSessionContext {
+                user_memory_block: Some("## Memory\n- remember the cutover"),
+                goal_objective: Some("ship WorldState Blocks"),
+                project_context_pack_enabled: false,
+                locale_tag: "en",
+                translation_enabled: false,
+                model_id: "deepseek-v4-pro",
+                context_window_override: None,
+                show_thinking: true,
+                verbosity: Some("concise"),
+                skills_scan_codewhale_only: false,
+            },
+        );
+
+        let SystemPrompt::Blocks(blocks) = prompt else {
+            panic!("live prompt assembly must return SystemPrompt::Blocks");
+        };
+        assert!(
+            blocks.len() >= 3,
+            "constitution + at least one WorldState fragment + authority trailer"
+        );
+        assert!(
+            !blocks[0].text.contains("<!-- cw:ctx:"),
+            "constitution block must stay marker-free for prefix cache stability"
+        );
+        assert!(
+            blocks[0].text.contains("## Core Execution"),
+            "constitution retains static core execution guidance"
+        );
+
+        let flat = system_prompt_flat_text(&SystemPrompt::Blocks(blocks.clone()));
+        assert!(flat.contains(crate::model_context::FragmentId::Workspace.marker()));
+        assert!(flat.contains(crate::model_context::FragmentId::Route.marker()));
+        assert!(flat.contains("## Environment"));
+        assert!(flat.contains("model: deepseek-v4-pro"));
+        assert!(flat.contains("<session_goal>"));
+        assert!(flat.contains("ship WorldState Blocks"));
+        assert!(flat.contains("remember the cutover"));
+        assert!(flat.contains("## Authority Recap"));
+        assert!(
+            !flat.contains(crate::model_context::FragmentId::SkillsTools.marker()),
+            "skills remain in constitution, not a volatile SkillsTools fragment"
+        );
+    }
+
+    #[test]
+    fn live_prompt_world_state_diff_retains_unchanged_fragments() {
+        let tmp = tempdir().expect("tempdir");
+        let session = PromptSessionContext {
+            user_memory_block: None,
+            goal_objective: None,
+            project_context_pack_enabled: false,
+            locale_tag: "en",
+            translation_enabled: false,
+            model_id: "codewhale",
+            context_window_override: None,
+            show_thinking: true,
+            verbosity: None,
+            skills_scan_codewhale_only: false,
+        };
+        let first = system_prompt_for_mode_with_context_skills_session_and_approval(
+            tmp.path(),
+            None,
+            None,
+            None,
+            session.clone(),
+        );
+        let second = system_prompt_for_mode_with_context_skills_session_and_approval(
+            tmp.path(),
+            None,
+            None,
+            None,
+            PromptSessionContext {
+                goal_objective: Some("only goal changed"),
+                ..session
+            },
+        );
+
+        let extract_world = |prompt: &SystemPrompt| -> crate::model_context::WorldState {
+            let SystemPrompt::Blocks(blocks) = prompt else {
+                panic!("expected Blocks");
+            };
+            let mut state = crate::model_context::WorldState::new();
+            for block in blocks.iter().skip(1) {
+                for id in crate::model_context::FragmentId::all() {
+                    let marker = id.marker();
+                    if let Some(rest) = block.text.strip_prefix(marker) {
+                        let body = rest.trim_start_matches('\n');
+                        state.upsert(crate::model_context::ModelContextFragment::new(
+                            *id,
+                            id.role(),
+                            body,
+                        ));
+                    }
+                }
+            }
+            state
+        };
+
+        let previous = extract_world(&first);
+        let next = extract_world(&second);
+        let diff = next.render_diff(Some(&previous));
+        assert!(
+            diff.retained
+                .iter()
+                .any(|marker| marker == crate::model_context::FragmentId::Route.marker()),
+            "unchanged route fragment must be retained: {diff:?}"
+        );
+        assert!(
+            diff.updated
+                .iter()
+                .any(|fragment| fragment.id == crate::model_context::FragmentId::Workspace),
+            "goal change must update workspace fragment: {diff:?}"
+        );
+    }
+
+    #[test]
     fn default_prompt_stays_under_2953_static_baseline() {
         const ISSUE_2953_BASELINE_CHARS: usize = 30_461;
         let prompt = compose_prompt(Personality::Calm);
@@ -3728,5 +3859,27 @@ mod tests {
             prompt.chars().count() < ISSUE_2953_BASELINE_CHARS,
             "default static prompt should stay below the #2953 baseline"
         );
+    }
+}
+#[test]
+fn core_execution_profile_is_runtime_only() {
+    for required in [
+        "repository instructions",
+        "smallest coherent change",
+        "relevant verification",
+        "typed outcome",
+    ] {
+        assert!(CORE_EXECUTION_PROFILE_PROMPT.contains(required));
+    }
+    for forbidden in [
+        "footer",
+        "color",
+        "hotbar",
+        "panel",
+        "Fleet",
+        "Workflow",
+        "OpenHands",
+    ] {
+        assert!(!CORE_EXECUTION_PROFILE_PROMPT.contains(forbidden));
     }
 }

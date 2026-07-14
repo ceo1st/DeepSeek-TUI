@@ -2568,6 +2568,17 @@ struct SetConfigResponse {
     requires_reload: bool,
 }
 
+fn persist_runtime_tui_setting(key: &str, value: &str) -> Result<(), ApiError> {
+    let mut settings = crate::settings::Settings::load_persisted()
+        .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
+    settings
+        .set(key, value)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    settings
+        .save()
+        .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))
+}
+
 /// Response for `POST /v1/config/reload`.
 #[derive(Debug, Serialize)]
 struct ReloadConfigResponse {
@@ -2578,7 +2589,7 @@ async fn get_config(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<GuiConfigResponse>, ApiError> {
     let config = state.config.read();
-    let settings = crate::settings::Settings::load().unwrap_or_default();
+    let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
     let mcp_config_path = config.mcp_config_path().display().to_string();
 
     // Determine effective model: prefer config default, then constant.
@@ -2674,48 +2685,17 @@ async fn set_config(
                 let provider = state.config.read().api_provider();
                 config_persistence::persist_provider_base_url_key(config_path, provider, &value)
             }
-            "cost_currency" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.cost_currency = match value.as_str() {
-                    "cny" | "yuan" | "rmb" => "cny".to_string(),
-                    _ => "usd".to_string(),
-                };
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "default_mode" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.default_mode = crate::tui::app::AppMode::from_setting(&value)
-                    .as_setting()
-                    .into();
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "auto_compact" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.auto_compact = value.parse::<bool>().unwrap_or(true);
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
+            "cost_currency"
+            | "default_mode"
+            | "auto_compact"
+            | "show_thinking"
+            | "show_tool_details"
+            | "calm_mode"
+            | "prefer_external_pdftotext"
+            | "workspace_follow_symlinks"
+            | "locale"
+            | "max_history" => {
+                persist_runtime_tui_setting(&key, &value)?;
                 return Ok(Json(SetConfigResponse {
                     key,
                     value,
@@ -2734,67 +2714,6 @@ async fn set_config(
             }
             "mcp_config_path" => {
                 config_persistence::persist_root_string_key(config_path, "mcp_config_path", &value)
-            }
-            "show_thinking"
-            | "show_tool_details"
-            | "calm_mode"
-            | "prefer_external_pdftotext"
-            | "workspace_follow_symlinks" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                let bool_val = value.parse::<bool>().unwrap_or(false);
-                match key.as_str() {
-                    "show_thinking" => settings.show_thinking = bool_val,
-                    "show_tool_details" => settings.show_tool_details = bool_val,
-                    "calm_mode" => settings.calm_mode = bool_val,
-                    "prefer_external_pdftotext" => settings.prefer_external_pdftotext = bool_val,
-                    "workspace_follow_symlinks" => settings.workspace_follow_symlinks = bool_val,
-                    _ => {}
-                }
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "locale" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.locale = value.clone();
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
-            }
-            "max_history" => {
-                let mut settings = crate::settings::Settings::load()
-                    .map_err(|e| ApiError::internal(format!("Failed to load settings: {e}")))?;
-                settings.max_input_history = value.parse::<usize>().map_err(|_| {
-                    ApiError::bad_request(format!(
-                        "Invalid value '{value}' for max_history: expected a non-negative integer"
-                    ))
-                })?;
-                settings
-                    .save()
-                    .map_err(|e| ApiError::internal(format!("Failed to save settings: {e}")))?;
-                return Ok(Json(SetConfigResponse {
-                    key,
-                    value,
-                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
-                    persisted: true,
-                    requires_reload,
-                }));
             }
             "subagents_enabled" => {
                 let enabled = value.parse::<bool>().map_err(|_| {

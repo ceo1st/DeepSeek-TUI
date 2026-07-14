@@ -1258,12 +1258,13 @@ pub struct TuiConfig {
     pub status_items: Option<Vec<StatusItem>>,
     /// Emit OSC 8 hyperlink escape sequences around URLs in the transcript so
     /// supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty,
-    /// WezTerm, Alacritty, recent gnome-terminal/konsole) make them
-    /// Cmd+click-openable. Terminals without OSC 8 support render the plain
-    /// label and ignore the escape. Defaults to on for macOS/Linux and off for
-    /// Windows legacy consoles; set `false` to suppress everywhere (e.g. for a
-    /// terminal that misrenders the sequence). OSC 8 escapes are emitted
-    /// out-of-band, so buffer-column corruption is not a concern.
+    /// WezTerm, Alacritty, recent gnome-terminal/konsole) make them clickable
+    /// with the terminal's link gesture (usually Cmd-click on macOS and
+    /// Ctrl-click on Linux/Windows). Terminals without OSC 8 support render the
+    /// plain label and ignore the escape. Defaults to on for macOS/Linux and
+    /// off for Windows legacy consoles; set `false` to suppress everywhere
+    /// (e.g. for a terminal that misrenders the sequence). OSC 8 escapes are
+    /// emitted out-of-band, so buffer-column corruption is not a concern.
     pub osc8_links: Option<bool>,
     /// High-level notification trigger condition. When set, overrides the
     /// `[notifications].threshold_secs` gate from the lower-level
@@ -1509,7 +1510,7 @@ pub struct ToolsConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusItem {
-    /// "agent" / "yolo" / "plan" chip.
+    /// "act" / "plan" / "operate" chip.
     Mode,
     /// Model identifier (e.g. `deepseek-v4-pro`).
     Model,
@@ -1630,7 +1631,7 @@ impl StatusItem {
     #[must_use]
     pub fn hint(self) -> &'static str {
         match self {
-            StatusItem::Mode => "agent · yolo · plan",
+            StatusItem::Mode => "plan · act · operate",
             StatusItem::Model => "the model id you'll send to",
             StatusItem::Cost => "running total for this session",
             StatusItem::Status => "what the agent is doing right now",
@@ -2745,9 +2746,414 @@ struct RequirementsFile {
     allowed_sandbox_modes: Vec<String>,
 }
 
+/// The highest-precedence source that can currently own approval policy.
+///
+/// The resolved [`Config`] historically retained only the final string, which
+/// made an in-session editor unable to distinguish a user-owned root key from
+/// a profile, environment, managed, requirements, or project constraint. The
+/// destructive Full Access preset uses this classification to fail closed
+/// unless it can prove that removing the root key is the operation requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalPolicyControl {
+    Unset,
+    RootConfig,
+    Profile,
+    Environment,
+    ManagedConfig,
+    ProjectConfig,
+    Requirements,
+    Ambiguous,
+}
+
+impl ApprovalPolicyControl {
+    #[must_use]
+    pub(crate) fn editable_root(self) -> bool {
+        matches!(self, Self::Unset | Self::RootConfig)
+    }
+
+    #[must_use]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unset => "saved TUI posture",
+            Self::RootConfig => "the root config.toml approval_policy",
+            Self::Profile => "the active config profile",
+            Self::Environment => "DEEPSEEK_APPROVAL_POLICY",
+            Self::ManagedConfig => "managed configuration",
+            Self::ProjectConfig => "project configuration",
+            Self::Requirements => "managed approval requirements",
+            Self::Ambiguous => "an unresolved configuration source",
+        }
+    }
+}
+
+/// Highest-precedence source that owns the interactive shell availability
+/// switch. Project/profile/environment/managed constraints are intentionally
+/// read-only from the root settings editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellAccessControl {
+    Unset,
+    RootConfig,
+    Profile,
+    Environment,
+    ManagedConfig,
+    ProjectConfig,
+    Ambiguous,
+}
+
+impl ShellAccessControl {
+    #[must_use]
+    pub(crate) fn editable_root(self) -> bool {
+        matches!(self, Self::Unset | Self::RootConfig)
+    }
+
+    #[must_use]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unset => "the session default",
+            Self::RootConfig => "the root config.toml allow_shell",
+            Self::Profile => "the active config profile",
+            Self::Environment => "DEEPSEEK_ALLOW_SHELL",
+            Self::ManagedConfig => "managed configuration",
+            Self::ProjectConfig => "project configuration",
+            Self::Ambiguous => "an unresolved configuration source",
+        }
+    }
+}
+
+fn project_config_root_bool(workspace: &Path, key: &str) -> Option<bool> {
+    [
+        workspace
+            .join(codewhale_config::CODEWHALE_APP_DIR)
+            .join("config.toml"),
+        workspace
+            .join(codewhale_config::LEGACY_APP_DIR)
+            .join("config.toml"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+    .and_then(|path| std::fs::read_to_string(path).ok())
+    .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+    .and_then(|document| document.get(key).and_then(toml::Value::as_bool))
+}
+
+/// Map the saved TUI permission posture onto the approval-policy ordering used
+/// by project config. Full Access is looser than every project policy, so its
+/// baseline is the loosest ranked policy (`auto`).
+#[must_use]
+pub(crate) fn approval_policy_baseline_from_permission_posture(
+    posture: Option<&str>,
+) -> Option<&'static str> {
+    posture.and_then(
+        |posture| match posture.trim().to_ascii_lowercase().as_str() {
+            "ask" | "suggest" | "on-request" | "untrusted" => Some("on-request"),
+            "auto" | "auto-review" | "auto_review" => Some("auto"),
+            "full" | "full-access" | "full_access" | "bypass" => Some("auto"),
+            _ => None,
+        },
+    )
+}
+
 // === Config Loading ===
 
 impl Config {
+    /// Return the non-root source that prevents an interactive runtime preset
+    /// from safely rewriting approval, shell, and sandbox posture. Presets may
+    /// edit user-owned root keys, but must never overwrite a profile, env,
+    /// managed, requirements, or project constraint in the live merged Config.
+    #[must_use]
+    pub(crate) fn runtime_preset_blocker(
+        &self,
+        config_path: Option<&Path>,
+        profile: Option<&str>,
+        workspace: &Path,
+    ) -> Option<&'static str> {
+        let requirements_path = self
+            .requirements_path
+            .as_deref()
+            .map(expand_path)
+            .or_else(default_requirements_path);
+        if let Some(path) = requirements_path
+            && path.exists()
+        {
+            let controlled = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|raw| toml::from_str::<RequirementsFile>(&raw).ok())
+                .is_none_or(|requirements| {
+                    !requirements.allowed_approval_policies.is_empty()
+                        || !requirements.allowed_sandbox_modes.is_empty()
+                });
+            if controlled {
+                return Some("managed runtime requirements");
+            }
+        }
+
+        let workspace_is_home = effective_home_dir().is_some_and(|home| {
+            let workspace = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf());
+            let home = home.canonicalize().unwrap_or(home);
+            workspace == home
+        });
+        let project_controls_runtime = || {
+            let saved_approval_baseline = crate::settings::Settings::load_persisted()
+                .ok()
+                .and_then(|settings| settings.permission_posture)
+                .and_then(|posture| {
+                    approval_policy_baseline_from_permission_posture(Some(&posture))
+                });
+            let approval_baseline = self.approval_policy.as_deref().or(saved_approval_baseline);
+            let parsed_controls =
+                codewhale_config::load_project_config(workspace).is_some_and(|project| {
+                    project.approval_policy.as_deref().is_some_and(|policy| {
+                        codewhale_config::project_approval_policy_is_allowed(
+                            approval_baseline,
+                            policy,
+                        )
+                    }) || project.sandbox_mode.as_deref().is_some_and(|sandbox| {
+                        codewhale_config::project_sandbox_mode_is_allowed(
+                            self.sandbox_mode.as_deref(),
+                            sandbox,
+                        )
+                    })
+                });
+            parsed_controls || project_config_root_bool(workspace, "allow_shell") == Some(false)
+        };
+        if !workspace_is_home && project_controls_runtime() {
+            return Some("project runtime configuration");
+        }
+
+        let managed_path = self
+            .managed_config_path
+            .as_deref()
+            .map(expand_path)
+            .or_else(default_managed_config_path);
+        if let Some(path) = managed_path
+            && path.exists()
+        {
+            match load_single_config_file(&path) {
+                Ok(managed)
+                    if managed.approval_policy.is_some()
+                        || managed.sandbox_mode.is_some()
+                        || managed.allow_shell.is_some() =>
+                {
+                    return Some("managed runtime configuration");
+                }
+                Err(_) => return Some("an unreadable managed runtime configuration"),
+                Ok(_) => {}
+            }
+        }
+
+        if [
+            "DEEPSEEK_APPROVAL_POLICY",
+            "DEEPSEEK_SANDBOX_MODE",
+            "DEEPSEEK_ALLOW_SHELL",
+        ]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return Some("environment-controlled runtime posture");
+        }
+
+        if let Some(profile) = profile {
+            let Some(path) = resolve_load_config_path(config_path.map(Path::to_path_buf)) else {
+                return Some("an unresolved active config profile");
+            };
+            let Some(parsed) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|raw| toml::from_str::<ConfigFile>(&raw).ok())
+            else {
+                return Some("an unreadable active config profile");
+            };
+            if parsed
+                .profiles
+                .as_ref()
+                .and_then(|profiles| profiles.get(profile))
+                .is_some_and(|profile| {
+                    profile.approval_policy.is_some()
+                        || profile.sandbox_mode.is_some()
+                        || profile.allow_shell.is_some()
+                })
+            {
+                return Some("the active config profile");
+            }
+        }
+
+        None
+    }
+
+    /// Identify whether the effective approval policy can safely be edited by
+    /// changing the root user config. Sources applied later in the load chain
+    /// are deliberately treated as controlling even when their value happens
+    /// to equal the root value; equality is not provenance.
+    #[must_use]
+    pub(crate) fn approval_policy_control(
+        &self,
+        config_path: Option<&Path>,
+        profile: Option<&str>,
+        workspace: &Path,
+    ) -> ApprovalPolicyControl {
+        if self.approval_policy_is_requirements_managed() {
+            return ApprovalPolicyControl::Requirements;
+        }
+
+        let workspace_is_home = effective_home_dir().is_some_and(|home| {
+            let workspace = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf());
+            let home = home.canonicalize().unwrap_or(home);
+            workspace == home
+        });
+        if !workspace_is_home {
+            let saved_approval_baseline = crate::settings::Settings::load_persisted()
+                .ok()
+                .and_then(|settings| settings.permission_posture)
+                .and_then(|posture| {
+                    approval_policy_baseline_from_permission_posture(Some(&posture))
+                });
+            let approval_baseline = self.approval_policy.as_deref().or(saved_approval_baseline);
+            if codewhale_config::load_project_config(workspace)
+                .and_then(|project| project.approval_policy)
+                .is_some_and(|policy| {
+                    codewhale_config::project_approval_policy_is_allowed(approval_baseline, &policy)
+                })
+            {
+                return ApprovalPolicyControl::ProjectConfig;
+            }
+        }
+
+        let managed_path = self
+            .managed_config_path
+            .as_deref()
+            .map(expand_path)
+            .or_else(default_managed_config_path);
+        if let Some(path) = managed_path
+            && path.exists()
+        {
+            match load_single_config_file(&path) {
+                Ok(managed) if managed.approval_policy.is_some() => {
+                    return ApprovalPolicyControl::ManagedConfig;
+                }
+                Err(_) => return ApprovalPolicyControl::Ambiguous,
+                Ok(_) => {}
+            }
+        }
+
+        if std::env::var_os("DEEPSEEK_APPROVAL_POLICY").is_some() {
+            return ApprovalPolicyControl::Environment;
+        }
+
+        let Some(path) = resolve_load_config_path(config_path.map(Path::to_path_buf)) else {
+            return if self.approval_policy.is_some() {
+                ApprovalPolicyControl::Ambiguous
+            } else {
+                ApprovalPolicyControl::Unset
+            };
+        };
+        let parsed = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| toml::from_str::<ConfigFile>(&raw).ok());
+        let Some(parsed) = parsed else {
+            return if self.approval_policy.is_some() {
+                ApprovalPolicyControl::Ambiguous
+            } else {
+                ApprovalPolicyControl::Unset
+            };
+        };
+        if let Some(profile) = profile
+            && parsed
+                .profiles
+                .as_ref()
+                .and_then(|profiles| profiles.get(profile))
+                .is_some_and(|profile| profile.approval_policy.is_some())
+        {
+            return ApprovalPolicyControl::Profile;
+        }
+        if parsed.base.approval_policy.is_some() {
+            ApprovalPolicyControl::RootConfig
+        } else if self.approval_policy.is_some() {
+            ApprovalPolicyControl::Ambiguous
+        } else {
+            ApprovalPolicyControl::Unset
+        }
+    }
+
+    /// Identify whether shell availability can safely be edited through the
+    /// user-owned root config. Later sources are controlling even when their
+    /// effective value happens to match the root value.
+    #[must_use]
+    pub(crate) fn allow_shell_control(
+        &self,
+        config_path: Option<&Path>,
+        profile: Option<&str>,
+        workspace: &Path,
+    ) -> ShellAccessControl {
+        let workspace_is_home = effective_home_dir().is_some_and(|home| {
+            let workspace = workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf());
+            let home = home.canonicalize().unwrap_or(home);
+            workspace == home
+        });
+        if !workspace_is_home && project_config_root_bool(workspace, "allow_shell") == Some(false) {
+            return ShellAccessControl::ProjectConfig;
+        }
+
+        let managed_path = self
+            .managed_config_path
+            .as_deref()
+            .map(expand_path)
+            .or_else(default_managed_config_path);
+        if let Some(path) = managed_path
+            && path.exists()
+        {
+            match load_single_config_file(&path) {
+                Ok(managed) if managed.allow_shell.is_some() => {
+                    return ShellAccessControl::ManagedConfig;
+                }
+                Err(_) => return ShellAccessControl::Ambiguous,
+                Ok(_) => {}
+            }
+        }
+
+        if std::env::var_os("DEEPSEEK_ALLOW_SHELL").is_some() {
+            return ShellAccessControl::Environment;
+        }
+
+        let Some(path) = resolve_load_config_path(config_path.map(Path::to_path_buf)) else {
+            return if self.allow_shell.is_some() {
+                ShellAccessControl::Ambiguous
+            } else {
+                ShellAccessControl::Unset
+            };
+        };
+        let parsed = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| toml::from_str::<ConfigFile>(&raw).ok());
+        let Some(parsed) = parsed else {
+            return if self.allow_shell.is_some() {
+                ShellAccessControl::Ambiguous
+            } else {
+                ShellAccessControl::Unset
+            };
+        };
+        if let Some(profile) = profile
+            && parsed
+                .profiles
+                .as_ref()
+                .and_then(|profiles| profiles.get(profile))
+                .is_some_and(|profile| profile.allow_shell.is_some())
+        {
+            return ShellAccessControl::Profile;
+        }
+        if parsed.base.allow_shell.is_some() {
+            ShellAccessControl::RootConfig
+        } else if self.allow_shell.is_some() {
+            ShellAccessControl::Ambiguous
+        } else {
+            ShellAccessControl::Unset
+        }
+    }
+
     /// Whether an explicit config or requirements file owns approval posture.
     /// TUI preferences may supply a default only when this is false.
     #[must_use]
@@ -6709,7 +7115,7 @@ fn provider_env_api_key(provider: ApiProvider) -> Option<String> {
     })
 }
 
-fn explicit_cli_api_key_override() -> Option<String> {
+pub(crate) fn explicit_cli_api_key_override() -> Option<String> {
     (std::env::var("DEEPSEEK_API_KEY_SOURCE").as_deref() == Ok("cli"))
         .then(|| {
             std::env::var("CODEWHALE_CLI_API_KEY")
@@ -6903,6 +7309,27 @@ fn now_unix_secs() -> Option<f64> {
 #[must_use]
 pub fn kimi_cli_credentials_present() -> bool {
     kimi_cli_oauth_credentials_path().is_ok_and(|path| path.exists())
+}
+
+/// Prompt-free structural check for Kimi CLI OAuth material. This deliberately
+/// performs no refresh: a fresh access token or a non-empty refresh token is
+/// enough to say login material is saved, while malformed/empty files are not.
+#[must_use]
+pub fn kimi_cli_credentials_valid() -> bool {
+    let Ok(path) = kimi_cli_oauth_credentials_path() else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(credential) = serde_json::from_str::<KimiOAuthCredential>(&raw) else {
+        return false;
+    };
+    kimi_oauth_access_token_is_fresh(&credential)
+        || credential
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
 }
 
 /// Clear the API key from config-file storage.

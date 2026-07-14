@@ -418,8 +418,10 @@ fn accrue_child_token_cost_if_any(app: &mut App, result: &Result<ToolResult, Too
         .and_then(serde_json::Value::as_str)
         .and_then(crate::config::ApiProvider::parse)
         .unwrap_or(app.api_provider);
+    let billing =
+        crate::route_billing::for_child_route(app.api_provider, app.billing_presentation, provider);
     if let Some(cost) =
-        crate::pricing::calculate_turn_cost_estimate_for_provider(provider, model, &usage)
+        crate::pricing::calculate_turn_cost_estimate_for_route(provider, model, &usage, billing)
     {
         app.accrue_subagent_cost_estimate(cost);
     }

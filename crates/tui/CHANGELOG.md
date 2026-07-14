@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.68] - 2026-07-12
+## [0.8.68] - 2026-07-13
 
-The underwater release: the TUI's default shell is replaced end to end, the
-runtime keeps its guarantees, and the whole new layer ships localized. The
-entries below cover the full candidate; the pre-candidate section that
-follows records what had already landed on main for 0.8.68 by 2026-07-10.
+Release-candidate notes for the underwater release: the TUI's default shell is
+replaced end to end, the runtime keeps its guarantees, and the new layer is
+prepared with localized coverage. These notes describe the code prepared for
+v0.8.68; they are not evidence that the public tag or package artifacts have
+been published. The pre-candidate section that follows records what had already
+landed on main for 0.8.68 by 2026-07-10.
 
 ### Changed — the underwater shell
 
@@ -86,6 +88,33 @@ follows records what had already landed on main for 0.8.68 by 2026-07-10.
   `Alt+[`, `Alt+]`, `Alt+L`, `Alt+?`), and give theme, Help, model, and
   config rows direct mouse paths with the same activation as Enter.
 
+### Changed — release-candidate integration
+
+- Make worker delegation route-aware and identity-safe: workers receive a
+  small role-scoped system prompt instead of stale parent/model boilerplate,
+  faster routes resolve through the configured provider, and opening a worker
+  shows its complete available transcript. Remove `token_budget` from the
+  ordinary model-facing Agent schema so agents do not micromanage ad-hoc
+  launches; explicit legacy calls remain readable for compatibility.
+- Mature `/config` interaction for enumerated and boolean settings with
+  pickers/toggles, mouse-wheel scrolling, stable focus, and configured-provider
+  selection. Startup mode is now only Agent or Plan; legacy `operate`/`yolo`
+  settings migrate to Agent with permission posture represented separately.
+- Show where effective permission policy comes from and keep profile,
+  environment, project, managed, and requirements-controlled posture read-only
+  in the in-session editor. Runtime presets edit only proven user-owned root
+  settings and no longer persist temporary environment overlays.
+- Restore the original four-line whale mark and make ambient ocean motion
+  coherent across the full scroll surface: one continuous ombre, eased fish
+  that face their direction of travel, fish in otherwise blank scrollback, and
+  explicit reduced-motion and animation controls.
+- Keep model reasoning in the transcript rather than the Tasks strip, retain
+  the live header status indicator, separate worker and success colors, and use
+  the same rail grammar for both work-strip and transcript scrollbars.
+- Present the default Z.AI Coding Plan route, including child routes, as
+  subscription quota instead of estimated per-token dollars. No undocumented
+  account endpoint is called by this change.
+
 ### Added
 
 - Korean (ko) UI locale with full key parity and onboarding/setup wiring
@@ -112,6 +141,20 @@ follows records what had already landed on main for 0.8.68 by 2026-07-10.
   completion footer, and per-theme ANSI output for every shipped palette.
 
 ### Fixed
+
+- Resolve the sub-agent completion/cancellation race with one terminal-state
+  claim: cancellation suppresses late mailbox/parent/UI delivery, while a
+  completed result remains publicly running until its notification is safely
+  delivered.
+- Keep Workflow panel controls from stealing ordinary composer letters. Enter,
+  Delete, Up/Down, and Esc own panel actions; typed characters return focus to
+  the composer and start the message normally.
+- Preserve the composer prompt gutter from the first typed character through
+  wrapping, scrolling, cursor placement, and mouse hit-testing so the `>` does
+  not disappear or make input appear to jump.
+- Emit terminal-native OSC 8 metadata for rendered URLs without placing escape
+  payload bytes in the measured text, keeping long links visible, selectable,
+  and clickable in supporting terminals.
 
 - Keep headless structured output terminal-clean: `codewhale exec` engines
   no longer emit interactive terminal-title/taskbar OSC sequences, so

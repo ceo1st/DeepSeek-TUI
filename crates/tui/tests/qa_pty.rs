@@ -13,8 +13,10 @@
 #[path = "support/qa_harness/mod.rs"]
 mod qa_harness;
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use qa_harness::harness::{Harness, make_sealed_workspace};
 use qa_harness::keys;
@@ -75,12 +77,10 @@ fn spawn_minimal(
     Ok((ws, h))
 }
 
-/// The product now starts at a real pre-session launch surface. PTY scenarios
-/// below exercise composer/runtime behavior, so cross that boundary exactly
-/// as a user does instead of bypassing the launch contract with test flags.
+/// PTY scenarios exercise composer/runtime behavior. The default startup now
+/// enters a session directly; users who explicitly enable `launch_screen`
+/// retain the separate launch surface, covered by unit rendering tests.
 fn enter_launch_session(h: &mut Harness) -> anyhow::Result<()> {
-    h.wait_for_text("New session", BOOT_TIMEOUT)?;
-    h.send(keys::key::enter())?;
     h.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
     Ok(())
 }
@@ -93,6 +93,88 @@ fn write_skill(root: std::path::PathBuf, name: &str, description: &str) -> anyho
         format!("---\nname: {name}\ndescription: {description}\n---\nUse {name}.\n"),
     )?;
     Ok(())
+}
+
+fn spawn_approval_fixture_server() -> anyhow::Result<(String, std::thread::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut request_index = 0usize;
+        while request_index < 2 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut request = [0u8; 64 * 1024];
+            let _ = stream.read(&mut request);
+            let body = if request_index == 0 {
+                [
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id":"chatcmpl-approval",
+                            "object":"chat.completion.chunk",
+                            "model":"deepseek-v4-flash",
+                            "choices":[{"index":0,"delta":{"tool_calls":[{
+                                "index":0,
+                                "id":"call_approval_pty",
+                                "type":"function",
+                                "function":{"name":"write_file","arguments":"{\"path\":\"approval-proof.txt\",\"content\":\"must-not-write\"}"}
+                            }]},"finish_reason":null}]
+                        })
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id":"chatcmpl-approval",
+                            "object":"chat.completion.chunk",
+                            "model":"deepseek-v4-flash",
+                            "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+                            "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}
+                        })
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ]
+                .join("")
+            } else {
+                [
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id":"chatcmpl-denied",
+                            "object":"chat.completion.chunk",
+                            "model":"deepseek-v4-flash",
+                            "choices":[{"index":0,"delta":{"content":"DENIAL-HONORED"},"finish_reason":null}]
+                        })
+                    ),
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({
+                            "id":"chatcmpl-denied",
+                            "object":"chat.completion.chunk",
+                            "model":"deepseek-v4-flash",
+                            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24}
+                        })
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ]
+                .join("")
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            request_index += 1;
+        }
+    });
+    Ok((format!("http://{address}"), handle))
 }
 
 fn first_non_blank_row(frame: &qa_harness::Frame) -> Option<u16> {
@@ -237,6 +319,304 @@ fn smoke_keystroke_reaches_composer() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn printable_v_stays_in_composer_and_alt_help_fallback_works() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+    let (_ws, mut h) = boot_minimal()?;
+    h.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+
+    h.send(keys::key::ch('v'))?;
+    h.wait_for_text("v", KEY_TIMEOUT)?;
+    assert!(
+        h.frame().contains("v"),
+        "bare v must remain composer-owned:\n{}",
+        h.debug_dump()
+    );
+    h.send(b"\x15")?; // Ctrl+U clears the composer before testing Alt/Option.
+    h.send(keys::key::alt('?'))?;
+    h.wait_for(
+        |frame| frame.contains("Help") || frame.contains("Keyboard") || frame.contains("Shortcuts"),
+        KEY_TIMEOUT,
+    )?;
+
+    let _ = h.shutdown();
+    Ok(())
+}
+
+#[test]
+fn resize_and_mouse_wheel_preserve_composer_ownership() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+    let ws = make_sealed_workspace()?;
+    let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(ws.workspace())
+        .clear_env()
+        .seal_home(ws.home())
+        .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("NO_ANIMATIONS", "1")
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            ws.workspace().to_str().expect("utf-8 workspace path"),
+            "--no-project-config",
+            "--skip-onboarding",
+            "--mouse-capture",
+        ])
+        .size(40, 140)
+        .spawn()?;
+    enter_launch_session(&mut h)?;
+
+    h.resize(24, 80)?;
+    h.wait_for_idle(Duration::from_millis(200), Duration::from_secs(3))?;
+    assert_eq!((h.frame().rows(), h.frame().cols()), (24, 80));
+    h.send(keys::mouse::wheel_down(5, 40))?;
+    h.send(keys::mouse::click(22, 20))?;
+    h.send(keys::key::text("mouse-resize-proof"))?;
+    h.wait_for_text("mouse-resize-proof", KEY_TIMEOUT)?;
+    let dump = h.debug_dump();
+    assert!(
+        !dump.contains("[<65"),
+        "mouse bytes leaked into composer:\n{dump}"
+    );
+
+    let _ = h.shutdown();
+    Ok(())
+}
+
+#[test]
+fn work_surface_real_rows_own_click_wheel_resize_and_stop_confirm() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+    let ws = make_sealed_workspace()?;
+    let session_path = ws.workspace().join("mouse-work-session.json");
+    let todos = (0..14)
+        .map(|index| {
+            serde_json::json!({
+                "id": index + 1,
+                "content": format!("todo-mouse-{index:02}"),
+                "status": if index == 0 { "in_progress" } else { "pending" }
+            })
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        &session_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "metadata": {
+                "id": "pty-work-mouse",
+                "title": "Mouse work surface",
+                "created_at": "2026-07-13T00:00:00Z",
+                "updated_at": "2026-07-13T00:00:00Z",
+                "message_count": 0,
+                "total_tokens": 0,
+                "model": "deepseek-v4-pro",
+                "model_provider": "deepseek",
+                "workspace": ws.workspace(),
+                "mode": "agent",
+                "cost": {},
+                "cumulative_turn_secs": 0
+            },
+            "messages": [],
+            "system_prompt": null,
+            "work_state": {
+                "todos": {"items": todos, "completion_pct": 0, "in_progress_id": 1},
+                "plan": {"objective": "", "items": []}
+            }
+        }))?,
+    )?;
+
+    let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(ws.workspace())
+        .clear_env()
+        .seal_home(ws.home())
+        .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("NO_ANIMATIONS", "1")
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            ws.workspace().to_str().expect("utf-8 workspace path"),
+            "--no-project-config",
+            "--skip-onboarding",
+            "--mouse-capture",
+            "--yolo",
+        ])
+        .size(32, 100)
+        .spawn()?;
+    enter_launch_session(&mut h)?;
+    h.send(keys::key::text(&format!(
+        "/load {}",
+        session_path.to_string_lossy()
+    )))?;
+    h.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
+    h.send(keys::key::enter())?;
+    h.wait_for_text("todo-mouse-00", KEY_TIMEOUT)?;
+
+    let (first_row, first_col) = h
+        .frame()
+        .find_text("todo-mouse-00")
+        .expect("real rendered first To-do row");
+    h.send(keys::mouse::wheel_down(first_row, first_col))?;
+    h.wait_for_idle(Duration::from_millis(200), Duration::from_secs(3))?;
+    assert!(
+        !h.debug_dump().contains("[<65"),
+        "wheel over work surface leaked into the transcript/composer:\n{}",
+        h.debug_dump()
+    );
+
+    h.resize(24, 80)?;
+    h.wait_for_idle(Duration::from_millis(200), Duration::from_secs(3))?;
+    let target = if h.frame().contains("todo-mouse-02") {
+        "todo-mouse-02"
+    } else {
+        "todo-mouse-00"
+    };
+    let (row, col) = h.frame().find_text(target).expect("row survived resize");
+    h.send(keys::mouse::click(row, col))?;
+    h.wait_for_text("To-do", KEY_TIMEOUT)?;
+    h.wait_for_text(target, KEY_TIMEOUT)?;
+    h.wait_for_text("q/Esc close", KEY_TIMEOUT)?;
+    let _ = h.shutdown();
+
+    let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(ws.workspace())
+        .clear_env()
+        .seal_home(ws.home())
+        .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("NO_ANIMATIONS", "1")
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            ws.workspace().to_str().expect("utf-8 workspace path"),
+            "--no-project-config",
+            "--skip-onboarding",
+            "--mouse-capture",
+            "--yolo",
+        ])
+        .size(24, 80)
+        .spawn()?;
+    enter_launch_session(&mut h)?;
+
+    // A live bang shell projects a real stoppable run row. Arm and accept the
+    // rendered row-local Stop control using its actual post-resize coordinates.
+    h.send(keys::key::text("! echo CWQA_STOP_ROW; sleep 30"))?;
+    h.wait_for_idle(Duration::from_millis(100), Duration::from_secs(2))?;
+    h.send(keys::key::enter())?;
+    h.wait_for_text("run running", KEY_TIMEOUT)?;
+    h.wait_for_text("[stop]", KEY_TIMEOUT)?;
+    let (stop_row, stop_col) = h.frame().find_text("stop").expect("rendered Stop control");
+    h.send(keys::mouse::click(stop_row, stop_col))?;
+    h.wait_for_text("confirm", KEY_TIMEOUT)?;
+
+    // Reject the row-local Stop with Esc. A second Esc only releases the work
+    // surface's focus; neither keypress may leak through and cancel the live
+    // command. This is the real-PTY counterpart to the interaction unit tests
+    // and protects the dialog-vs-active-work ownership boundary.
+    h.send(keys::key::esc())?;
+    h.wait_for(
+        |frame| frame.contains("run running") && !frame.contains("confirm"),
+        KEY_TIMEOUT,
+    )?;
+    h.send(keys::key::esc())?;
+    h.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
+    assert!(
+        h.frame().contains("run running"),
+        "repeated Esc after rejecting Stop cancelled active work:\n{}",
+        h.debug_dump()
+    );
+
+    // Re-arm from the rendered control after focus was released, then accept.
+    let (stop_row, stop_col) = h.frame().find_text("stop").expect("rendered Stop control");
+    h.send(keys::mouse::click(stop_row, stop_col))?;
+    h.wait_for_text("confirm", KEY_TIMEOUT)?;
+    // Confirm the mouse-armed, row-selected action with Enter. Unit coverage
+    // separately proves the armed control strip's second-click hitbox.
+    h.send(keys::key::enter())?;
+    h.wait_for(
+        |frame| !frame.contains("run running"),
+        Duration::from_secs(5),
+    )?;
+
+    let _ = h.shutdown();
+    Ok(())
+}
+
+#[test]
+fn approval_modal_real_rows_survive_wheel_resize_and_deny_without_side_effect() -> anyhow::Result<()>
+{
+    let _guard = qa_pty_test_lock();
+    let (base_url, server) = spawn_approval_fixture_server()?;
+    let ws = make_sealed_workspace()?;
+    let denied_path = ws.workspace().join("approval-proof.txt");
+    let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(ws.workspace())
+        .clear_env()
+        .seal_home(ws.home())
+        .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("NO_ANIMATIONS", "1")
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            ws.workspace().to_str().expect("utf-8 workspace path"),
+            "--no-project-config",
+            "--skip-onboarding",
+            "--mouse-capture",
+        ])
+        .size(32, 100)
+        .spawn()?;
+    enter_launch_session(&mut h)?;
+
+    h.send(keys::key::text(
+        "Request the fixture write_file call; do not change its arguments.",
+    ))?;
+    h.wait_for_idle(Duration::from_millis(100), Duration::from_secs(2))?;
+    h.send(keys::key::enter())?;
+    h.wait_for_text("Approve once", Duration::from_secs(10))?;
+    h.wait_for_text("Deny this call", KEY_TIMEOUT)?;
+
+    let (deny_row, deny_col) = h
+        .frame()
+        .find_text("Deny this call")
+        .expect("rendered denial option");
+    h.send(keys::mouse::wheel_down(deny_row, deny_col))?;
+    h.wait_for_text("❯ [2 / a]", KEY_TIMEOUT)?;
+    h.resize(24, 80)?;
+    h.wait_for(
+        |frame| frame.rows() == 24 && frame.cols() == 80,
+        KEY_TIMEOUT,
+    )?;
+    h.wait_for_idle(Duration::from_millis(200), Duration::from_secs(3))?;
+    h.wait_for_text("Deny this call", KEY_TIMEOUT)?;
+    let (deny_row, deny_col) = h
+        .frame()
+        .find_text("Deny this call")
+        .expect("denial option survived resize");
+    h.send(keys::mouse::wheel_down(deny_row, deny_col))?;
+    h.wait_for_text("❯ [3 / d / n]", KEY_TIMEOUT)?;
+    h.send(keys::mouse::click(deny_row, deny_col))?;
+    if let Err(err) = h.wait_for_text("DENIAL-HONORED", Duration::from_secs(10)) {
+        let logs = std::fs::read_dir(ws.home().join(".codewhale/logs"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow::anyhow!("{err:#}\napproval logs:\n{logs}"));
+    }
+    assert!(
+        !denied_path.exists(),
+        "denied approval executed its write_file side effect: {}",
+        denied_path.display()
+    );
+
+    let _ = h.shutdown();
+    server.join().expect("approval fixture server thread");
+    Ok(())
+}
+
 /// Release stopship coverage: a real built TUI restores durable Work state and
 /// keeps both To-do and the effective permission posture visible at each
 /// supported compact evidence size. No model turn is sent.
@@ -314,6 +694,7 @@ fn work_and_permission_are_visible_at_release_terminal_sizes() -> anyhow::Result
             .env("CODEX_HOME", codex_home.to_string_lossy())
             .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
             .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+            .env("NO_ANIMATIONS", "1")
             .env("RUST_LOG", "warn")
             .args([
                 "--workspace",
@@ -382,6 +763,7 @@ fn cancelled_bang_shell_settles_transcript_card() -> anyhow::Result<()> {
         // cell, which is the cache-transition edge this regression covers.
         .env("DEEPSEEK_API_KEY", "")
         .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("NO_ANIMATIONS", "1")
         .env("RUST_LOG", "warn")
         .args([
             "--workspace",
@@ -457,6 +839,7 @@ fn skills_menu_shows_local_and_global_skills() -> anyhow::Result<()> {
         .seal_home(ws.home())
         .env("DEEPSEEK_API_KEY", "ci-test-key-not-real")
         .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("NO_ANIMATIONS", "1")
         .env("RUST_LOG", "warn")
         .args([
             "--workspace",

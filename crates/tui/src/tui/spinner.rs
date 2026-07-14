@@ -2,6 +2,11 @@
 //!
 //! Keep the braille spinner in one place so transcript tool cards, sidebars,
 //! and any future running-job surfaces advance with the same cadence.
+//!
+//! Motion *policy* (whether to animate at all) lives in
+//! [`crate::tui::motion::MotionPolicy`]. Callers that already have a policy
+//! should prefer [`crate::tui::motion::MotionPolicy::spinner_glyph`]; the
+//! helpers here remain the shared frame table + elapsed-time index.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

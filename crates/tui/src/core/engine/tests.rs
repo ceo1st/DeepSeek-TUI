@@ -497,6 +497,233 @@ fn external_user_message_op(content: &str, mode: AppMode) -> Op {
     }
 }
 
+struct DropSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct BlockingModelClient {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    request_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl crate::core::model_client::ModelClient for BlockingModelClient {
+    fn provider_name(&self) -> &str {
+        "deterministic-blocking"
+    }
+
+    fn model(&self) -> &str {
+        "deterministic-blocking-model"
+    }
+
+    async fn create_message(
+        &self,
+        _request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::models::MessageResponse> {
+        std::future::pending().await
+    }
+
+    async fn create_message_stream(
+        &self,
+        _request: crate::models::MessageRequest,
+    ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
+        let _drop_signal = DropSignal(std::sync::Arc::clone(&self.request_dropped));
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
+fn deterministic_engine_config(workspace: &Path) -> EngineConfig {
+    EngineConfig {
+        workspace: workspace.to_path_buf(),
+        snapshots_enabled: false,
+        subagents_enabled: false,
+        ..EngineConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn injected_model_drives_real_engine_navigation_trajectory() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let workspace = tempdir().expect("tempdir");
+    fs::write(
+        workspace.path().join("README.md"),
+        "navigation-seam-proof\n",
+    )
+    .expect("write fixture");
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn("call-read", "read_file", r#"{"path":"README.md"}"#),
+        canned::simple_text_turn("Navigation complete."),
+    ]));
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let (engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op(
+            "Read README.md and report what it contains.",
+            AppMode::Agent,
+        ))
+        .await
+        .expect("send deterministic navigation turn");
+
+    let mut saw_read = false;
+    let mut saw_answer = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for deterministic navigation")
+    {
+        match event {
+            Event::ToolCallComplete { name, result, .. } if name == "read_file" => {
+                let result = result.expect("read_file result");
+                assert!(result.success, "{result:?}");
+                assert!(result.content.contains("navigation-seam-proof"));
+                saw_read = true;
+            }
+            Event::MessageDelta { content, .. } => {
+                saw_answer |= content.contains("Navigation complete");
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+    assert!(
+        saw_read,
+        "real registry must execute the mock-requested read"
+    );
+    assert!(
+        saw_answer,
+        "real stream projection must emit the final answer"
+    );
+    assert_eq!(mock.call_count(), 2);
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn injected_model_receives_malformed_tool_feedback_and_recovers() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let workspace = tempdir().expect("tempdir");
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn("call-bad-read", "read_file", "{}"),
+        canned::simple_text_turn("Recovered after validation feedback."),
+    ]));
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let (engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op(
+            "Exercise malformed tool feedback.",
+            AppMode::Agent,
+        ))
+        .await
+        .expect("send malformed trajectory");
+
+    let mut validation_feedback = None;
+    let mut recovered = false;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for malformed trajectory")
+    {
+        match event {
+            Event::ToolCallComplete { name, result, .. } if name == "read_file" => {
+                validation_feedback = Some(match result {
+                    Ok(result) => result.content,
+                    Err(error) => error.to_string(),
+                });
+            }
+            Event::MessageDelta { content, .. } => {
+                recovered |= content.contains("Recovered after validation feedback");
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+    let feedback = validation_feedback.expect("validation feedback event");
+    assert!(feedback.to_ascii_lowercase().contains("path"), "{feedback}");
+    assert!(
+        recovered,
+        "model must get a follow-up turn after tool failure"
+    );
+    assert_eq!(mock.call_count(), 2);
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn engine_cancellation_drops_active_injected_model_request() {
+    let workspace = tempdir().expect("tempdir");
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let request_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client: crate::core::model_client::SharedModelClient =
+        std::sync::Arc::new(BlockingModelClient {
+            entered: std::sync::Arc::clone(&entered),
+            request_dropped: std::sync::Arc::clone(&request_dropped),
+        });
+    let (engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op(
+            "Block until explicitly cancelled.",
+            AppMode::Agent,
+        ))
+        .await
+        .expect("send cancellation trajectory");
+    tokio::time::timeout(model_turn_event_timeout(), entered.notified())
+        .await
+        .expect("model request was never entered");
+    handle.cancel();
+
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for cancellation")
+    {
+        if let Event::TurnComplete { status, error, .. } = event {
+            assert_eq!(status, TurnOutcomeStatus::Interrupted, "{error:?}");
+            break;
+        }
+    }
+    drop(rx);
+    assert!(
+        request_dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "cancellation must drop the active provider future"
+    );
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    task.await.expect("engine task");
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn operate_admission_blocks_unready_nontrivial_but_allows_act_and_trivial() {
@@ -1588,6 +1815,18 @@ fn tool_error_messages_include_actionable_hints() {
     let missing_field = ToolError::missing_field("path");
     let formatted = format_tool_error(&missing_field, "read_file");
     assert!(formatted.contains("missing required field"));
+    assert!(formatted.contains("\"category\":\"missing_field\""));
+    assert!(formatted.contains("\"bad_field\":\"path\""));
+    assert!(formatted.contains("\"retryable\":true"));
+    assert!(formatted.contains("\"side_effect_status\":\"not_started\""));
+
+    let schema = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
+    });
+    let formatted = format_tool_error_with_schema(&missing_field, "read_file", Some(&schema));
+    assert!(formatted.contains("\"required\":[\"path\"]"));
 
     let timeout = ToolError::Timeout { seconds: 5 };
     let formatted = format_tool_error(&timeout, "exec_shell");
@@ -6147,8 +6386,12 @@ fn engine_prompt_respects_hidden_thinking_config() {
     };
     let (engine, _handle) = Engine::new(config, &Config::default());
     let prompt = match engine.session.system_prompt.as_ref() {
-        Some(SystemPrompt::Text(text)) => text,
-        Some(SystemPrompt::Blocks(_)) => panic!("expected text system prompt"),
+        Some(SystemPrompt::Text(text)) => text.clone(),
+        Some(SystemPrompt::Blocks(blocks)) => blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         None => panic!("expected system prompt"),
     };
 

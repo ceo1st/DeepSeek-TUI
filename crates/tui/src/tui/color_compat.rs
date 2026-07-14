@@ -803,63 +803,114 @@ mod tests {
         assert!(first_close_at < z_at && z_at < second_at, "{out:?}");
     }
 
-    /// #3029 end-to-end: the in-band `wrap_link` payload rendered into a Buffer
-    /// by `Paragraph` must (a) be cleaned out of the cells by the extractor and
-    /// (b) re-emitted out-of-band by the backend around the label glyph. This
-    /// proves producer (`extract_buffer_link_regions` + `set_frame_links`) and
-    /// consumer (`ColorCompatBackend::draw`) compose.
+    /// #3029 end-to-end: a long bare URL hard-wraps at narrow width while its
+    /// full target travels beside every visible chunk. No escape payload enters
+    /// the buffer, and the backend re-emits one OSC 8 pair per row without
+    /// altering the visible byte stream.
     #[test]
-    fn osc8_extractor_feeds_backend_out_of_band() {
-        use crate::tui::osc8;
+    fn osc8_metadata_feeds_backend_for_every_wrapped_url_chunk() {
+        use crate::tui::{markdown_render, osc8};
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
-        use ratatui::text::{Line, Span};
+        use ratatui::style::Style;
         use ratatui::widgets::{Paragraph, Widget};
+        use unicode_width::UnicodeWidthStr;
 
-        // 1. Render an in-band link payload into a buffer, exactly as the
-        //    transcript render seam would.
-        let target = "https://example.test/e2e";
-        let label = "open";
-        let wrapped = osc8::wrap_link(target, label);
-        let area = Rect::new(0, 0, 40, 1);
+        let target = "https://example.test/a/very/long/path/that/wraps/across/rows";
+        let rendered = markdown_render::render_markdown_tagged(target, 12, Style::default());
+        assert!(rendered.len() > 2, "fixture must wrap at narrow width");
+        let lines = rendered
+            .iter()
+            .map(|rendered| rendered.line.clone())
+            .collect::<Vec<_>>();
+        let line_links = rendered
+            .iter()
+            .map(|rendered| rendered.links.clone())
+            .collect::<Vec<_>>();
+        let visible = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible.concat(), target);
+
+        let area = Rect::new(3, 2, 12, u16::try_from(lines.len()).unwrap());
         let mut buf = Buffer::empty(area);
-        Paragraph::new(vec![Line::from(vec![Span::raw(wrapped)])]).render(area, &mut buf);
+        Paragraph::new(lines).render(area, &mut buf);
 
-        // 2. The extractor recovers the region AND blanks the payload cells.
-        //    Capture the region once — re-running would find nothing because
-        //    the payload is now gone (that's the point).
-        let regions = osc8::extract_buffer_link_regions(&mut buf, area);
-        assert_eq!(regions.len(), 1, "one link recovered: {regions:?}");
+        // Visible cells start at the area's real x offset and contain exactly
+        // the URL chunks — never the historical `]8;;` payload bytes.
+        for (row_index, text) in visible.iter().enumerate() {
+            let y = area.y + u16::try_from(row_index).unwrap();
+            let row = (0..u16::try_from(text.width()).unwrap())
+                .map(|offset| buf[(area.x + offset, y)].symbol().to_string())
+                .collect::<String>();
+            assert_eq!(row, *text);
+        }
+        assert!((area.y..area.bottom()).all(|y| {
+            (area.x..area.right()).all(|x| {
+                let symbol = buf[(x, y)].symbol();
+                !symbol.contains('\x1b') && !symbol.contains("]8;;")
+            })
+        }));
+
+        let regions = osc8::link_regions_for_lines(area, &line_links);
+        assert_eq!(regions.len(), rendered.len());
+        for ((region, text), row_index) in regions.iter().zip(&visible).zip(0u16..) {
+            assert_eq!(region.row, area.y + row_index);
+            assert_eq!(region.col_start, area.x);
+            assert_eq!(
+                region.col_end,
+                area.x + u16::try_from(text.width()).unwrap() - 1
+            );
+            assert_eq!(region.target, target);
+        }
+
+        let buf_ref = &buf;
+        let cells = (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y, buf_ref[(x, y)].clone())))
+            .collect::<Vec<_>>();
+
+        // Capture an unlinked baseline from the exact same cells.
+        let _ = osc8::take_frame_links();
+        let baseline_writer = SharedWriter::default();
+        let baseline_capture = baseline_writer.0.clone();
+        let mut baseline =
+            ColorCompatBackend::new(baseline_writer, ColorDepth::TrueColor, PaletteMode::Dark);
+        baseline
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
+            .unwrap();
+
         osc8::set_frame_links(regions);
-
-        // 3. Hand the cleaned cells to the backend and capture the byte stream.
         let writer = SharedWriter::default();
         let capture = writer.0.clone();
         let mut backend = ColorCompatBackend::new(writer, ColorDepth::TrueColor, PaletteMode::Dark);
-        let cells: Vec<(u16, u16, ratatui::buffer::Cell)> = (0..area.width)
-            .map(|x| {
-                let cell = buf[(x, 0)].clone();
-                (x, 0u16, cell)
-            })
-            .collect();
         backend
             .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
             .unwrap();
         let out = String::from_utf8_lossy(&capture.borrow()).to_string();
 
-        // 4. The backend re-emitted the link out-of-band around the label.
         let open = format!("\x1b]8;;{target}\x1b\\");
         let close = "\x1b]8;;\x1b\\";
         assert_eq!(
             out.matches(open.as_str()).count(),
-            1,
-            "open emitted once: {out:?}"
+            rendered.len(),
+            "each row reopens the full target: {out:?}"
         );
-        assert_eq!(out.matches(close).count(), 1, "close emitted once: {out:?}");
-        let open_at = out.find(open.as_str()).expect("open");
-        let close_at = out.find(close).expect("close");
-        let label_at = out.find(label).expect("label glyph");
-        assert!(open_at < label_at, "open precedes label: {out:?}");
-        assert!(label_at < close_at, "close follows label: {out:?}");
+        assert_eq!(out.matches(close).count(), rendered.len());
+
+        let baseline_out = String::from_utf8_lossy(&baseline_capture.borrow()).to_string();
+        let mut baseline_visible = String::new();
+        osc8::strip_ansi_into(&baseline_out, &mut baseline_visible);
+        let mut linked_visible = String::new();
+        osc8::strip_ansi_into(&out, &mut linked_visible);
+        assert_eq!(
+            linked_visible, baseline_visible,
+            "OSC 8 insertion must not move or alter any rendered cell"
+        );
     }
 }

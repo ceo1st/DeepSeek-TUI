@@ -77,9 +77,10 @@ drafting behind a ratify gate:
 
 ## Naming: Modes, Workflow, and Fleet
 
-These names describe different layers, not competing systems. Agent, Plan, and
-YOLO stay the permission/work modes. Workflow is an orchestration overlay that
-can run on top of those modes when the task needs a continuous workflow.
+These names describe different layers, not competing systems. Plan and Act are
+the everyday work modes; Operate is an explicit preview while its control board
+is still being built. Workflow is an orchestration overlay that can run on top
+of those modes when the task needs a continuous workflow.
 
 - **Workflow** is the repeatable plan and user-facing orchestration
   overlay: a script/IR that decides which phases and agents run next, keeps

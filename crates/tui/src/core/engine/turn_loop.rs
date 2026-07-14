@@ -5,6 +5,9 @@
 //! event handling, tool planning/execution, LSP post-edit hooks, capacity
 //! checkpoints, and loop termination.
 
+use super::stuck_guard::{
+    RUNTIME_NOTICE as STUCK_RUNTIME_NOTICE, StepFingerprint, StuckGuard, StuckSignal,
+};
 use super::*;
 use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
@@ -267,11 +270,12 @@ impl Engine {
         }
 
         let client = self
-            .deepseek_client
+            .model_client
             .clone()
-            .expect("DeepSeek client should be configured");
+            .expect("model client should be configured");
 
         let mut consecutive_tool_error_steps = 0u32;
+        let mut stuck_guard = StuckGuard::default();
         let mut turn_error: Option<String> = None;
         let mut context_recovery_attempts = 0u8;
         let mut tool_catalog = tools.unwrap_or_default();
@@ -374,7 +378,7 @@ impl Engine {
                     .await;
                 let auto_messages_before = self.session.messages.len();
                 match compact_messages_safe(
-                    &client,
+                    client.as_ref(),
                     &self.session.messages,
                     &self.config.compaction,
                     Some(&self.session.workspace),
@@ -453,7 +457,7 @@ impl Engine {
                     }
 
                     if self
-                        .recover_context_overflow(&client, "preflight token budget")
+                        .recover_context_overflow(client.as_ref(), "preflight token budget")
                         .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -643,7 +647,10 @@ impl Engine {
                     if is_context_length_error_message(&message)
                         && context_recovery_attempts < MAX_CONTEXT_RECOVERY_ATTEMPTS
                         && self
-                            .recover_context_overflow(&client, "provider context-length rejection")
+                            .recover_context_overflow(
+                                client.as_ref(),
+                                "provider context-length rejection",
+                            )
                             .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -1303,6 +1310,27 @@ impl Engine {
                     content: content_blocks,
                 })
                 .await;
+            }
+
+            if tool_uses.is_empty() {
+                match stuck_guard.observe(StepFingerprint::assistant_no_tool(&current_text_visible))
+                {
+                    Some(StuckSignal::Warn) => {
+                        self.add_session_message(self.runtime_text_message_with_turn_metadata(
+                            STUCK_RUNTIME_NOTICE.to_string(),
+                            UserInputProvenance::Runtime,
+                        ))
+                        .await;
+                        turn.next_step();
+                        continue;
+                    }
+                    Some(StuckSignal::Stop) => {
+                        let reason = "stuck loop detected after repeated no-progress messages";
+                        let _ = self.tx_event.send(Event::status(reason)).await;
+                        return (TurnOutcomeStatus::Failed, Some(reason.to_string()));
+                    }
+                    None => {}
+                }
             }
 
             // If no tool uses, check for inline REPL blocks (paper §2) or
@@ -2050,6 +2078,17 @@ impl Engine {
                 }
 
                 if parallel_allowed {
+                    let parallel_plan_receipts: Vec<_> = plans
+                        .iter()
+                        .map(|plan| {
+                            (
+                                plan.index,
+                                plan.id.clone(),
+                                plan.name.clone(),
+                                plan.input.clone(),
+                            )
+                        })
+                        .collect();
                     let mut tool_tasks = FuturesUnordered::new();
                     let shell_permits =
                         Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_SHELL_EXEC));
@@ -2154,9 +2193,48 @@ impl Engine {
                         });
                     }
 
-                    while let Some(outcome) = tool_tasks.next().await {
-                        let index = outcome.index;
-                        outcomes[index] = Some(outcome);
+                    let mut parallel_cancelled = false;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = self.cancel_token.cancelled() => {
+                                parallel_cancelled = true;
+                                break;
+                            }
+                            outcome = tool_tasks.next() => {
+                                let Some(outcome) = outcome else { break; };
+                                let index = outcome.index;
+                                outcomes[index] = Some(outcome);
+                            }
+                        }
+                    }
+                    // Dropping FuturesUnordered drops every still-active tool
+                    // future (including MCP transport calls) instead of merely
+                    // waiting for cooperative cancellation inside each tool.
+                    drop(tool_tasks);
+                    if parallel_cancelled {
+                        for (index, id, name, input) in parallel_plan_receipts {
+                            if outcomes[index].is_some() {
+                                continue;
+                            }
+                            let result = Ok(interrupted_tool_result());
+                            let _ = self
+                                .tx_event
+                                .send(Event::ToolCallComplete {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    result: result.clone(),
+                                })
+                                .await;
+                            outcomes[index] = Some(ToolExecOutcome {
+                                index,
+                                id,
+                                name,
+                                input,
+                                started_at: Instant::now(),
+                                result,
+                            });
+                        }
                     }
                 } else {
                     for plan in plans {
@@ -2209,13 +2287,16 @@ impl Engine {
 
                         if tool_name == MULTI_TOOL_PARALLEL_NAME {
                             let started_at = Instant::now();
-                            let result = self
-                                .execute_parallel_tool(
+                            let cancel_token = self.cancel_token.clone();
+                            let result = tokio::select! {
+                                biased;
+                                () = cancel_token.cancelled() => Ok(interrupted_tool_result()),
+                                result = self.execute_parallel_tool(
                                     tool_input.clone(),
                                     tool_registry,
                                     tool_exec_lock.clone(),
-                                )
-                                .await;
+                                ) => result,
+                            };
 
                             let _ = self
                                 .tx_event
@@ -2412,19 +2493,22 @@ impl Engine {
                         let mut result = if let Some(result_override) = result_override {
                             result_override
                         } else {
-                            Self::execute_tool_with_lock(
-                                tool_exec_lock.clone(),
-                                plan.supports_parallel,
-                                plan.interactive,
-                                self.tx_event.clone(),
-                                tool_name.clone(),
-                                tool_input.clone(),
-                                self.session.workspace.clone(),
-                                tool_registry,
-                                mcp_pool.clone(),
-                                context_override,
-                            )
-                            .await
+                            tokio::select! {
+                                biased;
+                                () = self.cancel_token.cancelled() => Ok(interrupted_tool_result()),
+                                result = Self::execute_tool_with_lock(
+                                    tool_exec_lock.clone(),
+                                    plan.supports_parallel,
+                                    plan.interactive,
+                                    self.tx_event.clone(),
+                                    tool_name.clone(),
+                                    tool_input.clone(),
+                                    self.session.workspace.clone(),
+                                    tool_registry,
+                                    mcp_pool.clone(),
+                                    context_override,
+                                ) => result,
+                            }
                         };
 
                         if let Some(approval_stamp) = approval_stamp
@@ -2493,10 +2577,33 @@ impl Engine {
             // sidebar "Goal:" line stays stale for the whole (possibly long)
             // goal-loop turn while get_goal already reflects the new objective.
             let mut goal_tool_ran = false;
+            let mut stuck_signal = None;
 
             for outcome in outcomes.into_iter().flatten() {
                 let tool_input = outcome.input.clone();
                 let tool_name_for_ws = outcome.name.clone();
+                let observed_signal = match &outcome.result {
+                    Ok(output) if output.success => {
+                        stuck_guard.observe(StepFingerprint::tool(&outcome.name, &tool_input, None))
+                    }
+                    Ok(output) => stuck_guard.observe(StepFingerprint::tool(
+                        &outcome.name,
+                        &tool_input,
+                        Some(&output.content),
+                    )),
+                    Err(error) => stuck_guard.observe(StepFingerprint::tool(
+                        &outcome.name,
+                        &tool_input,
+                        Some(&error.to_string()),
+                    )),
+                };
+                if matches!(observed_signal, Some(StuckSignal::Stop)) {
+                    stuck_signal = Some(StuckSignal::Stop);
+                } else if matches!(observed_signal, Some(StuckSignal::Warn))
+                    && stuck_signal.is_none()
+                {
+                    stuck_signal = Some(StuckSignal::Warn);
+                }
                 if matches!(outcome.name.as_str(), "create_goal" | "update_goal") {
                     goal_tool_ran = true;
                 }
@@ -2575,7 +2682,11 @@ impl Engine {
                         step_error_categories.push(envelope.category);
                         step_error_tool_names.push(outcome.name.clone());
                         step_error_tool_inputs.push(tool_input.clone());
-                        let error = format_tool_error(&e, &outcome.name);
+                        let input_schema = tool_catalog
+                            .iter()
+                            .find(|tool| tool.name == outcome.name)
+                            .map(|tool| &tool.input_schema);
+                        let error = format_tool_error_with_schema(&e, &outcome.name, input_schema);
                         self.session.working_set.observe_tool_call(
                             &tool_name_for_ws,
                             &tool_input,
@@ -2604,6 +2715,20 @@ impl Engine {
             // applies it behind a `changed` guard).
             if goal_tool_ran {
                 self.emit_goal_updated().await;
+            }
+
+            if let Some(signal) = stuck_signal {
+                if matches!(signal, StuckSignal::Warn) {
+                    self.add_session_message(self.runtime_text_message_with_turn_metadata(
+                        STUCK_RUNTIME_NOTICE.to_string(),
+                        UserInputProvenance::Runtime,
+                    ))
+                    .await;
+                } else {
+                    let reason = "stuck loop detected after repeated tool actions/results";
+                    let _ = self.tx_event.send(Event::status(reason)).await;
+                    return (TurnOutcomeStatus::Failed, Some(reason.to_string()));
+                }
             }
 
             if stop_after_plan_tool {

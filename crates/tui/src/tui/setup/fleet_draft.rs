@@ -16,8 +16,8 @@
 //!   parse, escalation rejection, sanitization, bounding — before anyone
 //!   previews it. Failure of any kind degrades to the manual authoring flow;
 //!   it never blocks the wizard.
-//! - **Drafting is not ratifying.** The caller shows the exact rendered TOML
-//!   and still requires the explicit ratify keypress before anything is
+//! - **Drafting is not saving.** The caller shows the exact rendered TOML
+//!   and still requires the explicit save keypress before anything is
 //!   written; the on-disk bytes are rendered from the validated struct, never
 //!   from model output.
 
@@ -255,7 +255,7 @@ fn profile_draft_response_text(content: &[ContentBlock]) -> String {
 
 /// Ask `client` to draft a fleet profile for the wizard's answers. Returns
 /// the sanitized, bounded draft, or a short human-facing reason on any
-/// failure. The caller owns timeout, preview, and the ratify gate.
+/// failure. The caller owns timeout, preview, and the save gate.
 pub(crate) async fn draft_fleet_profile_with_model<C: LlmClient>(
     client: &C,
     request_model: &str,

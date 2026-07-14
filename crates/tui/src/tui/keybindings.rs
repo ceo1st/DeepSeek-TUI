@@ -198,7 +198,9 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "Alt+C",
+        // `/context` is the guaranteed path; Alt+C is an unadvertised
+        // handler until proven in real terminals (TUI-DOG-003).
+        chord: "/context",
         description_id: crate::localization::MessageId::KbCompactInspector,
         section: KeybindingSection::Submission,
     },
@@ -208,7 +210,8 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
-        chord: "v",
+        // Bare `v` always types `v`; details is Alt+V only (⌥V on macOS).
+        chord: "Alt+V",
         description_id: crate::localization::MessageId::KbSelectedDetails,
         section: KeybindingSection::Submission,
     },
@@ -287,18 +290,10 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
     },
     // --- Help ---
     KeybindingEntry {
-        chord: "Alt+?",
+        // F1 is primary (with /help); Ctrl+/ is the secondary fallback.
+        // Alt+? stays an unadvertised handler (TUI-DOG-003).
+        chord: "F1 / Ctrl+/",
         description_id: crate::localization::MessageId::KbHelpOverlay,
-        section: KeybindingSection::Help,
-    },
-    KeybindingEntry {
-        chord: "F1",
-        description_id: crate::localization::MessageId::KbToggleHelp,
-        section: KeybindingSection::Help,
-    },
-    KeybindingEntry {
-        chord: "Ctrl+/",
-        description_id: crate::localization::MessageId::KbToggleHelp,
         section: KeybindingSection::Help,
     },
 ];
@@ -330,27 +325,69 @@ mod tests {
     }
 
     #[test]
-    fn help_section_documents_modified_question_mark() {
+    fn help_advertises_f1_and_ctrl_slash_never_alt_question() {
+        // TUI-DOG-003: Alt+? is not advertised anywhere; F1 (with /help) is
+        // primary and Ctrl+/ is the secondary fallback.
+        assert!(
+            KEYBINDINGS.iter().any(|entry| {
+                entry.section == KeybindingSection::Help
+                    && entry.chord.contains("F1")
+                    && entry.chord.contains("Ctrl+/")
+            }),
+            "help must document F1 with the Ctrl+/ fallback"
+        );
         assert!(
             KEYBINDINGS
                 .iter()
-                .any(|entry| entry.chord == "Alt+?" && entry.section == KeybindingSection::Help),
-            "Alt+? must remain documented as the help-toggle chord"
+                .all(|entry| !entry.chord.contains("Alt+?")),
+            "Alt+? must not be advertised in the help catalog"
         );
     }
 
     #[test]
     fn transcript_navigation_catalog_does_not_advertise_bare_typing_keys() {
-        for stale in ["g / G", "[ / ]", "l", "?", "Ctrl+↑ / Ctrl+↓"] {
+        for stale in [
+            "g / G",
+            "[ / ]",
+            "l",
+            "?",
+            "Ctrl+↑ / Ctrl+↓",
+            "v",
+            "v / Alt+V",
+        ] {
             assert!(
                 KEYBINDINGS.iter().all(|entry| entry.chord != stale),
                 "stale handler-free chord remains documented: {stale}"
             );
         }
-        for wired in ["Alt+G / Alt+Shift+G", "Alt+[ / Alt+]", "Alt+L", "Alt+?"] {
+        for wired in ["Alt+G / Alt+Shift+G", "Alt+[ / Alt+]", "Alt+L", "Alt+V"] {
             assert!(
                 KEYBINDINGS.iter().any(|entry| entry.chord == wired),
                 "wired transcript shortcut missing from help: {wired}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_binding_source_matches_help_catalog_chords() {
+        use crate::tui::shell_key_routing::{ShellBindingId, binding};
+        assert_eq!(binding(ShellBindingId::ToolDetails).catalog_chord, "Alt+V");
+        assert_eq!(
+            binding(ShellBindingId::ContextInspector).catalog_chord,
+            "/context"
+        );
+        assert_eq!(binding(ShellBindingId::Help).catalog_chord, "F1 / Ctrl+/");
+        for id in [
+            ShellBindingId::ToolDetails,
+            ShellBindingId::ContextInspector,
+            ShellBindingId::Help,
+        ] {
+            let chord = binding(id).catalog_chord;
+            assert!(
+                KEYBINDINGS
+                    .iter()
+                    .any(|entry| entry.chord == chord || entry.chord.contains(chord)),
+                "shell binding {id:?} chord missing from help catalog: {chord}"
             );
         }
     }
@@ -390,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_details_help_documents_bare_v_without_alt_v() {
+    fn tool_details_documents_alt_v_only_never_bare_v() {
         let selected_details = KEYBINDINGS
             .iter()
             .filter(|entry| {
@@ -399,13 +436,13 @@ mod tests {
             .map(|entry| entry.chord)
             .collect::<Vec<_>>();
 
-        assert_eq!(selected_details, vec!["v"]);
-        let legacy_modified_details_chord = ["Alt", "V"].join("+");
+        // TUI-DOG-002: bare `v` always types `v`; details is Alt+V only.
+        assert_eq!(selected_details, vec!["Alt+V"]);
         assert!(
             KEYBINDINGS
                 .iter()
-                .all(|entry| entry.chord != legacy_modified_details_chord),
-            "help should advertise the bare v details shortcut"
+                .all(|entry| entry.chord != "v" && !entry.chord.starts_with("v /")),
+            "bare `v` must not be advertised — composer typing owns it"
         );
     }
 

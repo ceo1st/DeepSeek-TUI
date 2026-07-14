@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Paragraph, Widget, Wrap},
 };
 
-use crate::config::{Config, has_api_key, has_api_key_for};
+use crate::config::{Config, has_api_key};
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::prompts::{
@@ -294,36 +294,48 @@ impl Default for SetupRuntimeFacts {
 impl SetupRuntimeFacts {
     fn from_app_config(app: &App, config: &Config) -> Self {
         let expert_override = SetupExpertOverrideState::load();
-        let provider_ready = has_api_key_for(config, app.api_provider);
+        let readiness = crate::provider_readiness::resolve_for_model(
+            config,
+            app.api_provider,
+            if app.auto_model { "auto" } else { &app.model },
+            &app.provider_health,
+        );
+        // A failed observed check remains retryable in route pickers, but the
+        // setup receipt must not certify it as healthy. Saved-unchecked and
+        // local-unchecked are honest reviewed configuration states; an actual
+        // session failure is NeedsAction until a later success replaces it.
+        let provider_ready = readiness.can_attempt()
+            && !matches!(
+                &readiness,
+                crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
+            );
         let model = app.model_display_label();
         let provider = app.api_provider.display_name().to_string();
-        let auth = if provider_ready {
-            "present or local runtime".to_string()
-        } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
-            "missing Codex OAuth login".to_string()
-        } else {
-            "missing for active provider".to_string()
-        };
+        let auth = readiness.label().into_owned();
         let health = if provider_ready {
-            "ready for first turn; live validation remains with /provider".to_string()
+            format!("{}; route can be attempted", readiness.label())
+        } else if matches!(
+            &readiness,
+            crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
+        ) {
+            format!("{}; retry or open /provider", readiness.label())
         } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
-            "run codex login or set OPENAI_CODEX_ACCESS_TOKEN before first turn".to_string()
+            format!("{}; run codex login or open /provider", readiness.label())
         } else if let Some(url) = app.api_provider.credential_url() {
-            format!("needs key or local runtime before first turn; credentials: {url}")
+            format!(
+                "{}; credentials: {url}; open /provider to repair the route",
+                readiness.label()
+            )
         } else {
-            "needs key or local runtime before first turn".to_string()
+            format!("{}; open /provider to repair the route", readiness.label())
         };
         let provider_result = format!(
             "provider={}, model={}, auth={}, health={}",
             app.api_provider.as_str(),
             model,
+            readiness.label(),
             if provider_ready {
-                "present/local"
-            } else {
-                "missing"
-            },
-            if provider_ready {
-                "not checked"
+                "attemptable"
             } else {
                 "needs action"
             }
@@ -355,7 +367,9 @@ impl SetupRuntimeFacts {
         let runtime_result = format!(
             "intent={}, approval={}, shell={}, trust={}, sandbox={}, network={}",
             app.mode.as_setting(),
-            app.approval_mode.label().to_ascii_lowercase(),
+            app.approval_mode
+                .permission_chip_label()
+                .to_ascii_lowercase(),
             if app.allow_shell { "enabled" } else { "hidden" },
             if app.trust_mode {
                 "trusted"
@@ -420,7 +434,10 @@ impl SetupRuntimeFacts {
             provider_ready,
             provider_result,
             work_intent: app.mode.display_name().to_string(),
-            approval: app.approval_mode.label().to_ascii_lowercase(),
+            approval: app
+                .approval_mode
+                .permission_chip_label()
+                .to_ascii_lowercase(),
             shell,
             allow_shell_enabled: app.allow_shell,
             trust,
@@ -529,18 +546,22 @@ impl SetupRuntimePreset {
     pub fn default_mode(self) -> &'static str {
         match self {
             Self::AskFirst => "plan",
-            Self::NormalAgent => "agent",
-            Self::HighTrustLocal => "yolo",
+            Self::NormalAgent | Self::HighTrustLocal => "agent",
+        }
+    }
+
+    pub fn permission_posture(self) -> &'static str {
+        match self {
+            Self::AskFirst | Self::NormalAgent => "ask",
+            Self::HighTrustLocal => "full-access",
         }
     }
 
     pub fn approval_policy(self) -> Option<&'static str> {
         match self {
             Self::AskFirst | Self::NormalAgent => Some("on-request"),
-            // YOLO derives bypass approval from `default_mode = "yolo"`.
-            // `approval_policy = "bypass"` is intentionally not a persisted
-            // config value. Interactive Shift+Tab posture is stored separately
-            // in TUI settings and cannot override managed approval policy.
+            // Full Access lives in TUI settings; it is intentionally not a
+            // top-level approval_policy value.
             Self::HighTrustLocal => None,
         }
     }
@@ -560,15 +581,26 @@ impl SetupRuntimePreset {
     }
 
     pub fn result_summary(self) -> String {
-        let approval = self.approval_policy().unwrap_or("mode-derived-yolo-bypass");
+        let approval = self
+            .approval_policy()
+            .unwrap_or("unset (Full Access saved in TUI settings)");
         format!(
-            "preset={}, default_mode={}, approval_policy={}, allow_shell={}, sandbox_mode={}, network=unchanged, trust=unchanged",
+            "preset={}, default_mode={}, permission_posture={}, approval_policy={}, allow_shell={}, sandbox_mode={}, network=unchanged, trust=unchanged",
             self.id(),
-            self.default_mode(),
+            self.display_mode(),
+            self.permission_posture(),
             approval,
             self.allow_shell(),
             self.sandbox_mode()
         )
+    }
+
+    fn display_mode(self) -> &'static str {
+        match self {
+            Self::AskFirst => "plan",
+            Self::NormalAgent => "act",
+            Self::HighTrustLocal => "act + full-access",
+        }
     }
 }
 
@@ -3084,14 +3116,18 @@ fn runtime_preset_preview_text(
 
 fn runtime_preset_diff_rows(preset: SetupRuntimePreset, facts: &SetupRuntimeFacts) -> Vec<String> {
     let approval_target = preset.approval_policy().map_or_else(
-        || "unchanged; YOLO derives bypass from default_mode".to_string(),
+        || "removed; Full Access comes from settings.permission_posture".to_string(),
         ToString::to_string,
     );
     let mut rows = vec![
         format!(
             "settings.default_mode: {} -> {}",
             facts.default_mode,
-            preset.default_mode()
+            preset.display_mode()
+        ),
+        format!(
+            "settings.permission_posture: -> {}",
+            preset.permission_posture()
         ),
         format!(
             "config.approval_policy: {} -> {}",
@@ -4349,7 +4385,7 @@ mod tests {
             cn_text.contains("credentials: https://platform.deepseek.com/api_keys"),
             "{cn_text}"
         );
-        assert!(cn_text.contains("missing for active provider"), "{cn_text}");
+        assert!(cn_text.contains("missing key"), "{cn_text}");
 
         let local_config = Config {
             provider: Some("ollama".to_string()),
@@ -4364,10 +4400,7 @@ mod tests {
         );
         let local_text = lines_to_text(local_view.provider_model_detail_lines());
         assert!(local_text.contains("Ollama"), "{local_text}");
-        assert!(
-            local_text.contains("present or local runtime"),
-            "{local_text}"
-        );
+        assert!(local_text.contains("local · not checked"), "{local_text}");
         assert!(!local_text.contains("credentials:"), "{local_text}");
     }
 
@@ -5527,6 +5560,55 @@ mod tests {
     }
 
     #[test]
+    fn observed_provider_failure_records_needs_action_not_verified() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let codewhale_home = tmp.path().join(".codewhale");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+        let _deepseek_env = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let config = Config {
+            api_key: Some("saved-deepseek-key".to_string()),
+            ..Default::default()
+        };
+        let mut app = App::new(setup_test_options(workspace), &config);
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model = "deepseek-v4-pro".to_string();
+        app.provider_health.record_failure_message(
+            &config,
+            crate::config::ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            crate::error_taxonomy::ErrorCategory::Authentication,
+            "credential rejected",
+        );
+
+        let facts = SetupRuntimeFacts::from_app_config(&app, &config);
+        assert!(!facts.provider_ready);
+        assert!(facts.auth.contains("last check failed"), "{}", facts.auth);
+        assert!(facts.provider_result.contains("health=needs action"));
+
+        let mut view = SetupWizardView::new_at_with_facts(
+            SetupState::default(),
+            Locale::En,
+            SetupStep::ProviderModel,
+            facts,
+        );
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, .. }) =
+            view.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("expected setup-state commit event");
+        };
+        assert_eq!(
+            state.status(SetupStep::ProviderModel),
+            StepStatus::NeedsAction
+        );
+    }
+
+    #[test]
     fn runtime_posture_review_confirms_without_config_mutation() {
         let facts = SetupRuntimeFacts {
             runtime_result: "intent=agent, approval=suggest, shell=enabled, trust=workspace, sandbox=default, network=prompt by default".to_string(),
@@ -5658,7 +5740,7 @@ mod tests {
 
         assert!(text.contains("Selected preset:"));
         assert!(text.contains("Normal agent"));
-        assert!(text.contains("settings.default_mode: agent -> agent"));
+        assert!(text.contains("settings.default_mode: agent -> act"));
         assert!(text.contains("config.allow_shell: true -> true"));
         assert!(text.contains("Safety floor:"));
         assert!(text.contains("Press A to preview"));
@@ -6161,10 +6243,11 @@ mod tests {
             panic!("first apply should preview the exact diff");
         };
         assert!(content.contains("Runtime Posture Preset Preview"));
-        assert!(content.contains("settings.default_mode: agent -> yolo"));
+        assert!(content.contains("settings.default_mode: agent -> act + full-access"));
         assert!(content.contains(
-            "config.approval_policy: never -> unchanged; YOLO derives bypass from default_mode"
+            "config.approval_policy: never -> removed; Full Access comes from settings.permission_posture"
         ));
+        assert!(content.contains("settings.permission_posture: -> full-access"));
         assert!(content.contains("config.network.default: deny -> unchanged"));
 
         let action = view.handle_key(key(KeyCode::Char('a')));
@@ -6189,7 +6272,7 @@ mod tests {
                 .and_then(|entry| entry.result.as_deref())
                 .is_some_and(|result| {
                     result.contains("preset=high-trust-local")
-                        && result.contains("default_mode=yolo")
+                        && result.contains("default_mode=act + full-access")
                         && result.contains("network=unchanged")
                 })
         );

@@ -1,13 +1,14 @@
 //! Terminal-native underwater field for the CodeWhale transcript.
 //!
-//! The field is atmosphere, never content: callers paint it only into cells
-//! outside occupied transcript text. Reduced motion freezes the field but does
-//! not remove it, so choosing an underwater treatment always has a visible
-//! result.
+//! The field is atmosphere, never content: ordinary shell cells share its
+//! water column while semantic surfaces such as selections, errors, and code
+//! keep their own backgrounds. Reduced motion freezes the field but does not
+//! remove it, so choosing an underwater treatment always has a visible result.
 
-use ratatui::style::Color;
+use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
 use crate::palette::{PaletteMode, UiTheme};
+use crate::tui::underwater::ShellPhase;
 
 /// Appearance treatment for the underwater shell.
 ///
@@ -71,16 +72,14 @@ impl OceanTreatment {
 pub const AMBIENT_MIN_WIDTH: u16 = 68;
 pub const AMBIENT_MIN_HEIGHT: u16 = 15;
 
-/// Ambient-life ink for a theme, independent of the ombre ramp. Flat keeps
-/// the same sunk seafoam as ombre; palettes without RGB surfaces (Terminal)
-/// fall back to the raw secondary accent so the terminal's own palette
-/// colors the life.
+/// Ambient-life inks for a theme, independent of the ombre ramp. Fish use two
+/// sunk sky-blue shades so seafoam remains reserved for live work.
 #[must_use]
-pub fn ambient_ink(theme: &UiTheme) -> Color {
-    let seafoam = rgb(theme.accent_secondary).unwrap_or((79, 209, 197));
+pub fn ambient_inks(theme: &UiTheme) -> (Color, Color) {
+    let sky = rgb(theme.info).unwrap_or((106, 174, 242));
     match rgb(theme.surface_bg) {
-        Some(base) => color(mix(seafoam, base, 0.42)),
-        None => theme.accent_secondary,
+        Some(base) => (color(mix(sky, base, 0.42)), color(mix(sky, base, 0.28))),
+        None => (theme.info, theme.info),
     }
 }
 
@@ -90,6 +89,79 @@ pub struct OceanRamp {
     pub middle: Color,
     pub deep: Color,
     pub ambient: Color,
+}
+
+/// One continuous water column shared by every shell band in a frame.
+///
+/// Individual widgets still own their foreground and semantic surfaces, but
+/// ordinary shell backgrounds sample this column with their absolute row.
+/// That keeps the header, work strip, transcript, phase line, and composer
+/// from each restarting the same miniature gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OceanColumn {
+    ramp: OceanRamp,
+    top: u16,
+    height: u16,
+    elapsed_ms: u128,
+    completion_elapsed_ms: Option<u128>,
+    phase: ShellPhase,
+    animated: bool,
+}
+
+impl OceanColumn {
+    #[must_use]
+    pub fn new(
+        ramp: OceanRamp,
+        viewport: Rect,
+        elapsed_ms: u128,
+        completion_elapsed_ms: Option<u128>,
+        phase: ShellPhase,
+        animated: bool,
+    ) -> Self {
+        Self {
+            ramp,
+            top: viewport.y,
+            height: viewport.height.max(1),
+            elapsed_ms,
+            completion_elapsed_ms,
+            phase,
+            animated,
+        }
+    }
+
+    #[must_use]
+    pub fn color_at_y(self, y: u16) -> Color {
+        let row = y.saturating_sub(self.top).min(self.height - 1);
+        if let Some(elapsed) = self.completion_elapsed_ms {
+            self.ramp.color_at_completion(row, self.height, elapsed)
+        } else if self.animated {
+            self.ramp
+                .color_at_phase(row, self.height, self.elapsed_ms, self.phase)
+        } else {
+            self.ramp.color_at(row, self.height)
+        }
+    }
+
+    #[must_use]
+    pub fn with_viewport(mut self, viewport: Rect) -> Self {
+        self.top = viewport.y;
+        self.height = viewport.height.max(1);
+        self
+    }
+
+    /// Continue the shared column through a shell-owned surface without
+    /// flattening semantic highlights (selection, hover, error, code blocks).
+    pub fn paint_matching(self, area: Rect, buf: &mut Buffer, background: Color) {
+        for y in area.top()..area.bottom() {
+            let row_bg = self.color_at_y(y);
+            for x in area.left()..area.right() {
+                let cell = &mut buf[(x, y)];
+                if cell.bg == background {
+                    cell.set_bg(row_bg);
+                }
+            }
+        }
+    }
 }
 
 impl OceanRamp {
@@ -133,16 +205,48 @@ impl OceanRamp {
     }
 
     #[must_use]
-    pub fn color_at_phase(self, row: u16, height: u16, elapsed_ms: u128) -> Color {
+    pub fn color_at_phase(
+        self,
+        row: u16,
+        height: u16,
+        elapsed_ms: u128,
+        phase: ShellPhase,
+    ) -> Color {
         let base = self.color_at(row, height);
         let depth = if height <= 1 {
             0.0
         } else {
             f32::from(row.min(height - 1)) / f32::from(height - 1)
         };
-        let cycle = (elapsed_ms % 12_000) as f32 / 12_000.0;
+        if matches!(
+            phase,
+            ShellPhase::Waiting | ShellPhase::Approval | ShellPhase::Failed
+        ) {
+            return base;
+        }
+        let cycle = (elapsed_ms % 90_000) as f32 / 90_000.0;
         let breath = (cycle * std::f32::consts::TAU).sin() * 0.5 + 0.5;
-        mix_colors(base, self.ambient, breath * 0.075 * (1.0 - depth))
+        let (phase_bias, phase_depth) = match phase {
+            ShellPhase::Idle => (0.035, 1.0 - depth),
+            ShellPhase::Typing => (0.025, 1.0 - depth),
+            ShellPhase::Working => (0.045, 0.35 + depth * 0.65),
+            ShellPhase::Verifying => (0.055, 0.65 + (1.0 - depth) * 0.35),
+            ShellPhase::Done => (0.018, 1.0 - depth),
+            ShellPhase::Waiting | ShellPhase::Approval | ShellPhase::Failed => unreachable!(),
+        };
+        mix_colors(base, self.ambient, breath * phase_bias * phase_depth)
+    }
+
+    #[must_use]
+    pub fn color_at_completion(self, row: u16, height: u16, elapsed_ms: u128) -> Color {
+        let base = self.color_at(row, height);
+        let elapsed = elapsed_ms.min(800) as f32 / 800.0;
+        let brightness = if elapsed <= 0.4 {
+            0.88 + (1.12 - 0.88) * (elapsed / 0.4)
+        } else {
+            1.12 + (1.0 - 1.12) * ((elapsed - 0.4) / 0.6)
+        };
+        scale_color(base, brightness)
     }
 }
 
@@ -165,6 +269,18 @@ fn mix_colors(from: Color, to: Color, amount: f32) -> Color {
         (Some(from), Some(to)) => color(mix(from, to, amount)),
         _ => from,
     }
+}
+
+#[must_use]
+fn scale_color(value: Color, brightness: f32) -> Color {
+    let Some((r, g, b)) = rgb(value) else {
+        return value;
+    };
+    color((
+        (f32::from(r) * brightness).round().clamp(0.0, 255.0) as u8,
+        (f32::from(g) * brightness).round().clamp(0.0, 255.0) as u8,
+        (f32::from(b) * brightness).round().clamp(0.0, 255.0) as u8,
+    ))
 }
 
 #[must_use]
@@ -254,35 +370,101 @@ mod tests {
     }
 
     #[test]
-    fn ambient_ink_matches_the_ramp_and_survives_reset_surfaces() {
-        // RGB themes: flat fish wear the same sunk seafoam as the ombre ramp
-        // so switching treatment never recolors the life.
+    fn ambient_ink_matches_sunk_sky_shades_and_survives_reset_surfaces() {
+        // RGB themes: fish wear two sunk sky shades; seafoam remains live-work ink.
         let theme = crate::palette::UI_THEME;
         let ramp = OceanRamp::for_theme(&theme).expect("RGB theme");
-        assert_eq!(ambient_ink(&theme), ramp.ambient);
+        let (primary, secondary) = ambient_inks(&theme);
+        assert_ne!(primary, ramp.ambient);
+        assert_ne!(primary, secondary);
+        assert_ne!(primary, theme.accent_secondary);
 
         // Terminal-owned surfaces have no RGB base; the raw secondary accent
         // lets the terminal's own palette color the life.
         let terminal = crate::palette::TERMINAL_UI_THEME;
-        assert_eq!(ambient_ink(&terminal), terminal.accent_secondary);
+        assert_eq!(ambient_inks(&terminal), (terminal.info, terminal.info));
     }
 
     #[test]
     fn shimmer_is_subtle_and_concentrated_near_the_surface() {
         let ramp = OceanRamp::for_theme(&crate::palette::UI_THEME).expect("RGB theme");
-        let surface_a = ramp.color_at_phase(0, 20, 0);
-        let surface_b = ramp.color_at_phase(0, 20, 3_000);
-        let deep_a = ramp.color_at_phase(19, 20, 0);
-        let deep_b = ramp.color_at_phase(19, 20, 3_000);
+        let surface_a = ramp.color_at_phase(0, 20, 0, ShellPhase::Idle);
+        let surface_b = ramp.color_at_phase(0, 20, 3_000, ShellPhase::Idle);
+        let deep_a = ramp.color_at_phase(19, 20, 0, ShellPhase::Idle);
+        let deep_b = ramp.color_at_phase(19, 20, 3_000, ShellPhase::Idle);
 
         let surface_shift = distance(surface_a, surface_b);
         assert!(
-            (2..=18).contains(&surface_shift),
+            (1..=8).contains(&surface_shift),
             "surface shift was {surface_shift}"
         );
         assert_eq!(
             deep_a, deep_b,
             "the floor should stay perceptually anchored"
+        );
+    }
+
+    #[test]
+    fn attention_phases_are_still_and_work_phases_have_distinct_depth_bias() {
+        let ramp = OceanRamp::for_theme(&crate::palette::UI_THEME).expect("RGB theme");
+        for phase in [
+            ShellPhase::Waiting,
+            ShellPhase::Approval,
+            ShellPhase::Failed,
+        ] {
+            assert_eq!(
+                ramp.color_at_phase(4, 20, 0, phase),
+                ramp.color_at_phase(4, 20, 45_000, phase)
+            );
+        }
+        assert_ne!(
+            ramp.color_at_phase(10, 20, 22_500, ShellPhase::Working),
+            ramp.color_at_phase(10, 20, 22_500, ShellPhase::Verifying)
+        );
+    }
+
+    #[test]
+    fn completion_breath_peaks_once_then_settles() {
+        let ramp = OceanRamp::for_theme(&crate::palette::UI_THEME).expect("RGB theme");
+        let start = ramp.color_at_completion(0, 20, 0);
+        let peak = ramp.color_at_completion(0, 20, 320);
+        let settled = ramp.color_at_completion(0, 20, 800);
+        assert_ne!(start, peak);
+        assert_ne!(peak, settled);
+        assert_eq!(settled, ramp.color_at(0, 20));
+    }
+
+    #[test]
+    fn split_shell_surfaces_share_one_absolute_row_column() {
+        let theme = crate::palette::UI_THEME;
+        let ramp = OceanRamp::for_theme(&theme).expect("RGB theme");
+        let viewport = Rect::new(0, 0, 12, 12);
+        let header = Rect::new(0, 0, 12, 2);
+        let composer = Rect::new(0, 10, 12, 2);
+        let mut buf = Buffer::empty(viewport);
+        for y in header.top()..header.bottom() {
+            for x in header.left()..header.right() {
+                buf[(x, y)].set_bg(theme.header_bg);
+            }
+        }
+        for y in composer.top()..composer.bottom() {
+            for x in composer.left()..composer.right() {
+                buf[(x, y)].set_bg(theme.composer_bg);
+            }
+        }
+        buf[(4, 10)].set_bg(theme.selection_bg);
+
+        let column = OceanColumn::new(ramp, viewport, 0, None, ShellPhase::Idle, false);
+        column.paint_matching(header, &mut buf, theme.header_bg);
+        column.paint_matching(composer, &mut buf, theme.composer_bg);
+
+        assert_eq!(buf[(0, 0)].bg, ramp.color_at(0, 12));
+        assert_eq!(buf[(0, 11)].bg, ramp.color_at(11, 12));
+        assert_ne!(buf[(0, 1)].bg, buf[(0, 10)].bg);
+        assert_eq!(
+            buf[(4, 10)].bg,
+            theme.selection_bg,
+            "semantic surfaces must survive the shell ombre pass"
         );
     }
 }

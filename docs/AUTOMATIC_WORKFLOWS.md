@@ -38,7 +38,7 @@ You can still type `/workflow` to force “orchestrate the current work.”
 | `require_approval_for_writes` | `true` | Writes / elevated plans need explicit approval |
 | `auto_start_child_limit` | `8` | Soft cap on automatic child count |
 | `max_children` / `max_depth` | `64` / `2` | Hard ceilings |
-| `default_token_budget` | `120000` | Shared budget hint |
+| `default_token_budget` | `120000` | Shared admission hint; not an exact mid-stream cutoff |
 | `persist_completed_activity` | `true` | Keep completed panel/history activity |
 
 Elevated work (writes, shell beyond read-only, network, secrets, worktrees, high
@@ -65,8 +65,14 @@ approval policy. See [Sandbox](SANDBOX.md).
 ## Synthesis and compatibility
 
 - Prefer `responseSchema` on children that must return structured fields.
-- Failed parallel slots become `null` (partial success); filter them before
-  synthesizing one operator-facing summary.
+- Ordinary failed parallel slots become `null` (partial success); filter them
+  before synthesizing one operator-facing summary. A `responseSchema` mismatch
+  is a contract failure and intentionally fails the run instead of being
+  silently converted to `null`.
+- Workflow token budgets govern admission and aggregate accounting. Once
+  exhausted they reject later or descendant spawns, but children already
+  running in parallel can reconcile aggregate usage above the hint because
+  providers report usage only at response boundaries.
 - Compatibility paths remain: `script`, `source_path` (checked-in
   `.workflow.js` / `.workflow.ts`), and structured `plan`.
 

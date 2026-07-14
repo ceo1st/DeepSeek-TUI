@@ -472,7 +472,7 @@ fn add_app_runtime_entries(builder: &mut ReportBuilder, app: &App) {
             app.model,
             app.api_provider.as_str(),
             app.mode.label(),
-            app.approval_mode.label()
+            app.approval_mode.permission_chip_label()
         ),
         CountingConfidence::Approximate,
         Some(4),

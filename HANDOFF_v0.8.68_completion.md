@@ -1,13 +1,15 @@
 # CodeWhale 0.8.68 Handoff — Finish the Landing
 
-> **Status (2026-07-12): Historical / completed.** Every actionable item below
-> either landed by v0.8.68 (multipart/brotli removal, palette migration,
-> allowed_tools deletion, tools_file/removed_messages cleanup, double-Enter
-> steer) or was deliberately superseded — item 7's "remove `todo_*` aliases at
-> 0.9.0" went the other way: #4132 keeps `todo_*`/`checklist_*` as hidden
-> replay aliases, so do not execute it. The DO-NOT-DELETE module table below
-> remains a standing guardrail. The companion `opportunities.md` was never
-> committed; its link is dangling by design.
+> **Status (2026-07-13): Historical handoff, not completion proof.** v0.8.68 is
+> still an unpublished release candidate. Paths, branch counts, checkmarks, and
+> verification claims below describe the checkout that produced this handoff;
+> do not use them as evidence for the current candidate. Use the current
+> [v0.8.68 release-candidate ledger](docs/releases/v0.8.68-release-candidate.md)
+> instead. Some listed work is now present in the candidate and some was
+> superseded — notably, #4132 keeps `todo_*`/`checklist_*` as hidden replay
+> aliases, so do not execute the old instruction to remove them. The
+> DO-NOT-DELETE table remains a standing guardrail. The companion
+> `opportunities.md` was never committed; its link is dangling by design.
 >
 > ~~**Companion document:** [`opportunities.md`](../../opportunities.md)~~ (not
 > in the repository) — this file was the *what to do next*; the catalog behind

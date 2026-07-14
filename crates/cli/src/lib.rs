@@ -167,8 +167,8 @@ struct Cli {
     no_mouse_capture: bool,
     #[arg(long = "skip-onboarding")]
     skip_onboarding: bool,
-    /// YOLO mode: auto-approve all tools
-    #[arg(long)]
+    /// Legacy compatibility alias for Act + Full Access.
+    #[arg(long, hide = true)]
     yolo: bool,
     /// Continue the most recent interactive session for this workspace.
     #[arg(short = 'c', long = "continue")]

@@ -27,6 +27,10 @@ impl Frame {
         self.captured_at = Some(Instant::now());
     }
 
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+    }
+
     pub fn rows(&self) -> u16 {
         self.parser.screen().size().0
     }
@@ -60,6 +64,20 @@ impl Frame {
 
     pub fn contains(&self, needle: &str) -> bool {
         self.text().contains(needle)
+    }
+
+    /// First visible coordinate of `needle`, using terminal display columns.
+    /// PTY mouse tests use this to click the row the renderer actually painted
+    /// instead of hard-coding layout coordinates.
+    pub fn find_text(&self, needle: &str) -> Option<(u16, u16)> {
+        for row in 0..self.rows() {
+            let text = self.row(row);
+            if let Some(byte) = text.find(needle) {
+                let col = unicode_width::UnicodeWidthStr::width(&text[..byte]);
+                return Some((row, u16::try_from(col).ok()?));
+            }
+        }
+        None
     }
 
     /// Foreground/background colors for one terminal cell. Theme QA uses the

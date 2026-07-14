@@ -32,9 +32,11 @@ use crate::sandbox::SandboxPolicy;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, ElevationWidget, Renderable};
 use codewhale_config::ToolAskRule;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1222,6 +1224,7 @@ impl ApprovalOption {
 pub struct ApprovalView {
     request: ApprovalRequest,
     selected: usize,
+    row_hitboxes: RefCell<Vec<Rect>>,
     locale: Locale,
     timeout: Option<Duration>,
     requested_at: Instant,
@@ -1239,6 +1242,7 @@ impl ApprovalView {
         Self {
             request,
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
             locale,
             timeout: None,
             requested_at: Instant::now(),
@@ -1276,6 +1280,10 @@ impl ApprovalView {
     /// Selected option for the renderer (used by the widget tests too).
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    pub(crate) fn set_mouse_hitboxes(&self, hitboxes: Vec<Rect>) {
+        *self.row_hitboxes.borrow_mut() = hitboxes;
     }
 
     /// Risk level for the renderer's accent picking.
@@ -1409,6 +1417,32 @@ impl ModalView for ApprovalView {
             }
             KeyCode::Char('v') | KeyCode::Char('V') => self.emit_params_pager(),
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
+            _ => ViewAction::None,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.select_prev();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    return self.commit_option(ApprovalOption::from_index_for(
+                        &self.request.tool_name,
+                        index,
+                    ));
+                }
+                ViewAction::None
+            }
             _ => ViewAction::None,
         }
     }
@@ -1597,6 +1631,7 @@ pub struct ElevationView {
     request: ElevationRequest,
     selected: usize,
     locale: Locale,
+    row_hitboxes: RefCell<Vec<Rect>>,
 }
 
 impl ElevationView {
@@ -1605,6 +1640,7 @@ impl ElevationView {
             request,
             selected: 0,
             locale,
+            row_hitboxes: RefCell::new(Vec::new()),
         }
     }
 
@@ -1678,8 +1714,36 @@ impl ModalView for ElevationView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.select_prev();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    return self.emit_decision(self.request.options[index].clone());
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        let elevation_widget = ElevationWidget::new(&self.request, self.selected, self.locale);
+        let elevation_widget = ElevationWidget::new_with_hitboxes(
+            &self.request,
+            self.selected,
+            self.locale,
+            &self.row_hitboxes,
+        );
         elevation_widget.render(area, buf);
     }
 }
@@ -1691,7 +1755,8 @@ impl ModalView for ElevationView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
 
     fn create_key_event(code: KeyCode) -> KeyEvent {
@@ -2722,6 +2787,29 @@ diff --git a/src/b.rs b/src/b.rs
     fn benign_enter_approves_in_one_step() {
         let mut view = ApprovalView::new(benign_request());
         let action = view.handle_key(create_key_event(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                decision: ReviewDecision::Approved,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mouse_click_renders_and_approves_inline_option() {
+        let mut view = ApprovalView::new(benign_request());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+            .expect("render approval prompt");
+        let rect = view.row_hitboxes.borrow()[0];
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
         assert!(matches!(
             action,
             ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {

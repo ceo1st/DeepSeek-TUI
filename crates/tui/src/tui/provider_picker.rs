@@ -36,14 +36,17 @@ use ratatui::{
 };
 
 use crate::config::{
-    ApiProvider, Config, base_url_uses_local_host, has_api_key_for, kimi_cli_credentials_present,
-    provider_is_configured,
+    ApiProvider, Config, base_url_uses_local_host, has_api_key_for, provider_is_configured,
 };
 use crate::core::ops::ProviderRuntimeStatus;
 use crate::model_profile::{SupportState, resolved_capability_profile};
 use crate::models_dev_live::{self, ModelsDevFreshness};
 use crate::palette;
 use crate::provider_lake::catalog_model_count_for_provider;
+use crate::provider_readiness::{
+    CredentialState, ProviderReadinessSnapshot, ProviderRouteIdentity, ResolvedProviderReadiness,
+    credential_state_for_provider, route_identity_for_model,
+};
 use crate::tui::app::ReasoningEffort;
 use crate::tui::views::{
     ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
@@ -127,11 +130,14 @@ pub struct ProviderDashboardRow {
     pub reasoning: ProviderReasoningSummary,
     pub capabilities: ProviderCapabilityBadges,
     pub model_origin: ProviderModelOrigin,
-    pub readiness: ProviderReadiness,
+    pub(crate) readiness: ResolvedProviderReadiness,
     pub maturity: ProviderMaturity,
     pub messages: Vec<String>,
     pub is_active: bool,
     has_key: bool,
+    credential_state: CredentialState,
+    route_identity: ProviderRouteIdentity,
+    route_ok: bool,
     /// Whether this provider should appear in the default `/provider`
     /// manager view (#3830) without the user explicitly browsing the full
     /// catalog: the active provider, one with working credentials/OAuth, a
@@ -171,16 +177,6 @@ pub struct ProviderDefaultRoute {
 pub struct ProviderRequestConcurrencySummary {
     pub limit: Option<usize>,
     pub active: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderReadiness {
-    Ready,
-    NeedsKey,
-    NeedsLogin,
-    LocalReady,
-    Legacy,
-    Invalid,
 }
 
 /// How battle-tested a provider integration is, independent of whether the
@@ -416,7 +412,9 @@ impl ProviderDashboardRow {
         let request_concurrency =
             ProviderRequestConcurrencySummary::for_row(provider, config, runtime_status, is_active);
 
-        let Some(kind) = provider.kind() else {
+        let compatibility_kind = (provider == ApiProvider::DeepseekCN)
+            .then_some(codewhale_config::ProviderKind::Deepseek);
+        let Some(kind) = provider.kind().or(compatibility_kind) else {
             return Self {
                 provider,
                 provider_id,
@@ -430,6 +428,7 @@ impl ProviderDashboardRow {
                 available_model_count: 0,
                 default_route: ProviderDefaultRoute {
                     logical_model: configured_model
+                        .clone()
                         .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
                     wire_model: "legacy alias".to_string(),
                 },
@@ -438,7 +437,7 @@ impl ProviderDashboardRow {
                 reasoning: ProviderReasoningSummary::unknown(provider, config),
                 capabilities: ProviderCapabilityBadges::unknown(),
                 model_origin,
-                readiness: ProviderReadiness::Legacy,
+                readiness: ResolvedProviderReadiness::Legacy,
                 maturity: ProviderMaturity::for_provider(provider),
                 messages: vec![
                     "legacy DeepSeek China alias; routing maps through DeepSeek compatibility"
@@ -446,6 +445,13 @@ impl ProviderDashboardRow {
                 ],
                 is_active,
                 has_key,
+                credential_state: CredentialState::Legacy,
+                route_identity: route_identity_for_model(
+                    config,
+                    provider,
+                    configured_model.as_deref().unwrap_or("deepseek-v4-pro"),
+                ),
+                route_ok: true,
                 is_configured: provider_is_configured(
                     provider,
                     is_active,
@@ -466,7 +472,12 @@ impl ProviderDashboardRow {
             explicit_provider: Some(kind),
             model_selector: configured_model.clone().map(LogicalModelRef::from),
             saved_provider_model: None,
-            base_url_override: configured_base_url.clone(),
+            // The legacy CN alias shares DeepSeek's strict model contract.
+            // Passing its endpoint as a generic override would classify the
+            // route as custom and accidentally accept foreign model ids.
+            base_url_override: (provider != ApiProvider::DeepseekCN)
+                .then(|| configured_base_url.clone())
+                .flatten(),
         };
 
         let mut messages = Vec::new();
@@ -478,7 +489,13 @@ impl ProviderDashboardRow {
                     messages.extend(candidate.validation.messages.clone());
                 }
                 (
-                    candidate.endpoint.base_url,
+                    if provider == ApiProvider::DeepseekCN {
+                        configured_base_url
+                            .clone()
+                            .unwrap_or_else(|| provider.default_base_url().to_string())
+                    } else {
+                        candidate.endpoint.base_url
+                    },
                     vec![protocol_label(candidate.protocol).to_string()],
                     ProviderDefaultRoute {
                         logical_model: candidate.logical_model.raw().to_string(),
@@ -520,7 +537,19 @@ impl ProviderDashboardRow {
             messages.push("catalog snapshot missing; using provider default".to_string());
         }
 
-        let readiness = readiness_for(provider, auth_status, route_ok);
+        let credential_state = if provider == ApiProvider::Custom {
+            credential_state_from_auth(auth_status)
+        } else {
+            credential_state_for_provider(config, provider)
+        };
+        let route_identity =
+            route_identity_for_model(config, provider, &default_route.logical_model);
+        let readiness = readiness_for(
+            &route_identity,
+            credential_state,
+            route_ok,
+            &ProviderReadinessSnapshot::default(),
+        );
         let reasoning = ProviderReasoningSummary::for_route(provider, &default_route, config);
         let capabilities = ProviderCapabilityBadges::for_route(provider, &default_route.wire_model);
 
@@ -549,6 +578,9 @@ impl ProviderDashboardRow {
             messages,
             is_active,
             has_key,
+            credential_state,
+            route_identity,
+            route_ok,
             is_configured: provider_is_configured(
                 provider,
                 is_active,
@@ -766,19 +798,6 @@ impl ProviderAuthStatus {
     }
 }
 
-impl ProviderReadiness {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::NeedsKey => "needs-key",
-            Self::NeedsLogin => "needs-login",
-            Self::LocalReady => "local-ready",
-            Self::Legacy => "legacy",
-            Self::Invalid => "invalid",
-        }
-    }
-}
-
 /// Compact Models.dev freshness chip for the provider picker chrome (#4139).
 fn catalog_freshness_title_suffix() -> &'static str {
     match models_dev_live::status().freshness {
@@ -955,7 +974,7 @@ fn auth_status_for(
         };
     }
     if provider == ApiProvider::Moonshot && configured.is_some_and(config_uses_kimi_oauth) {
-        return if has_key {
+        return if crate::config::kimi_cli_credentials_valid() {
             ProviderAuthStatus::OAuthReady
         } else {
             ProviderAuthStatus::OAuthMissing
@@ -969,7 +988,7 @@ fn auth_status_for(
         };
     }
     if provider == ApiProvider::Xai
-        && let Some(status) = xai_oauth_status(configured, crate::xai_oauth::credentials_present())
+        && let Some(status) = xai_oauth_status(configured, crate::xai_oauth::credentials_valid())
     {
         return status;
     }
@@ -987,7 +1006,7 @@ fn xai_oauth_status(
     let oauth_selected = configured
         .and_then(|entry| entry.auth_mode.as_deref())
         .is_some_and(crate::xai_oauth::auth_mode_uses_xai_oauth);
-    if !oauth_selected && !credentials_present {
+    if !oauth_selected {
         return None;
     }
     Some(if credentials_present {
@@ -1083,27 +1102,29 @@ fn missing_auth_message(
 fn config_uses_kimi_oauth(config: &crate::config::ProviderConfig) -> bool {
     config.auth_mode.as_deref().is_some_and(|mode| {
         let normalized = mode.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-        matches!(normalized.as_str(), "kimi_oauth" | "kimi_cli" | "kimi_code")
+        matches!(
+            normalized.as_str(),
+            "kimi" | "kimi_oauth" | "kimi_cli" | "oauth"
+        )
     })
 }
 
 fn readiness_for(
-    provider: ApiProvider,
-    auth_status: ProviderAuthStatus,
+    identity: &ProviderRouteIdentity,
+    credential: CredentialState,
     route_ok: bool,
-) -> ProviderReadiness {
-    if provider.kind().is_none() {
-        return ProviderReadiness::Legacy;
-    }
-    if !route_ok {
-        return ProviderReadiness::Invalid;
-    }
+    health: &ProviderReadinessSnapshot,
+) -> ResolvedProviderReadiness {
+    crate::provider_readiness::resolve_with_identity(identity, credential, route_ok, health)
+}
+
+fn credential_state_from_auth(auth_status: ProviderAuthStatus) -> CredentialState {
     match auth_status {
-        ProviderAuthStatus::Local | ProviderAuthStatus::Optional => ProviderReadiness::LocalReady,
-        ProviderAuthStatus::Configured | ProviderAuthStatus::OAuthReady => ProviderReadiness::Ready,
-        ProviderAuthStatus::Legacy => ProviderReadiness::Legacy,
-        ProviderAuthStatus::Missing => ProviderReadiness::NeedsKey,
-        ProviderAuthStatus::OAuthMissing => ProviderReadiness::NeedsLogin,
+        ProviderAuthStatus::Local | ProviderAuthStatus::Optional => CredentialState::Local,
+        ProviderAuthStatus::Configured | ProviderAuthStatus::OAuthReady => CredentialState::Saved,
+        ProviderAuthStatus::Legacy => CredentialState::Legacy,
+        ProviderAuthStatus::Missing => CredentialState::MissingKey,
+        ProviderAuthStatus::OAuthMissing => CredentialState::MissingLogin,
     }
 }
 
@@ -1111,7 +1132,7 @@ fn usage_meter_for(provider: ApiProvider) -> String {
     match provider {
         ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => "cost: local".to_string(),
         ApiProvider::OpenaiCodex => "usage: Codex OAuth quota".to_string(),
-        ApiProvider::Moonshot if kimi_cli_credentials_present() => {
+        ApiProvider::Moonshot if crate::config::kimi_cli_credentials_valid() => {
             "usage: Kimi OAuth quota".to_string()
         }
         ApiProvider::XiaomiMimo => "cost: token-plan".to_string(),
@@ -1250,6 +1271,27 @@ impl ProviderPickerView {
         };
         picker.restore_memory(memory);
         picker
+    }
+
+    /// Apply session-local request evidence after the static catalog rows are
+    /// built. Saved credentials stay "not checked" until this snapshot proves
+    /// success; a failed check remains visible and retryable with its reason.
+    #[must_use]
+    pub(crate) fn with_provider_health(mut self, health: &ProviderReadinessSnapshot) -> Self {
+        for row in &mut self.rows {
+            row.readiness = readiness_for(
+                &row.route_identity,
+                row.credential_state,
+                row.route_ok,
+                health,
+            );
+            if let Some(detail) = row.readiness.detail()
+                && !row.messages.iter().any(|message| message == detail)
+            {
+                row.messages.push(detail.to_string());
+            }
+        }
+        self
     }
 
     /// Restore browsing context from the last dismissed `/provider` picker.
@@ -1407,7 +1449,14 @@ impl ProviderPickerView {
     }
 
     fn selected_has_key(&self) -> bool {
-        self.rows[self.selected_idx].has_key
+        matches!(
+            self.rows[self.selected_idx].credential_state,
+            CredentialState::Saved | CredentialState::Local | CredentialState::Legacy
+        )
+    }
+
+    fn selected_route_is_valid(&self) -> bool {
+        self.rows[self.selected_idx].route_ok
     }
 
     fn enter_key_entry(&mut self) {
@@ -1639,7 +1688,9 @@ impl ProviderPickerView {
     }
 
     fn render_list(&self, area: Rect, buf: &mut Buffer) {
-        let enter_action = if self.selected_has_key() {
+        let enter_action = if !self.selected_route_is_valid() {
+            "unavailable"
+        } else if self.selected_has_key() {
             "apply"
         } else {
             "set key"
@@ -1758,14 +1809,18 @@ impl ProviderPickerView {
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
+            let has_usable_auth = matches!(
+                row.credential_state,
+                CredentialState::Saved | CredentialState::Local | CredentialState::Legacy
+            );
             let hint_style = if is_selected {
-                let hint_fg = if row.has_key {
+                let hint_fg = if has_usable_auth {
                     palette::TEXT_MUTED
                 } else {
                     palette::STATUS_WARNING
                 };
                 Self::selected_row_style(hint_fg)
-            } else if row.has_key {
+            } else if has_usable_auth {
                 Style::default().fg(palette::TEXT_MUTED)
             } else {
                 Style::default().fg(palette::STATUS_WARNING)
@@ -2361,12 +2416,16 @@ impl ModalView for ProviderPickerView {
                 KeyCode::Enter if self.row_visible(self.selected_idx) => {
                     let provider = self.selected_provider();
                     let provider_id = self.selected_provider_id();
-                    if self.selected_has_key() {
+                    if !self.selected_route_is_valid() {
+                        ViewAction::None
+                    } else if self.selected_has_key() {
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerApplied {
                             provider,
                             provider_id,
                         })
-                    } else if provider == ApiProvider::Moonshot && kimi_cli_credentials_present() {
+                    } else if provider == ApiProvider::Moonshot
+                        && crate::config::kimi_cli_credentials_valid()
+                    {
                         ViewAction::EmitAndClose(ViewEvent::ProviderPickerKimiOAuthEnabled {
                             provider,
                         })
@@ -3180,11 +3239,117 @@ mod tests {
 
         assert_eq!(row.provider_id, "ollama");
         assert_eq!(row.auth_status, ProviderAuthStatus::Local);
-        assert_eq!(row.readiness, ProviderReadiness::LocalReady);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::LocalUnchecked);
         assert_eq!(row.supported_protocols, vec!["chat".to_string()]);
         assert_eq!(row.usage_meter, "cost: local");
         assert!(row.base_url.contains("localhost:11434"));
         assert!(row.is_active);
+    }
+
+    #[test]
+    fn deepseek_cn_row_uses_shared_readiness_and_strict_model_validation() {
+        let _lock = crate::test_support::lock_test_env();
+        let _key = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
+        let missing = Config {
+            provider: Some("deepseek-cn".to_string()),
+            ..Default::default()
+        };
+        let missing_row = ProviderDashboardRow::from_config(
+            ApiProvider::DeepseekCN,
+            ApiProvider::DeepseekCN,
+            &missing,
+        );
+        assert_eq!(missing_row.readiness, ResolvedProviderReadiness::MissingKey);
+        assert_ne!(missing_row.auth_status, ProviderAuthStatus::Legacy);
+
+        let configured = Config {
+            provider: Some("deepseek-cn".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                deepseek_cn: crate::config::ProviderConfig {
+                    api_key: Some("deepseek-cn-test-key".to_string()),
+                    model: Some("deepseek-v4-pro".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let configured_row = ProviderDashboardRow::from_config(
+            ApiProvider::DeepseekCN,
+            ApiProvider::DeepseekCN,
+            &configured,
+        );
+        assert_eq!(
+            configured_row.readiness,
+            ResolvedProviderReadiness::SavedUnchecked
+        );
+
+        let mut invalid = configured;
+        invalid
+            .providers
+            .as_mut()
+            .expect("providers")
+            .deepseek_cn
+            .model = Some("anthropic/claude-foreign".to_string());
+        let invalid_row = ProviderDashboardRow::from_config(
+            ApiProvider::DeepseekCN,
+            ApiProvider::DeepseekCN,
+            &invalid,
+        );
+        assert_eq!(
+            invalid_row.readiness,
+            ResolvedProviderReadiness::InvalidRoute
+        );
+    }
+
+    #[test]
+    fn provider_health_requires_observed_success_and_keeps_failure_reason() {
+        let config = Config {
+            api_key: Some("saved-key".to_string()),
+            ..Config::default()
+        };
+        let unchecked = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let row = unchecked
+            .rows
+            .iter()
+            .find(|row| row.provider == ApiProvider::Deepseek)
+            .expect("DeepSeek row");
+        assert_eq!(row.readiness, ResolvedProviderReadiness::SavedUnchecked);
+
+        let mut health = ProviderReadinessSnapshot::default();
+        health.record_success(&config, ApiProvider::Deepseek, "deepseek-v4-pro");
+        let ready =
+            ProviderPickerView::new(ApiProvider::Deepseek, &config).with_provider_health(&health);
+        assert_eq!(
+            ready
+                .rows
+                .iter()
+                .find(|row| row.provider == ApiProvider::Deepseek)
+                .unwrap()
+                .readiness,
+            ResolvedProviderReadiness::Ready
+        );
+
+        health.record_failure_message(
+            &config,
+            ApiProvider::Deepseek,
+            "deepseek-v4-pro",
+            crate::error_taxonomy::ErrorCategory::Authentication,
+            "credential rejected",
+        );
+        let failed =
+            ProviderPickerView::new(ApiProvider::Deepseek, &config).with_provider_health(&health);
+        let row = failed
+            .rows
+            .iter()
+            .find(|row| row.provider == ApiProvider::Deepseek)
+            .unwrap();
+        assert!(row.readiness.label().contains("last check failed"));
+        assert!(
+            row.messages
+                .iter()
+                .any(|message| message == "credential rejected")
+        );
     }
 
     #[test]
@@ -3522,7 +3687,7 @@ mod tests {
 
         assert_eq!(row.provider_id, "openai");
         assert_eq!(row.auth_status, ProviderAuthStatus::Configured);
-        assert_eq!(row.readiness, ProviderReadiness::Ready);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::SavedUnchecked);
         assert_eq!(row.base_url, "http://localhost:9000/v1");
         assert_eq!(row.default_route.logical_model, "custom-model");
         assert_eq!(row.default_route.wire_model, "custom-model");
@@ -3565,7 +3730,7 @@ mod tests {
         assert_eq!(row.kind, "openai-compatible");
         assert!(row.is_active);
         assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
-        assert_eq!(row.readiness, ProviderReadiness::NeedsKey);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
         assert_eq!(row.base_url, "https://api.example.com/v1");
         assert_eq!(row.supported_protocols, vec!["chat".to_string()]);
         assert_eq!(row.default_route.logical_model, "vendor/custom-model-v1");
@@ -3613,7 +3778,7 @@ mod tests {
             .expect("configured custom provider row");
 
         assert_eq!(row.auth_status, ProviderAuthStatus::Configured);
-        assert_eq!(row.readiness, ProviderReadiness::Ready);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::SavedUnchecked);
         assert!(row.has_key);
         assert!(
             !row.messages
@@ -3768,7 +3933,7 @@ mod tests {
         assert_eq!(row.provider_id, "openmodel");
         assert_eq!(row.display_name, "OpenModel");
         assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
-        assert_eq!(row.readiness, ProviderReadiness::NeedsKey);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
         assert_eq!(row.supported_protocols, vec!["anthropic".to_string()]);
         assert_eq!(row.base_url, crate::config::DEFAULT_OPENMODEL_BASE_URL);
         assert_eq!(row.default_route.logical_model, "deepseek-v4-flash");
@@ -3792,8 +3957,8 @@ mod tests {
         );
 
         assert_eq!(row.auth_status, ProviderAuthStatus::Missing);
-        assert_eq!(row.readiness, ProviderReadiness::NeedsKey);
-        assert_eq!(row.readiness.label(), "needs-key");
+        assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
+        assert_eq!(row.readiness.label(), "missing key");
         let hint = row.compact_hint();
         assert!(hint.contains("key:not-set"));
         assert!(!hint.contains("needs-auth"));
@@ -3825,7 +3990,7 @@ mod tests {
         );
 
         assert_eq!(row.auth_status, ProviderAuthStatus::Configured);
-        assert_eq!(row.readiness, ProviderReadiness::Invalid);
+        assert_eq!(row.readiness, ResolvedProviderReadiness::InvalidRoute);
         assert_eq!(row.default_route.wire_model, "unresolved");
         assert!(
             row.messages
@@ -4406,10 +4571,7 @@ mod tests {
             xai_oauth_status(Some(&oauth_config), true),
             Some(ProviderAuthStatus::OAuthReady)
         );
-        assert_eq!(
-            xai_oauth_status(None, true),
-            Some(ProviderAuthStatus::OAuthReady)
-        );
+        assert_eq!(xai_oauth_status(None, true), None);
         assert_eq!(xai_oauth_status(None, false), None);
     }
 

@@ -101,6 +101,9 @@ pub struct ParsedMarkdown {
 #[derive(Debug, Clone)]
 pub struct RenderedMarkdownLine {
     pub line: Line<'static>,
+    /// Hyperlinks aligned to display columns in `line`. Targets stay
+    /// out-of-band; `Span::content` always contains visible text only.
+    pub links: Vec<osc8::LineLink>,
     pub is_code: bool,
     pub copy_prefix_width: usize,
     pub copy_separator_after: CopyLineSeparator,
@@ -229,6 +232,7 @@ pub fn render_parsed_tagged(
                     .into_iter()
                     .map(|line| RenderedMarkdownLine {
                         line,
+                        links: Vec::new(),
                         is_code: false,
                         copy_prefix_width: 0,
                         copy_separator_after: CopyLineSeparator::Newline,
@@ -250,6 +254,7 @@ pub fn render_parsed_tagged(
                         "─".repeat(width.min(40)),
                         Style::default().fg(palette::TEXT_DIM),
                     )),
+                    links: Vec::new(),
                     is_code: false,
                     copy_prefix_width: 0,
                     copy_separator_after: CopyLineSeparator::Newline,
@@ -261,6 +266,7 @@ pub fn render_parsed_tagged(
                         "─".repeat(width.min(60)),
                         Style::default().fg(palette::TEXT_DIM),
                     )),
+                    links: Vec::new(),
                     is_code: false,
                     copy_prefix_width: 0,
                     copy_separator_after: CopyLineSeparator::Newline,
@@ -295,6 +301,7 @@ pub fn render_parsed_tagged(
             Block::Blank => {
                 out.push(RenderedMarkdownLine {
                     line: Line::from(""),
+                    links: Vec::new(),
                     is_code: false,
                     copy_prefix_width: 0,
                     copy_separator_after: CopyLineSeparator::Newline,
@@ -308,6 +315,7 @@ pub fn render_parsed_tagged(
     if out.is_empty() {
         out.push(RenderedMarkdownLine {
             line: Line::from(""),
+            links: Vec::new(),
             is_code: false,
             copy_prefix_width: 0,
             copy_separator_after: CopyLineSeparator::Newline,
@@ -510,6 +518,7 @@ fn render_wrapped_line_tagged(
         };
         out.push(RenderedMarkdownLine {
             line,
+            links: Vec::new(),
             is_code,
             copy_prefix_width: if indent_code { prefix_width } else { 0 },
             copy_separator_after,
@@ -533,11 +542,17 @@ fn render_list_line_tagged(
 
     let mut out = Vec::new();
     for (idx, rendered) in wrapped.into_iter().enumerate() {
+        let links = rendered
+            .links
+            .iter()
+            .map(|link| link.shifted(bullet_width))
+            .collect();
         if idx == 0 {
             let mut spans = vec![Span::styled(bullet_prefix.clone(), bullet_style)];
             spans.extend(rendered.line.spans);
             out.push(RenderedMarkdownLine {
                 line: Line::from(spans),
+                links,
                 is_code: false,
                 copy_prefix_width: 0,
                 copy_separator_after: rendered.copy_separator_after,
@@ -547,6 +562,7 @@ fn render_list_line_tagged(
             spans.extend(rendered.line.spans);
             out.push(RenderedMarkdownLine {
                 line: Line::from(spans),
+                links,
                 is_code: false,
                 copy_prefix_width: bullet_width,
                 copy_separator_after: rendered.copy_separator_after,
@@ -578,6 +594,7 @@ fn render_line_with_links_tagged(
     if line.trim().is_empty() {
         return vec![RenderedMarkdownLine {
             line: Line::from(""),
+            links: Vec::new(),
             is_code: false,
             copy_prefix_width: 0,
             copy_separator_after: CopyLineSeparator::Newline,
@@ -591,9 +608,14 @@ fn render_line_with_links_tagged(
         let mut first = true;
         for part in token.text.split(' ') {
             if !first {
-                // The space consumed by split — attach as a plain space word
-                // so the wrap loop can decide whether to keep or break it.
-                words.push(InlineToken::new(" ".to_string(), token.style, None));
+                // The space consumed by split remains part of a markdown-link
+                // label when the surrounding token is linked. It is still a
+                // wrap opportunity and is dropped at a row boundary.
+                words.push(InlineToken::new(
+                    " ".to_string(),
+                    token.style,
+                    token.link_url.clone(),
+                ));
             }
             if !part.is_empty() {
                 words.push(InlineToken::new(
@@ -608,6 +630,7 @@ fn render_line_with_links_tagged(
 
     let mut lines: Vec<RenderedMarkdownLine> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_links: Vec<osc8::LineLink> = Vec::new();
     let mut current_width = 0usize;
 
     for word in words {
@@ -616,7 +639,8 @@ fn render_line_with_links_tagged(
             // Space: emit only if we're mid-line and it fits; otherwise drop
             // (it's a potential wrap point, not content).
             if !current_spans.is_empty() && current_width < width {
-                current_spans.push(Span::raw(" "));
+                current_spans.push(word.span_for(" ".to_string()));
+                record_inline_link(&mut current_links, &word, current_width, 1);
                 current_width += 1;
             }
             continue;
@@ -629,7 +653,12 @@ fn render_line_with_links_tagged(
         if ww > width && width > 0 {
             // Flush the in-progress line first.
             if !current_spans.is_empty() {
-                push_inline_line(&mut lines, &mut current_spans, CopyLineSeparator::Space);
+                push_inline_line(
+                    &mut lines,
+                    &mut current_spans,
+                    &mut current_links,
+                    CopyLineSeparator::Space,
+                );
                 current_width = 0;
             }
             // Char-break the word into width-sized chunks. Each full chunk
@@ -640,8 +669,12 @@ fn render_line_with_links_tagged(
             for ch in word.text.chars() {
                 let cw = ch.width().unwrap_or(1);
                 if chunk_w + cw > width && chunk_w > 0 {
+                    let chunk = std::mem::take(&mut chunk);
+                    let mut links = Vec::new();
+                    record_inline_link(&mut links, &word, 0, chunk_w);
                     lines.push(RenderedMarkdownLine {
-                        line: Line::from(vec![word.span_for(std::mem::take(&mut chunk))]),
+                        line: Line::from(vec![word.span_for(chunk)]),
+                        links,
                         is_code: false,
                         copy_prefix_width: 0,
                         copy_separator_after: CopyLineSeparator::None,
@@ -652,6 +685,7 @@ fn render_line_with_links_tagged(
                 chunk_w += cw;
             }
             if !chunk.is_empty() {
+                record_inline_link(&mut current_links, &word, 0, chunk_w);
                 current_spans.push(word.span_for(chunk));
                 current_width = chunk_w;
             }
@@ -660,21 +694,33 @@ fn render_line_with_links_tagged(
         // Wrap before this word if it doesn't fit.
         if current_width > 0 && current_width + ww > width {
             // Trim trailing space span before breaking.
-            push_inline_line(&mut lines, &mut current_spans, CopyLineSeparator::Space);
+            push_inline_line(
+                &mut lines,
+                &mut current_spans,
+                &mut current_links,
+                CopyLineSeparator::Space,
+            );
             current_width = 0;
         }
+        record_inline_link(&mut current_links, &word, current_width, ww);
         current_spans.push(word.into_span());
         current_width += ww;
     }
 
     if !current_spans.is_empty() {
-        push_inline_line(&mut lines, &mut current_spans, CopyLineSeparator::Newline);
+        push_inline_line(
+            &mut lines,
+            &mut current_spans,
+            &mut current_links,
+            CopyLineSeparator::Newline,
+        );
     } else if let Some(last) = lines.last_mut() {
         last.copy_separator_after = CopyLineSeparator::Newline;
     }
     if lines.is_empty() {
         lines.push(RenderedMarkdownLine {
             line: Line::from(""),
+            links: Vec::new(),
             is_code: false,
             copy_prefix_width: 0,
             copy_separator_after: CopyLineSeparator::Newline,
@@ -686,6 +732,7 @@ fn render_line_with_links_tagged(
 fn push_inline_line(
     lines: &mut Vec<RenderedMarkdownLine>,
     spans: &mut Vec<Span<'static>>,
+    links: &mut Vec<osc8::LineLink>,
     copy_separator_after: CopyLineSeparator,
 ) {
     if let Some(last) = spans.last()
@@ -693,11 +740,47 @@ fn push_inline_line(
     {
         spans.pop();
     }
+    let visible_width = spans
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum::<usize>();
+    links.retain(|link| link.col_start < visible_width);
+    for link in links.iter_mut() {
+        link.col_end = link.col_end.min(visible_width.saturating_sub(1));
+    }
     lines.push(RenderedMarkdownLine {
         line: Line::from(std::mem::take(spans)),
+        links: std::mem::take(links),
         is_code: false,
         copy_prefix_width: 0,
         copy_separator_after,
+    });
+}
+
+fn record_inline_link(
+    links: &mut Vec<osc8::LineLink>,
+    token: &InlineToken,
+    col_start: usize,
+    width: usize,
+) {
+    let Some(target) = token.link_url.as_ref() else {
+        return;
+    };
+    if width == 0 {
+        return;
+    }
+    let col_end = col_start.saturating_add(width).saturating_sub(1);
+    if let Some(last) = links.last_mut()
+        && last.target == *target
+        && last.col_end.saturating_add(1) == col_start
+    {
+        last.col_end = col_end;
+        return;
+    }
+    links.push(osc8::LineLink {
+        col_start,
+        col_end,
+        target: target.clone(),
     });
 }
 
@@ -718,24 +801,11 @@ impl InlineToken {
     }
 
     fn span_for(&self, text: String) -> Span<'static> {
-        let content = match &self.link_url {
-            Some(url) if osc8::enabled() => osc8::wrap_link(url, &text),
-            _ => text,
-        };
-        Span::styled(content, self.style)
+        Span::styled(text, self.style)
     }
 
     fn into_span(self) -> Span<'static> {
-        let Self {
-            text,
-            style,
-            link_url,
-        } = self;
-        let content = match link_url {
-            Some(url) if osc8::enabled() => osc8::wrap_link(&url, &text),
-            _ => text,
-        };
-        Span::styled(content, style)
+        Span::styled(self.text, self.style)
     }
 }
 
@@ -821,19 +891,14 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
                 && let Some(paren_end) = after_bracket.find(')')
             {
                 let url = &after_bracket[1..paren_end];
-                if osc8::enabled() {
-                    out.push(InlineToken::new(
-                        text.to_string(),
-                        link_style,
-                        Some(url.to_string()),
-                    ));
-                } else {
-                    out.push(InlineToken::new(
-                        format!("{text} ({url})"),
-                        link_style,
-                        None,
-                    ));
-                }
+                // The runtime toggle gates backend emission, not layout.
+                // Keeping the same visible label and metadata in both modes
+                // prevents toggling OSC 8 from reflowing the transcript.
+                out.push(InlineToken::new(
+                    text.to_string(),
+                    link_style,
+                    normalized_http_link_target(url),
+                ));
                 rest = &after_bracket[paren_end + 1..];
                 continue;
             }
@@ -845,15 +910,11 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
             let token = &rest[..token_end];
             let url_end = trailing_url_end(token);
             let url = &token[..url_end];
-            if osc8::enabled() {
-                out.push(InlineToken::new(
-                    url.to_string(),
-                    link_style,
-                    Some(url.to_string()),
-                ));
-            } else {
-                out.push(InlineToken::new(url.to_string(), link_style, None));
-            }
+            out.push(InlineToken::new(
+                url.to_string(),
+                link_style,
+                normalized_http_link_target(url),
+            ));
             if url_end < token_end {
                 out.push(InlineToken::new(
                     token[url_end..].to_string(),
@@ -870,6 +931,34 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
         rest = &rest[next..];
     }
     out
+}
+
+/// OSC 8 targets produced by markdown are deliberately limited to ordinary
+/// web URLs. The browser-opening gesture is user-initiated, but accepting
+/// arbitrary schemes here would still turn untrusted model output into a
+/// `file:`, `javascript:`, or application-protocol link. Normalize the scheme
+/// and reject whitespace/control characters before metadata reaches a frame.
+fn normalized_http_link_target(target: &str) -> Option<String> {
+    let (scheme, rest) = if target
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        ("https://", &target[8..])
+    } else if target
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        ("http://", &target[7..])
+    } else {
+        return None;
+    };
+    if rest.is_empty()
+        || rest.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        || rest.split(['/', '?', '#']).next().is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    Some(format!("{scheme}{rest}"))
 }
 
 fn trailing_url_end(candidate: &str) -> usize {
@@ -1330,17 +1419,16 @@ mod tests {
 
     #[test]
     fn render_markdown_matches_parse_then_render() {
-        // Both calls run in the same thread under the same OSC8 lock so the
-        // flag is identical for both paths.
         let source = "# Title\n\nA paragraph with a https://example.com link.\n\n- one\n- two\n```\ncode\n```";
-        let direct = render_with_osc8(false, source);
-        let two_step = with_osc8(false, || {
-            let parsed = parse(source);
-            render_parsed(&parsed, 80, Style::default())
-                .iter()
-                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-                .collect::<String>()
-        });
+        let direct = render_markdown(source, 80, Style::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
+        let parsed = parse(source);
+        let two_step = render_parsed(&parsed, 80, Style::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<String>();
         assert_eq!(direct, two_step);
     }
 
@@ -1528,94 +1616,108 @@ mod tests {
         assert_eq!(items, vec![("-", "alpha"), ("-", "beta"), ("1.", "gamma")]);
     }
 
-    /// Render with the OSC 8 flag pinned to `enabled`, then restore the prior
-    /// value. We serialize through a static mutex because `osc8::ENABLED` is
-    /// process-wide state and other tests touching it would race otherwise.
-    fn render_with_osc8(enabled: bool, source: &str) -> String {
-        render_with_osc8_width(enabled, source, 80)
+    fn tagged_visible(lines: &[RenderedMarkdownLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|rendered| {
+                rendered
+                    .line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
     }
 
-    fn render_with_osc8_width(enabled: bool, source: &str, width: u16) -> String {
-        with_osc8(enabled, || {
-            render_markdown(source, width, Style::default())
+    #[test]
+    fn http_links_keep_visible_text_and_out_of_band_metadata() {
+        let source = "see https://example.com for details";
+        let rendered = render_markdown_tagged(source, 80, Style::default());
+        assert_eq!(tagged_visible(&rendered), vec![source]);
+        assert!(
+            rendered
                 .iter()
-                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-                .collect::<String>()
-        })
-    }
-
-    fn with_osc8<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
-        use std::sync::Mutex;
-        static OSC8_GUARD: Mutex<()> = Mutex::new(());
-        let _guard = OSC8_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = osc8::enabled();
-        osc8::set_enabled(enabled);
-        let result = f();
-        osc8::set_enabled(prior);
-        result
-    }
-
-    #[test]
-    fn http_links_get_osc_8_wrapped_when_enabled() {
-        let joined = render_with_osc8(true, "see https://example.com for details");
-        assert!(
-            joined.contains("\x1b]8;;https://example.com\x1b\\https://example.com\x1b]8;;\x1b\\"),
-            "expected OSC 8 wrapper around URL; got {joined:?}"
+                .flat_map(|line| &line.line.spans)
+                .all(|span| { !span.content.contains('\x1b') && !span.content.contains("]8;;") }),
+            "escape payloads must never enter visible spans"
+        );
+        assert_eq!(
+            rendered[0].links,
+            vec![osc8::LineLink {
+                col_start: 4,
+                col_end: 22,
+                target: "https://example.com".to_string(),
+            }]
         );
     }
 
     #[test]
-    fn bare_http_links_exclude_surrounding_punctuation_from_osc8_target() {
-        let joined = render_with_osc8(true, "see (https://example.com/path).");
-        assert!(
-            joined.contains(
-                "\x1b]8;;https://example.com/path\x1b\\https://example.com/path\x1b]8;;\x1b\\)."
-            ),
-            "expected trailing punctuation outside OSC 8 target; got {joined:?}"
-        );
-        assert!(
-            !joined.contains("\x1b]8;;https://example.com/path)."),
-            "OSC 8 target must not include surrounding punctuation: {joined:?}"
-        );
+    fn bare_http_links_exclude_surrounding_punctuation_from_target() {
+        let source = "see (https://example.com/path).";
+        let rendered = render_markdown_tagged(source, 80, Style::default());
+        assert_eq!(tagged_visible(&rendered), vec![source]);
+        assert_eq!(rendered[0].links.len(), 1);
+        let link = &rendered[0].links[0];
+        assert_eq!(link.target, "https://example.com/path");
+        assert_eq!(link.col_start, 5);
+        assert_eq!(link.col_end, 28);
     }
 
     #[test]
     fn bare_http_links_preserve_balanced_parentheses_in_target() {
         let url = "https://en.wikipedia.org/wiki/Function_(mathematics)";
-        let joined = render_with_osc8(true, &format!("see {url}."));
-        let expected = format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\.");
-        assert!(
-            joined.contains(&expected),
-            "expected balanced URL parentheses to remain linked; got {joined:?}"
-        );
+        let source = format!("see {url}.");
+        let rendered = render_markdown_tagged(&source, 100, Style::default());
+        assert_eq!(tagged_visible(&rendered), vec![source]);
+        assert_eq!(rendered[0].links.len(), 1);
+        assert_eq!(rendered[0].links[0].target, url);
     }
 
     #[test]
-    fn wrapped_osc_8_url_chunks_keep_full_link_target() {
+    fn wrapped_url_chunks_keep_visible_label_and_full_target() {
         let url = "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json";
-        let joined = render_with_osc8_width(true, url, 34);
-        let full_target = format!("\x1b]8;;{url}\x1b\\");
+        let rendered = render_markdown_tagged(url, 34, Style::default());
+        let visible = tagged_visible(&rendered);
+        assert!(visible.len() > 1, "fixture must wrap: {visible:?}");
+        assert_eq!(visible.concat(), url);
+        for (line, text) in rendered.iter().zip(&visible) {
+            assert_eq!(line.links.len(), 1, "each wrapped chunk is linked");
+            assert_eq!(line.links[0].target, url);
+            assert_eq!(line.links[0].col_start, 0);
+            assert_eq!(line.links[0].col_end, text.width().saturating_sub(1));
+            assert!(!text.contains('\x1b') && !text.contains("]8;;"));
+        }
+    }
 
-        assert!(
-            joined.matches(&full_target).count() > 1,
-            "expected each wrapped URL chunk to reopen the full OSC 8 target; got {joined:?}"
+    #[test]
+    fn named_link_shows_only_label_and_keeps_target_in_metadata() {
+        let rendered = render_markdown_tagged(
+            "read [the docs](https://example.com/guide) now",
+            80,
+            Style::default(),
         );
-        assert!(
-            !joined.contains(
-                "\x1b]8;;https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/inde\x1b\\"
-            ),
-            "wrapped link must not expose a truncated OSC 8 target: {joined:?}"
+        assert_eq!(tagged_visible(&rendered), vec!["read the docs now"]);
+        assert_eq!(
+            rendered[0].links,
+            vec![osc8::LineLink {
+                col_start: 5,
+                col_end: 12,
+                target: "https://example.com/guide".to_string(),
+            }]
         );
     }
 
     #[test]
-    fn osc_8_disabled_emits_plain_url() {
-        let joined = render_with_osc8(false, "see https://example.com for details");
-        assert!(
-            !joined.contains("\x1b]8;;"),
-            "expected no OSC 8 wrapper when disabled; got {joined:?}"
-        );
-        assert!(joined.contains("https://example.com"));
+    fn named_links_reject_non_web_schemes_and_normalize_http_scheme() {
+        let unsafe_link = render_markdown_tagged("[run](javascript:alert)", 80, Style::default());
+        assert_eq!(tagged_visible(&unsafe_link), vec!["run"]);
+        assert!(unsafe_link.iter().all(|line| line.links.is_empty()));
+
+        let web_link =
+            render_markdown_tagged("[docs](HTTPS://example.com/guide)", 80, Style::default());
+        assert_eq!(tagged_visible(&web_link), vec!["docs"]);
+        assert_eq!(web_link[0].links[0].target, "https://example.com/guide");
     }
 
     #[test]
@@ -1844,9 +1946,7 @@ mod tests {
     }
 
     fn render_paragraph_for_test(text: &str, width: usize) -> Vec<Line<'static>> {
-        with_osc8(false, || {
-            render_line_with_links(text, width, Style::default(), Style::default())
-        })
+        render_line_with_links(text, width, Style::default(), Style::default())
     }
 
     #[test]

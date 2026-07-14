@@ -573,6 +573,22 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(ShellCancelTool))
             .with_tool(Arc::new(ShellWaitTool::new("exec_wait")))
             .with_tool(Arc::new(ShellInteractTool::new("exec_interact")))
+            .with_terminal_tools()
+    }
+
+    /// Include the stateful PTY terminal tools. Like `exec_shell`, these are
+    /// only exposed when the active shell policy allows shell access.
+    #[must_use]
+    pub fn with_terminal_tools(self) -> Self {
+        use super::terminal_session::{
+            TerminalCancelTool, TerminalResetTool, TerminalRunTool, TerminalSendTool,
+            TerminalWaitTool,
+        };
+        self.with_tool(Arc::new(TerminalRunTool))
+            .with_tool(Arc::new(TerminalSendTool))
+            .with_tool(Arc::new(TerminalWaitTool))
+            .with_tool(Arc::new(TerminalCancelTool))
+            .with_tool(Arc::new(TerminalResetTool))
     }
 
     /// Include search tools (`grep_files`).
@@ -1175,6 +1191,7 @@ impl ToolRegistryBuilder {
         runtime: super::subagent::SubAgentRuntime,
     ) -> Self {
         use super::subagent::AgentTool;
+        use super::subagent::register_coordination_tools;
         use super::workflow::WorkflowTool;
         use super::workflow_trigger::soft_auto_policy_is_linked;
 
@@ -1184,11 +1201,16 @@ impl ToolRegistryBuilder {
             "workflow soft-auto policy must stay linked"
         );
 
-        self.with_tool(Arc::new(WorkflowTool::new(
-            Arc::clone(&manager),
-            runtime.clone(),
-        )))
-        .with_tool(Arc::new(AgentTool::new(manager, runtime)))
+        let builder = self
+            .with_tool(Arc::new(WorkflowTool::new(
+                Arc::clone(&manager),
+                runtime.clone(),
+            )))
+            .with_tool(Arc::new(AgentTool::new(
+                Arc::clone(&manager),
+                runtime.clone(),
+            )));
+        register_coordination_tools(builder, manager, runtime)
     }
 
     /// Build the registry with the given context.

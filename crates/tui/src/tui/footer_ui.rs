@@ -901,17 +901,28 @@ pub(crate) fn footer_context_percent_spans(app: &App) -> Vec<Span<'static>> {
 
 pub(crate) fn footer_cost_spans(app: &App) -> Vec<Span<'static>> {
     let displayed_cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    if !should_show_footer_cost(displayed_cost) {
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        displayed_cost,
+        app.cost_display_currency(app.cost_currency),
+        None,
+    );
+    // Footer only owns positive metered spend. Allowance/local/unknown live
+    // on the context panel so the chrome stays calm and never invents $0.00.
+    let crate::route_billing::UsageChip::Money(amount) = chip else {
         return Vec::new();
-    }
+    };
     let mut spans = vec![Span::styled(
-        app.format_cost_amount(displayed_cost),
+        amount,
         Style::default().fg(palette::TEXT_MUTED),
     )];
     // Append cache-savings hint when the last turn had cache hits that
     // saved money (#2038).
     if let Some(saved) = app.last_turn_cache_savings()
         && saved > 0.0
+        && app.billing_presentation.shows_money()
     {
         spans.push(Span::styled(
             format!(" · saved {}", app.format_cost_amount(saved)),
@@ -952,6 +963,7 @@ pub(crate) fn footer_balance_spans(app: &App) -> Vec<Span<'static>> {
     )]
 }
 
+#[allow(dead_code)] // positive-spend gate shared with billing chip helpers (TUI-DOG-010)
 pub(crate) fn should_show_footer_cost(displayed_cost: f64) -> bool {
     displayed_cost.is_finite() && displayed_cost > 0.0
 }

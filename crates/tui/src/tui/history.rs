@@ -14,6 +14,7 @@ use crate::tools::plan::PlanSnapshot;
 use crate::tools::review::ReviewOutput;
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::diff_render;
+use crate::tui::ui_text::CopyLineSeparator;
 
 mod agent_activity;
 mod archived_context;
@@ -241,6 +242,7 @@ impl HistoryCell {
         }
     }
 
+    #[allow(dead_code)] // retained for focused/detail renderers and direct rendering tests
     pub fn lines_with_options(
         &self,
         width: u16,
@@ -359,6 +361,19 @@ impl HistoryCell {
                     width,
                 )
             }
+            HistoryCell::Tool(_) => self
+                .lines_with_options_folded(width, options, folded)
+                .into_iter()
+                .map(|line| {
+                    let copy_prefix_width = tool_copy_prefix_width(&line);
+                    RenderedTranscriptLine {
+                        line,
+                        links: Vec::new(),
+                        copy_prefix_width,
+                        copy_separator_after: CopyLineSeparator::Newline,
+                    }
+                })
+                .collect(),
             _ => hard_break_copy_lines(self.lines_with_options_folded(width, options, folded)),
         }
     }
@@ -1765,6 +1780,69 @@ fn wrap_card_rail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         line.spans.insert(0, Span::raw(rail));
     }
     lines
+}
+
+/// Return the width of tool-cell chrome that remains after the transcript
+/// cache removes the cell-local card rail. Tool headers have two additional
+/// visual tokens (`✓`/spinner and the family glyph); detail rows have the
+/// thin transcript rail. Keeping this width with the rendered line avoids
+/// making selection copy infer chrome from glyph ranges, which can consume
+/// real code or CJK text that happens to begin with a box-drawing character.
+fn tool_copy_prefix_width(line: &Line<'static>) -> usize {
+    let spans = line.spans.as_slice();
+    let mut index = 0;
+
+    // The cache removes these exact local card rails before flattening.
+    if spans
+        .first()
+        .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
+    {
+        index = 1;
+    }
+
+    // Detail rows and pager affordances use the transcript rail as their
+    // first span. The live transcript's general rail accounting removes it;
+    // do not report it again as cell-local copy chrome.
+    if spans
+        .get(index)
+        .is_some_and(|span| span.content.as_ref() == TRANSCRIPT_RAIL)
+    {
+        return 0;
+    }
+
+    // A tool header starts with `<status> <family> `. Only consume this
+    // pair when both tokens are present, so output beginning with `✓` or a
+    // braille character remains copyable content.
+    let Some(status) = spans.get(index).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    let Some(family) = spans.get(index + 1).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    if !status.ends_with(' ')
+        || !is_tool_status_glyph(status.trim_end())
+        || !family.ends_with(' ')
+        || UnicodeWidthStr::width(family.trim_end()) != 1
+    {
+        return 0;
+    }
+
+    UnicodeWidthStr::width(status) + UnicodeWidthStr::width(family)
+}
+
+fn is_tool_status_glyph(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    chars.next().is_none()
+        && matches!(
+            ch,
+            '\u{2713}' // ✓
+                | '\u{2715}' // ✕
+                | '\u{00B7}' // ·
+                | '\u{2800}'..='\u{28FF}' // braille spinner frames
+        )
 }
 
 fn review_severity_color(severity: &str) -> Color {

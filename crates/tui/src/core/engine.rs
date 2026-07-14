@@ -28,9 +28,9 @@ use crate::compaction::{
     CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
 };
 use crate::config::{ApiProvider, Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL};
+use crate::core::model_client::SharedModelClient;
 use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, StreamError};
 use crate::features::{Feature, Features};
-use crate::llm_client::LlmClient;
 use crate::mcp::{McpConfig, McpPool};
 #[cfg(test)]
 use crate::models::ToolCaller;
@@ -591,6 +591,10 @@ pub struct Engine {
     config: EngineConfig,
     api_config: Config,
     deepseek_client: Option<DeepSeekClient>,
+    /// Provider-neutral client used by the canonical main turn loop. Concrete
+    /// clients remain temporarily available to provider-specific helper tools
+    /// while those boundaries migrate independently.
+    model_client: Option<SharedModelClient>,
     deepseek_client_error: Option<String>,
     api_key_env_only_recovery: Option<String>,
     session: Session,
@@ -889,6 +893,7 @@ impl Engine {
                 self.api_key_env_only_recovery =
                     Self::env_only_api_key_recovery_hint(&self.api_config);
                 self.deepseek_client = Some(client.clone());
+                self.model_client = Some(Arc::new(client.clone()));
                 self.deepseek_client_error = None;
                 self.seam_manager = self
                     .seam_manager
@@ -935,6 +940,9 @@ impl Engine {
             Ok(client) => (Some(client), None),
             Err(err) => (None, Some(err.to_string())),
         };
+        let model_client = deepseek_client
+            .as_ref()
+            .map(|client| Arc::new(client.clone()) as SharedModelClient);
         let api_provider = api_config.api_provider();
         let api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(api_config);
 
@@ -1075,6 +1083,7 @@ impl Engine {
             config,
             api_config: api_config.clone(),
             deepseek_client,
+            model_client,
             deepseek_client_error,
             api_key_env_only_recovery,
             session,
@@ -1118,6 +1127,22 @@ impl Engine {
             shared_paused,
         };
 
+        (engine, handle)
+    }
+
+    /// Construct the real Engine with an injected provider-neutral model
+    /// client. The event loop, prompt assembly, tool registry/execution,
+    /// cancellation, and session projection are unchanged; only the model I/O
+    /// boundary is replaced.
+    #[allow(dead_code)] // Production injection seam; currently exercised by deterministic Engine tests.
+    pub fn new_with_model_client(
+        config: EngineConfig,
+        api_config: &Config,
+        client: SharedModelClient,
+    ) -> (Self, EngineHandle) {
+        let (mut engine, handle) = Self::new(config, api_config);
+        engine.model_client = Some(client);
+        engine.deepseek_client_error = None;
         (engine, handle)
     }
 
@@ -2531,7 +2556,7 @@ impl Engine {
             return;
         }
 
-        if self.deepseek_client.is_none() {
+        if self.model_client.is_none() {
             let message = self
                 .deepseek_client_error
                 .as_deref()
@@ -2633,7 +2658,6 @@ impl Engine {
             )
             .await;
             Some(SubAgentForkContext {
-                system: self.session.system_prompt.clone(),
                 messages: self.messages_with_turn_metadata(),
                 structured_state_block: state.to_system_block(),
             })
@@ -3140,7 +3164,11 @@ impl Engine {
         removed
     }
 
-    async fn recover_context_overflow(&mut self, client: &DeepSeekClient, reason: &str) -> bool {
+    async fn recover_context_overflow(
+        &mut self,
+        client: &dyn crate::core::model_client::ModelClient,
+        reason: &str,
+    ) -> bool {
         let Some(target_budget) = context_input_budget_for_route(
             self.api_provider,
             &self.session.model,
@@ -3546,11 +3574,21 @@ impl Engine {
         // system prompt so the agent can autonomously review them before
         // claiming the task is done (#2127).
         let gate_block = self.slop_ledger_gate_block();
-        if let Some(ref block) = gate_block
-            && let Some(SystemPrompt::Text(prompt_text)) = &mut stable_prompt
-        {
-            prompt_text.push_str("\n\n");
-            prompt_text.push_str(block);
+        if let Some(ref block) = gate_block {
+            match &mut stable_prompt {
+                Some(SystemPrompt::Text(prompt_text)) => {
+                    prompt_text.push_str("\n\n");
+                    prompt_text.push_str(block);
+                }
+                Some(SystemPrompt::Blocks(blocks)) => {
+                    blocks.push(crate::models::SystemBlock {
+                        block_type: "text".to_string(),
+                        text: block.clone(),
+                        cache_control: None,
+                    });
+                }
+                None => {}
+            }
         }
 
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
@@ -4021,6 +4059,7 @@ use context::{context_input_budget_for_provider, effective_max_output_tokens};
 mod dispatch;
 mod lsp_hooks;
 mod streaming;
+mod stuck_guard;
 mod token_estimate_cache;
 mod tool_catalog;
 mod tool_execution;
@@ -4048,17 +4087,17 @@ fn filter_tool_catalog_for_gates(
 }
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
-#[cfg(test)]
-use self::dispatch::should_parallelize_tool_batch;
 use self::dispatch::{
     ParallelToolResult, ParallelToolResultEntry, ToolApprovalStamp, ToolExecGuard, ToolExecOutcome,
     ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
-    final_tool_input, format_tool_error, malformed_tool_arguments_error,
+    final_tool_input, format_tool_error_with_schema, malformed_tool_arguments_error,
     malformed_tool_arguments_input, mcp_tool_approval_description, mcp_tool_is_parallel_safe,
     mcp_tool_is_read_only, parse_parallel_tool_calls, parse_tool_input,
     plan_tool_execution_batches, should_force_update_plan_first, should_stop_after_plan_tool,
     stamp_tool_result_approval,
 };
+#[cfg(test)]
+use self::dispatch::{format_tool_error, should_parallelize_tool_batch};
 #[cfg(test)]
 use self::lsp_hooks::edited_paths_for_tool;
 #[cfg(test)]

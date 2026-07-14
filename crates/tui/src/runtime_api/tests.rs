@@ -14,6 +14,44 @@ use uuid::Uuid;
 
 struct MockExecutor;
 
+#[test]
+fn runtime_tui_settings_reject_legacy_modes_and_do_not_save_env_overlays() -> Result<()> {
+    let _lock = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let settings_dir = tmp.path().join(".codewhale");
+    fs::create_dir_all(&settings_dir)?;
+    fs::write(
+        settings_dir.join("settings.toml"),
+        "default_mode = \"plan\"\nlow_motion = false\nfancy_animations = true\nauto_compact = true\n",
+    )?;
+    let _config_path = EnvVarGuard::set(
+        "DEEPSEEK_CONFIG_PATH",
+        settings_dir.join("config.toml").as_os_str(),
+    );
+    let _no_animations = EnvVarGuard::set("NO_ANIMATIONS", "1");
+
+    for legacy in ["operate", "yolo"] {
+        let error = persist_runtime_tui_setting("default_mode", legacy)
+            .expect_err("legacy startup mode must be rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        crate::settings::Settings::load_persisted()?.default_mode,
+        "plan",
+        "a rejected write must leave the saved startup mode intact"
+    );
+
+    persist_runtime_tui_setting("default_mode", "agent")
+        .expect("agent should be a valid startup mode");
+    persist_runtime_tui_setting("auto_compact", "false").expect("strict boolean should persist");
+    let saved = crate::settings::Settings::load_persisted()?;
+    assert_eq!(saved.default_mode, "agent");
+    assert!(!saved.auto_compact);
+    assert!(!saved.low_motion, "NO_ANIMATIONS is runtime-only");
+    assert!(saved.fancy_animations, "NO_ANIMATIONS is runtime-only");
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl crate::task_manager::TaskExecutor for MockExecutor {
     async fn execute(

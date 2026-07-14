@@ -53,6 +53,7 @@ pub struct SettingsSection {
     pub low_motion: bool,
     pub fancy_animations: bool,
     pub ocean_treatment: OceanTreatmentValue,
+    pub work_surface_placement: WorkSurfacePlacementValue,
     pub paste_burst_detection: bool,
     pub show_thinking: bool,
     pub show_tool_details: bool,
@@ -236,10 +237,17 @@ pub enum TranscriptSpacingValue {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum WorkSurfacePlacementValue {
+    Top,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DefaultModeValue {
     Agent,
     Plan,
-    Yolo,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -326,7 +334,7 @@ pub fn parse_mode(arg: Option<&str>) -> Result<ConfigUiMode, String> {
 }
 
 pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
-    let settings = Settings::load().unwrap_or_default();
+    let settings = Settings::load_persisted().unwrap_or_default();
     let reasoning_effort = config
         .reasoning_effort()
         .map(ReasoningEffortValue::from_setting)
@@ -344,6 +352,7 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             low_motion: settings.low_motion,
             fancy_animations: settings.fancy_animations,
             ocean_treatment: settings.ocean_treatment.as_str().into(),
+            work_surface_placement: settings.work_surface_placement.as_str().into(),
             paste_burst_detection: settings.paste_burst_detection,
             show_thinking: settings.show_thinking,
             show_tool_details: settings.show_tool_details,
@@ -507,6 +516,10 @@ pub fn apply_document(
         ("low_motion", bool_str(doc.settings.low_motion)),
         ("fancy_animations", bool_str(doc.settings.fancy_animations)),
         ("ocean_treatment", doc.settings.ocean_treatment.as_setting()),
+        (
+            "work_surface_placement",
+            doc.settings.work_surface_placement.as_setting(),
+        ),
         (
             "paste_burst_detection",
             bool_str(doc.settings.paste_burst_detection),
@@ -680,7 +693,7 @@ fn reload_runtime_config(app: &mut App, config: &mut Config) -> Result<()> {
     app.update_model_compaction_budget();
     app.mcp_config_path = reloaded.mcp_config_path();
     app.skills_dir = reloaded.skills_dir();
-    app.ui_locale = resolve_locale(&Settings::load().unwrap_or_default().locale);
+    app.ui_locale = resolve_locale(&Settings::load_persisted().unwrap_or_default().locale);
     Ok(())
 }
 
@@ -866,12 +879,31 @@ impl TranscriptSpacingValue {
     }
 }
 
+impl WorkSurfacePlacementValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+impl From<&str> for WorkSurfacePlacementValue {
+    fn from(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "left" => Self::Left,
+            "right" => Self::Right,
+            _ => Self::Top,
+        }
+    }
+}
+
 impl DefaultModeValue {
     fn as_setting(self) -> &'static str {
         match self {
             Self::Agent => "agent",
             Self::Plan => "plan",
-            Self::Yolo => "yolo",
         }
     }
 }
@@ -981,10 +1013,9 @@ impl From<&str> for TranscriptSpacingValue {
 impl From<&str> for DefaultModeValue {
     fn from(value: &str) -> Self {
         match AppMode::from_setting(value) {
-            AppMode::Agent | AppMode::Operate => Self::Agent,
+            AppMode::Agent | AppMode::Operate | AppMode::Yolo => Self::Agent,
             AppMode::Plan => Self::Plan,
             AppMode::Auto => Self::Agent,
-            AppMode::Yolo => Self::Yolo,
         }
     }
 }
@@ -1151,8 +1182,21 @@ mod tests {
         let config = Config::default();
         let doc = build_document(&app, &config).expect("document");
         assert_eq!(doc.runtime.model, app.model);
-        assert_eq!(doc.runtime.approval_mode, ApprovalModeValue::Suggest);
+        // The document must mirror the live app posture. The developer's saved
+        // permission posture may legitimately be Bypass; this test must not
+        // rewrite that product setting into an assumed Suggest default.
+        assert_eq!(doc.runtime.approval_mode, app.approval_mode.into());
         assert_eq!(doc.config.reasoning_effort, ReasoningEffortValue::Max);
+    }
+
+    #[test]
+    fn legacy_startup_mode_values_project_to_agent_in_config_ui() {
+        assert_eq!(DefaultModeValue::from("agent"), DefaultModeValue::Agent);
+        assert_eq!(DefaultModeValue::from("operate"), DefaultModeValue::Agent);
+        assert_eq!(DefaultModeValue::from("yolo"), DefaultModeValue::Agent);
+        assert_eq!(DefaultModeValue::from("plan"), DefaultModeValue::Plan);
+        assert_eq!(DefaultModeValue::Agent.as_setting(), "agent");
+        assert_eq!(DefaultModeValue::Plan.as_setting(), "plan");
     }
 
     #[test]
@@ -1249,6 +1293,8 @@ background_color = "#1A1B26"
             approval_mode,
             &serde_json::json!(["auto", "bypass", "suggest", "never"])
         );
+        let default_mode = &schema["$defs"]["DefaultModeValue"]["enum"];
+        assert_eq!(default_mode, &serde_json::json!(["agent", "plan"]));
         let locale = &schema["$defs"]["UiLocale"]["enum"];
         assert_eq!(
             locale,
@@ -1341,7 +1387,9 @@ mcp_config_path = "disk-mcp.json"
     #[test]
     fn status_item_only_apply_does_not_require_engine_sync() {
         let _lock = lock_test_env();
+        let dir = tempfile::tempdir().expect("isolated config dir");
         let mut app = app();
+        app.config_path = Some(dir.path().join("config.toml"));
         let mut config = Config::default();
         let mut doc = build_document(&app, &config).expect("document");
         doc.config.status_items = vec![StatusItemValue::Cost, StatusItemValue::Model];

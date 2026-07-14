@@ -64,6 +64,41 @@ pub(super) fn running_agent_count(app: &App) -> usize {
     ids.len()
 }
 
+/// Describe detached workers that deliberately survive a parent-turn stop.
+///
+/// `agent` starts are detached from the turn cancellation token, so a plain
+/// "Request cancelled" receipt is incomplete whenever live workers remain.
+/// Use stable UI labels where available and raw ids as a lossless fallback;
+/// sorting keeps the receipt deterministic across HashMap iteration order.
+pub(super) fn parent_stop_status(app: &App, base: &str) -> String {
+    let mut ids = std::collections::BTreeSet::new();
+    ids.extend(app.agent_progress.keys().cloned());
+    ids.extend(
+        app.subagent_cache
+            .iter()
+            .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
+            .map(|agent| agent.agent_id.clone()),
+    );
+    if ids.is_empty() {
+        return base.to_string();
+    }
+
+    let labels = ids
+        .into_iter()
+        .map(|id| {
+            app.agent_label_map
+                .get(&id)
+                .filter(|label| !label.trim().is_empty())
+                .cloned()
+                .unwrap_or(id)
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{base}; detached workers continue (none canceled): {}",
+        labels.join(", ")
+    )
+}
+
 pub(super) fn active_fanout_counts(app: &App) -> Option<(usize, usize)> {
     // Read running count from the canonical slot states on the active
     // FanoutCard, if one exists. Used by `rlm` and any future multi-child
@@ -332,9 +367,15 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
         ..
     } = message
     {
+        let billing = crate::route_billing::for_child_route(
+            app.api_provider,
+            app.billing_presentation,
+            *provider,
+        );
         if app.session.subagent_cost_event_seqs.insert(seq)
-            && let Some(cost) =
-                crate::pricing::calculate_turn_cost_estimate_for_provider(*provider, model, usage)
+            && let Some(cost) = crate::pricing::calculate_turn_cost_estimate_for_route(
+                *provider, model, usage, billing,
+            )
         {
             app.accrue_subagent_cost_estimate(cost);
         }
@@ -886,6 +927,39 @@ mod tests {
             }
             cell => panic!("expected delegate card, got {cell:?}"),
         }
+    }
+
+    #[test]
+    fn parent_stop_status_names_only_workers_that_continue_detached() {
+        let mut app = App::new(test_options(), &Config::default());
+        app.subagent_cache
+            .push(subagent_result("agent_b", SubAgentStatus::Running));
+        app.subagent_cache
+            .push(subagent_result("agent_done", SubAgentStatus::Completed));
+        app.agent_progress
+            .insert("agent_a".to_string(), "running tool".to_string());
+        app.agent_label_map
+            .insert("agent_a".to_string(), "Agent 1".to_string());
+        app.agent_label_map
+            .insert("agent_b".to_string(), "Southern Right".to_string());
+        app.agent_label_map
+            .insert("agent_done".to_string(), "Finished worker".to_string());
+
+        let status = parent_stop_status(&app, "Request cancelled");
+        assert_eq!(
+            status,
+            "Request cancelled; detached workers continue (none canceled): Agent 1, Southern Right"
+        );
+        assert!(!status.contains("Finished worker"));
+    }
+
+    #[test]
+    fn parent_stop_status_is_unchanged_without_detached_workers() {
+        let app = App::new(test_options(), &Config::default());
+        assert_eq!(
+            parent_stop_status(&app, "Request cancelled"),
+            "Request cancelled"
+        );
     }
 
     #[test]

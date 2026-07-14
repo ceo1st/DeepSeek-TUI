@@ -7034,9 +7034,10 @@ fn provider_capability_openrouter_recent_large_models_are_reasoning_aware() {
             262_144,
         ),
         (OPENROUTER_QWEN_3_6_FLASH_MODEL, 1_000_000, 65_536),
-        (OPENROUTER_QWEN_3_6_35B_A3B_MODEL, 262_144, 262_140),
+        // Output caps vendor-verified at 65,536 (MODEL_PROVIDER_AUDIT A2/D-7).
+        (OPENROUTER_QWEN_3_6_35B_A3B_MODEL, 262_144, 65_536),
         (OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL, 262_144, 65_536),
-        (OPENROUTER_QWEN_3_6_27B_MODEL, 262_144, 262_140),
+        (OPENROUTER_QWEN_3_6_27B_MODEL, 262_144, 65_536),
         (OPENROUTER_QWEN_3_6_PLUS_MODEL, 1_000_000, 65_536),
         (OPENROUTER_XIAOMI_MIMO_V2_5_PRO_MODEL, 1_000_000, 131_072),
         (OPENROUTER_MINIMAX_M3_MODEL, 1_000_000, 524_288),

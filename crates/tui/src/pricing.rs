@@ -368,7 +368,25 @@ pub fn calculate_turn_cost_estimate_for_provider(
     model: &str,
     usage: &Usage,
 ) -> Option<CostEstimate> {
-    if provider == ApiProvider::OpenaiCodex {
+    let billing = if provider == ApiProvider::OpenaiCodex {
+        crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota")
+    } else {
+        crate::route_billing::BillingPresentation::Metered
+    };
+    calculate_turn_cost_estimate_for_route(provider, model, usage, billing)
+}
+
+/// Calculate cost only for routes that are actually money-metered. OAuth and
+/// token-plan routes deliberately return `None` even when the underlying model
+/// also exists behind a separately-priced public API.
+#[must_use]
+pub fn calculate_turn_cost_estimate_for_route(
+    provider: ApiProvider,
+    model: &str,
+    usage: &Usage,
+    billing: crate::route_billing::BillingPresentation,
+) -> Option<CostEstimate> {
+    if !billing.shows_money() {
         return None;
     }
     if usage.prompt_cache_write_tokens.unwrap_or(0) > 0
@@ -719,6 +737,33 @@ mod tests {
         assert!(
             calculate_cache_savings_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5", 250)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn subscription_route_does_not_inherit_same_models_api_price() {
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            ..Default::default()
+        };
+        assert!(
+            calculate_turn_cost_estimate_for_route(
+                ApiProvider::Anthropic,
+                "claude-sonnet-5",
+                &usage,
+                crate::route_billing::BillingPresentation::Metered,
+            )
+            .is_some()
+        );
+        assert!(
+            calculate_turn_cost_estimate_for_route(
+                ApiProvider::Anthropic,
+                "claude-sonnet-5",
+                &usage,
+                crate::route_billing::BillingPresentation::Subscription("Claude OAuth quota"),
+            )
+            .is_none()
         );
     }
 

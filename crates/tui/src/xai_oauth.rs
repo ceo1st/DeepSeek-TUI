@@ -145,6 +145,25 @@ pub fn credentials_present() -> bool {
     auth_file_path().exists()
 }
 
+/// Prompt-free structural check for Grok/xAI OAuth material. Never refreshes
+/// or writes: a fresh access token or a non-empty refresh token is enough to
+/// keep the route selectable, while malformed/empty files count as missing.
+#[must_use]
+pub fn credentials_valid() -> bool {
+    let path = auth_file_path();
+    let Ok(mut file) = load_auth_file(&path) else {
+        return false;
+    };
+    let Some((_, entry)) = select_entry(&mut file) else {
+        return false;
+    };
+    entry_access_token_is_fresh(&entry)
+        || entry
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+}
+
 /// Load + refresh OAuth credentials from the Grok CLI auth file.
 pub fn get_access_token() -> Result<String> {
     Ok(get_credentials()?.access_token)

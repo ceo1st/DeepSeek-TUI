@@ -372,8 +372,14 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
         | "kimi-k2.6"
         | "kimi-for-coding" => Some(262_144),
         "minimax/minimax-m3" | "minimax-m3" => Some(524_288),
-        "qwen/qwen3.6-35b-a3b" | "qwen/qwen3.6-27b" => Some(262_140),
-        "qwen/qwen3.6-flash" | "qwen/qwen3.6-max-preview" | "qwen/qwen3.6-plus" => Some(65_536),
+        // Alibaba's published limit is 65,536 output tokens; the earlier
+        // 262,140 mirrored the context window (data-entry smell flagged by
+        // MODEL_PROVIDER_AUDIT A2/D-7, vendor-verified 2026-07-12).
+        "qwen/qwen3.6-35b-a3b"
+        | "qwen/qwen3.6-27b"
+        | "qwen/qwen3.6-flash"
+        | "qwen/qwen3.6-max-preview"
+        | "qwen/qwen3.6-plus" => Some(65_536),
         "z-ai/glm-5.1" | "z-ai/glm-5.2" | "z-ai/glm-5-turbo" | "glm-5.1" | "glm-5.2"
         | "glm-5-turbo" => Some(131_072),
         "xiaomi/mimo-v2.5-pro"

@@ -19,10 +19,12 @@
 //!   text, or to a parsed + schema-validated object when `opts.responseSchema`
 //!   is set. Throws on rejection, failure, cancellation, budget exhaustion,
 //!   or once [`WORKFLOW_LIFETIME_CAP`] spawn attempts have been made.
-//! * `parallel(thunks)` — all-settled fan-out; a failed slot becomes `null`;
+//! * `parallel(thunks)` — all-settled fan-out; an ordinary failed slot becomes
+//!   `null`; schema-contract failures and run cancellation still fail the run;
 //!   at most [`PARALLEL_MAX_ITEMS`] items.
 //! * `pipeline(items, ...stages)` — per-item stage chains with no barrier
-//!   between stages; a stage error drops that item to `null`; same item cap.
+//!   between stages; an ordinary stage error drops that item to `null`, while
+//!   schema-contract failures and cancellation still fail the run; same cap.
 //! * `log(msg)` / `phase(title)` — progress events forwarded to the driver.
 //! * `budget.total` / `budget.spent()` / `budget.remaining()` — live driver
 //!   snapshots (`total` is `null` and `remaining()` is `Infinity` when no
@@ -33,11 +35,12 @@
 //!
 //! # Ownership boundaries
 //!
-//! Token accounting and reservation (design §5.3) belong to the driver; the
-//! VM only reads snapshots and fast-fails a spawn when the pool is already
-//! exhausted. Fleet roster resolution for `profile` also happens driver-side;
-//! this crate normalizes and token-validates the profile string, nothing
-//! more.
+//! Token accounting and admission belong to the driver; the VM only reads
+//! snapshots and fast-fails a spawn when the shared pool is already exhausted.
+//! Already-running parallel children can reconcile above the hint because
+//! provider usage arrives at response boundaries, not token-by-token. Fleet
+//! roster resolution for `profile` also happens driver-side; this crate
+//! normalizes and token-validates the profile string, nothing more.
 
 mod driver;
 mod error;

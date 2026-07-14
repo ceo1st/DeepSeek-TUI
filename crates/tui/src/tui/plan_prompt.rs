@@ -1,8 +1,8 @@
 //! Modal prompt for selecting what to do after a plan is generated.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Alignment, Rect};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap};
@@ -27,7 +27,7 @@ const PLAN_OPTIONS: [PlanOption; 4] = [
     },
     PlanOption {
         label: "Accept plan (Full Access)",
-        description: "Start implementation in Act with Full Access (bypass approvals)",
+        description: "Start implementation in Act without approval prompts",
         shortcut: 'y',
     },
     PlanOption {
@@ -94,6 +94,7 @@ fn push_option_lines(
 #[derive(Debug, Clone, Default)]
 pub struct PlanPromptView {
     selected: usize,
+    row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     /// Vertical scroll position (in lines).
     scroll: usize,
     /// Tracks a previous 'g' press for the 'gg' (jump to top) combo.
@@ -117,6 +118,7 @@ impl PlanPromptView {
     pub fn new(plan: Option<PlanSnapshot>) -> Self {
         Self {
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
             scroll: 0,
             pending_g: false,
             last_max_scroll: Cell::new(0),
@@ -305,7 +307,36 @@ impl ModalView for PlanPromptView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        if self.confirming_exit {
+            return ViewAction::None;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(12);
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = self.scroll.saturating_add(12);
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().find_map(|(rect, index)| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        .then_some(*index)
+                });
+                if let Some(index) = clicked {
+                    self.selected = index;
+                    return self.submit_selected();
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         // When the user pressed Esc after scrolling, show a confirmation prompt
         // instead of the normal plan + options.  Render it early so we skip the
         // plan-content construction entirely.
@@ -371,6 +402,7 @@ impl ModalView for PlanPromptView {
             push_todo_snapshot_lines(&mut lines, todos, content_width);
         }
 
+        let options_start = lines.len();
         for (idx, option) in PLAN_OPTIONS.iter().enumerate() {
             let number = idx + 1;
             push_option_lines(
@@ -396,6 +428,29 @@ impl ModalView for PlanPromptView {
         let scroll = self.scroll.min(max_scroll);
         let rendered_lines: Vec<Line<'static>> =
             lines.into_iter().skip(scroll).take(visible_lines).collect();
+
+        let content_area = modal_block().inner(popup_area);
+        for (idx, _) in PLAN_OPTIONS.iter().enumerate() {
+            let first_line = options_start + idx * 2;
+            if first_line < scroll || first_line >= scroll + visible_lines {
+                continue;
+            }
+            let y = content_area
+                .y
+                .saturating_add(u16::try_from(first_line - scroll).unwrap_or(u16::MAX));
+            let height = 2u16.min(
+                content_area
+                    .y
+                    .saturating_add(content_area.height)
+                    .saturating_sub(y),
+            );
+            if height > 0 {
+                self.row_hitboxes.borrow_mut().push((
+                    Rect::new(content_area.x, y, content_area.width, height),
+                    idx,
+                ));
+            }
+        }
 
         // Keep the footer intentionally compact. Long action lists live in the
         // selectable rows so narrow terminals never clip a hidden option.
@@ -766,7 +821,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::style::{Color, Style};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn render_buffer(view: &PlanPromptView, width: u16, height: u16) -> Buffer {
         let area = Rect::new(0, 0, width, height);
@@ -822,9 +879,7 @@ mod tests {
         let rendered = render_view(&view, 110, 36);
 
         assert!(rendered.contains("> [2/y] Accept plan (Full Access)"));
-        assert!(
-            rendered.contains("Start implementation in Act with Full Access (bypass approvals)")
-        );
+        assert!(rendered.contains("Start implementation in Act without approval prompts"));
     }
 
     #[test]
@@ -1227,5 +1282,25 @@ mod tests {
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(matches!(action, ViewAction::None));
         assert!(view.confirming_exit);
+    }
+
+    #[test]
+    fn mouse_click_renders_and_submits_plan_option() {
+        let mut view = PlanPromptView::new(None);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+            .expect("render plan prompt");
+        let rect = view.row_hitboxes.borrow()[2].0;
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::PlanPromptSelected { option: 3 })
+        ));
     }
 }

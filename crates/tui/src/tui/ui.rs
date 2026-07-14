@@ -101,8 +101,10 @@ use crate::tui::onboarding;
 use crate::tui::pager::PagerView;
 use crate::tui::persistence_actor::{self, PersistRequest};
 use crate::tui::plan_prompt::PlanPromptView;
+use crate::tui::plan_todo_bridge::{PlanAcceptance, project_accepted_plan};
 use crate::tui::scrolling::TranscriptScroll;
 // SelectionAutoscroll unused
+use crate::tui::motion::{FrameRequester, MotionPolicy};
 use crate::tui::session_picker::SessionPickerView;
 use crate::tui::shell_job_routing::{
     add_shell_job_message, format_shell_job_list, format_shell_poll, open_shell_job_pager,
@@ -113,8 +115,9 @@ use crate::tui::streaming_thinking;
 use crate::tui::subagent_routing::reconcile_subagent_activity_state_at;
 use crate::tui::subagent_routing::{
     apply_subagent_terminal_projection, format_task_list, handle_subagent_mailbox, open_task_pager,
-    reconcile_subagent_activity_state, running_agent_count, sort_subagents_in_place,
-    subagent_message_refreshes_workspace_context, task_mode_label, task_summary_to_panel_entry,
+    parent_stop_status, reconcile_subagent_activity_state, running_agent_count,
+    sort_subagents_in_place, subagent_message_refreshes_workspace_context, task_mode_label,
+    task_summary_to_panel_entry,
 };
 #[cfg(test)]
 use crate::tui::tool_routing::exploring_label;
@@ -203,6 +206,11 @@ const TOOL_HANG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(600);
 // the per-tool spinner pulse — keep this fast enough that the whale-spout
 // braille pattern reads as continuous motion instead of teleport-frames.
 const UI_STATUS_ANIMATION_MS: u64 = crate::tui::spinner::BRAILLE_SPINNER_FRAME_MS;
+/// Ambient fish and the completion wake need a smoother cadence than the
+/// deliberately legible status spinner. This remains modest enough for a
+/// terminal renderer while avoiding the five-frame-per-second "jump" seen
+/// whenever live status motion and ocean motion overlap.
+pub(crate) const UI_UNDERWATER_ANIMATION_MS: u64 = 80;
 // At an 80-column terminal the file tree owns 20 columns, leaving a 60-column
 // chat host. Keep a compact 20-column sidebar plus a 40-column transcript.
 pub(crate) const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 60;
@@ -729,15 +737,12 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
 
     // Apply OSC 8 hyperlink toggle from config.
     //
-    // #3029: OSC 8 hyperlinks are now emitted out-of-band. The transcript
-    // carries the link payloads in-band inside `Span` content, but each render
-    // seam calls `osc8::extract_buffer_link_regions`, which blanks the payload
-    // cells (so no buffer cell ever holds `\x1b` or `]8;;` — the old column-
-    // drift corruption is gone by construction) and publishes `LinkRegion`s.
-    // `ColorCompatBackend::draw` then re-emits the OSC 8 escapes through the
-    // backend's `Write` impl, interleaved with the cell stream — never inside a
-    // buffer cell. So the corruption that previously forced this default off is
-    // fixed, and hyperlinks are on by default for terminals that handle the OSC
+    // #3029: OSC 8 hyperlinks are emitted out-of-band. Markdown wrapping keeps
+    // visible spans and per-line targets in separate structures; each render
+    // seam translates those targets into absolute `LinkRegion`s without ever
+    // placing an escape byte in a ratatui buffer cell. `ColorCompatBackend`
+    // then emits the OSC 8 escapes through its `Write` impl around the matching
+    // cell runs. Hyperlinks are on by default for terminals that handle the OSC
     // terminator (`ESC \`) cleanly. Windows legacy consoles (conhost) still
     // mishandle the terminator, so the default stays off there; opt in via
     // `[tui] osc8_links = true` on any platform.
@@ -1665,7 +1670,6 @@ async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManag
     .map(task_summary_to_panel_entry)
     .collect();
 
-    entries.extend(active_reasoning_task_entries(app));
     entries.extend(active_rlm_task_entries(app));
 
     // #3804: this is a render-only read of shell jobs and must not block the
@@ -1799,37 +1803,6 @@ fn shell_job_live_output(job: &ShellJobSnapshot) -> Option<String> {
     }
 }
 
-fn active_reasoning_task_entries(app: &App) -> Vec<TaskPanelEntry> {
-    let Some(active) = app.active_cell.as_ref() else {
-        return Vec::new();
-    };
-    let duration_ms = app
-        .turn_started_at
-        .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-
-    active
-        .entries()
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| match entry {
-            HistoryCell::Thinking {
-                streaming: true, ..
-            } => Some(TaskPanelEntry {
-                id: format!("reasoning-{}", idx + 1),
-                status: "running".to_string(),
-                prompt_summary: "model reasoning".to_string(),
-                duration_ms,
-                kind: TaskPanelEntryKind::ModelReasoning,
-                stale: false,
-                elapsed_since_output_ms: None,
-                owner_agent_id: None,
-                owner_agent_name: None,
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
 fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
     let Some(active) = app.active_cell.as_ref() else {
         return Vec::new();
@@ -1951,6 +1924,9 @@ async fn run_event_loop(
     // `tui::frame_rate_limiter` for the rationale; ports the small piece of
     // codex's frame coalescing that maps cleanly onto our poll-based loop.
     let mut frame_rate_limiter = crate::tui::frame_rate_limiter::FrameRateLimiter::default();
+    // Widgets request future animation frames here; the poll loop remains the
+    // sole `terminal.draw` emitter (no competing animation loop).
+    let mut frame_requester = FrameRequester::new();
     let mut web_config_session: Option<WebConfigSession> = None;
     let mut prev_input_snapshot = String::new();
     let mut terminal_paused_at: Option<Instant> = None;
@@ -2525,6 +2501,8 @@ async fn run_event_loop(
                     }
                     EngineEvent::TurnStarted { turn_id } => {
                         app.ocean_completion_started_at = None;
+                        app.ocean_receipt_settle_start = None;
+                        app.ocean_turn_history_start = app.history.len();
                         app.suppress_stream_events_until_turn_complete = false;
                         app.is_loading = true;
                         app.offline_mode = false;
@@ -2637,14 +2615,18 @@ async fn run_event_loop(
                         app.runtime_turn_status = Some(match status {
                             crate::core::events::TurnOutcomeStatus::Completed => {
                                 app.ocean_completion_started_at = Some(Instant::now());
+                                app.ocean_receipt_settle_start =
+                                    Some(app.ocean_turn_history_start.min(app.history.len()));
                                 "completed".to_string()
                             }
                             crate::core::events::TurnOutcomeStatus::Interrupted => {
                                 app.ocean_completion_started_at = None;
+                                app.ocean_receipt_settle_start = None;
                                 "interrupted".to_string()
                             }
                             crate::core::events::TurnOutcomeStatus::Failed => {
                                 app.ocean_completion_started_at = None;
+                                app.ocean_receipt_settle_start = None;
                                 "failed".to_string()
                             }
                         });
@@ -2701,6 +2683,25 @@ async fn run_event_loop(
                                 (Some(provider), Some(model), auto_model)
                             })
                             .unwrap_or((None, None, false));
+                        let effective_turn_provider = provider.unwrap_or(app.api_provider);
+                        let effective_turn_model = model
+                            .as_deref()
+                            .filter(|model| !model.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                app.last_effective_model.as_deref().unwrap_or(&app.model)
+                            })
+                            .to_string();
+                        app.last_effective_provider = Some(effective_turn_provider);
+                        if status == crate::core::events::TurnOutcomeStatus::Completed {
+                            app.provider_health.record_success(
+                                config,
+                                effective_turn_provider,
+                                &effective_turn_model,
+                            );
+                        }
+                        if app.auto_model {
+                            app.last_effective_model = Some(effective_turn_model.clone());
+                        }
                         app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
                             provider,
                             model,
@@ -2724,15 +2725,13 @@ async fn run_event_loop(
                         }
 
                         // Update session cost
-                        let pricing_model = if app.auto_model {
-                            app.last_effective_model.as_deref().unwrap_or(&app.model)
-                        } else {
-                            &app.model
-                        };
-                        let turn_cost = crate::pricing::calculate_turn_cost_estimate_for_provider(
-                            app.api_provider,
-                            pricing_model,
+                        let billing =
+                            crate::route_billing::for_route(config, effective_turn_provider);
+                        let turn_cost = crate::pricing::calculate_turn_cost_estimate_for_route(
+                            effective_turn_provider,
+                            &effective_turn_model,
                             &usage,
+                            billing,
                         );
                         if let Some(cost) = turn_cost {
                             app.accrue_session_cost_estimate(cost);
@@ -2934,6 +2933,17 @@ async fn run_event_loop(
                         recoverable: _,
                     } => {
                         let provider_before_error = app.api_provider;
+                        let (health_provider, health_model) = app
+                            .pending_turn_route
+                            .as_ref()
+                            .map(|(provider, model, _)| (*provider, model.clone()))
+                            .unwrap_or_else(|| (provider_before_error, app.model.clone()));
+                        app.provider_health.record_failure(
+                            config,
+                            health_provider,
+                            &health_model,
+                            &envelope,
+                        );
                         let rollback_after_auth_failure =
                             matches!(
                                 envelope.category,
@@ -3593,19 +3603,19 @@ async fn run_event_loop(
             let events = app.view_stack.tick();
             if !events.is_empty() {
                 app.needs_redraw = true;
-            }
-            if handle_view_events(
-                terminal,
-                app,
-                config,
-                &task_manager,
-                &mut engine_handle,
-                &mut web_config_session,
-                events,
-            )
-            .await?
-            {
-                return Ok(());
+                if handle_view_events_boxed(
+                    terminal,
+                    app,
+                    config,
+                    &task_manager,
+                    &mut engine_handle,
+                    &mut web_config_session,
+                    events,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
             }
         }
 
@@ -3627,19 +3637,25 @@ async fn run_event_loop(
             area.width >= crate::tui::ocean::AMBIENT_MIN_WIDTH
                 && area.height >= crate::tui::ocean::AMBIENT_MIN_HEIGHT
         });
-        let underwater_idle_motion = !app.low_motion
+        let browsing_history = !app.viewport.transcript_scroll.is_at_tail();
+        let underwater_ambient_motion = !app.low_motion
             && app.fancy_animations
             && app.ocean_treatment.supports_ambient_life()
             && (ombre_field_breathes || ambient_life_visible)
             && app.onboarding == OnboardingState::None
             && !app.attention_hold_active()
-            && app.history.is_empty()
-            && app.input.trim().is_empty()
-            && app
-                .active_cell
-                .as_ref()
-                .is_none_or(crate::tui::active_cell::ActiveCell::is_empty)
-            && !app.is_loading;
+            && (browsing_history
+                || matches!(
+                    crate::tui::underwater::ShellPhase::from_app(app),
+                    crate::tui::underwater::ShellPhase::Working
+                        | crate::tui::underwater::ShellPhase::Verifying
+                )
+                || (app.history.is_empty()
+                    && app
+                        .active_cell
+                        .as_ref()
+                        .is_none_or(crate::tui::active_cell::ActiveCell::is_empty)
+                    && !app.is_loading));
         let underwater_completion_motion = !app.low_motion
             && app.fancy_animations
             && matches!(app.runtime_turn_status.as_deref(), Some("completed"))
@@ -3652,12 +3668,17 @@ async fn run_event_loop(
             history_has_live_motion,
             active_cell_has_live_motion,
         );
-        let animation_interval_ms = if status_motion {
-            status_animation_interval_ms(app)
-        } else {
-            125
-        };
-        if (status_motion || underwater_idle_motion || underwater_completion_motion)
+        let animation_interval_ms = animation_interval_ms(
+            app,
+            status_motion,
+            underwater_ambient_motion || underwater_completion_motion,
+        );
+        let motion_policy = MotionPolicy::from_settings(
+            app.low_motion,
+            app.fancy_animations,
+            app.constrained_frame_rate,
+        );
+        if (status_motion || underwater_ambient_motion || underwater_completion_motion)
             && last_status_frame.elapsed() >= Duration::from_millis(animation_interval_ms)
         {
             if streaming_thinking::animate_pending_translation(
@@ -3666,10 +3687,23 @@ async fn run_event_loop(
             ) {
                 app.mark_history_updated();
             }
-            if !app.low_motion && (history_has_live_motion || active_cell_has_live_motion) {
+            if motion_policy.allows_decorative()
+                && (history_has_live_motion || active_cell_has_live_motion)
+            {
                 app.mark_history_updated();
             }
-            app.needs_redraw = true;
+            // Coalesce decorative animation wakes through the shared requester.
+            // Reduced/Still drop these requests; state-change redraws still set
+            // needs_redraw directly below for phase/working chrome.
+            frame_requester.request_frame(Instant::now(), motion_policy);
+            if frame_requester.take_due(Instant::now(), motion_policy)
+                || !motion_policy.should_request_animation_frames()
+            {
+                // Full: emit only when the requester fires. Reduced/Still: keep
+                // the existing calm redraw so working/phase chrome stays truthful
+                // without decorative spin (TUI-DOG-008).
+                app.needs_redraw = true;
+            }
             last_status_frame = Instant::now();
         }
 
@@ -3719,6 +3753,7 @@ async fn run_event_loop(
         // Expire the "Press Ctrl+C again to quit" prompt silently after its
         // window. Triggers a redraw if the prompt was visible.
         app.tick_quit_armed();
+        let _ = crate::tui::work_surface::tick_stop_arm(app);
         app.tick_receipt();
         crate::tui::footer_ui::maybe_log_provider_wait_incident(app);
         // While the user is drag-selecting past the transcript edge, advance
@@ -3734,11 +3769,18 @@ async fn run_event_loop(
         // window, leave `needs_redraw = true` and shorten the poll timeout
         // so the loop wakes up exactly when drawing is allowed.
 
-        // Sync low-motion flag into the frame-rate limiter and streaming
-        // chunking policy. Low-motion mode drops the frame cap to 30 FPS
-        // and forces Smooth-only chunking so the display stays calm.
-        frame_rate_limiter.set_low_motion(app.low_motion || app.constrained_frame_rate);
-        app.streaming_state.set_low_motion(app.low_motion);
+        // Central motion contract: frame cap, stream catch-up, and chunking
+        // all read from MotionPolicy so reduced motion stays semantically calm
+        // (not a slow typewriter) and Full motion keeps the steady display clock.
+        let motion_policy = MotionPolicy::from_settings(
+            app.low_motion,
+            app.fancy_animations,
+            app.constrained_frame_rate,
+        );
+        frame_rate_limiter.set_low_motion(motion_policy.uses_constrained_frame_rate());
+        app.streaming_state
+            .set_low_motion(motion_policy.as_low_motion());
+        stream_display_clock.set_allow_catch_up(motion_policy.allows_catch_up_bursts());
 
         let draw_wait = if app.needs_redraw {
             frame_rate_limiter.time_until_next_draw(now)
@@ -3772,6 +3814,9 @@ async fn run_event_loop(
         }
         if let Some(until_stream_commit) = stream_display_clock.due_in(now) {
             poll_timeout = poll_timeout.min(until_stream_commit);
+        }
+        if let Some(until_anim) = frame_requester.due_in(now) {
+            poll_timeout = poll_timeout.min(until_anim);
         }
         if web_config_session.is_some() {
             poll_timeout = poll_timeout.min(Duration::from_millis(WEB_CONFIG_POLL_MS));
@@ -3999,7 +4044,7 @@ async fn run_event_loop(
                     continue;
                 }
                 let events = handle_mouse_event(app, mouse);
-                if handle_view_events(
+                if handle_view_events_boxed(
                     terminal,
                     app,
                     config,
@@ -4011,6 +4056,100 @@ async fn run_event_loop(
                 .await?
                 {
                     return Ok(());
+                }
+                if let Some(action) = app.pending_launch_action.take() {
+                    match action {
+                        crate::tui::underwater::LaunchAction::None => {}
+                        crate::tui::underwater::LaunchAction::NewSession => {
+                            let result = begin_launch_session(app, None);
+                            if apply_command_result(
+                                terminal,
+                                app,
+                                &mut engine_handle,
+                                &task_manager,
+                                config,
+                                &mut web_config_session,
+                                result,
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                        }
+                        crate::tui::underwater::LaunchAction::CreateWorktree(name) => {
+                            app.launch.status =
+                                Some(app.tr(MessageId::LaunchCreatingWorktree).into_owned());
+                            match provision_launch_worktree(app.workspace.clone(), name).await {
+                                Ok(workspace) => {
+                                    let result = begin_launch_session(app, Some(workspace));
+                                    if apply_command_result(
+                                        terminal,
+                                        app,
+                                        &mut engine_handle,
+                                        &task_manager,
+                                        config,
+                                        &mut web_config_session,
+                                        result,
+                                    )
+                                    .await?
+                                    {
+                                        return Ok(());
+                                    }
+                                }
+                                Err(err) => {
+                                    app.launch.status = Some(
+                                        app.tr(MessageId::LaunchWorktreeFailed)
+                                            .replace("{error}", &err.to_string()),
+                                    );
+                                }
+                            }
+                        }
+                        crate::tui::underwater::LaunchAction::Resume => {
+                            if app.launch.workspace_session_count == 0 {
+                                app.launch.status =
+                                    Some(app.tr(MessageId::LaunchNoSavedSessions).into_owned());
+                            } else {
+                                app.view_stack
+                                    .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+                            }
+                        }
+                        crate::tui::underwater::LaunchAction::Changelog => {
+                            let title = app.tr(MessageId::LaunchMenuChangelog).into_owned();
+                            open_text_pager(
+                                app,
+                                title,
+                                include_str!("../../../../CHANGELOG.md").to_string(),
+                            );
+                        }
+                        crate::tui::underwater::LaunchAction::Quit => {
+                            let _ = engine_handle.send(Op::Shutdown).await;
+                            return Ok(());
+                        }
+                    }
+                    app.needs_redraw = true;
+                }
+                if let Some(slot) = app.pending_hotbar_slot.take()
+                    && let Some(dispatch) = dispatch_hotbar_slot(app, config, slot)?
+                {
+                    match dispatch {
+                        HotbarDispatch::Handled => app.needs_redraw = true,
+                        HotbarDispatch::AppAction(action) => {
+                            if apply_command_result(
+                                terminal,
+                                app,
+                                &mut engine_handle,
+                                &task_manager,
+                                config,
+                                &mut web_config_session,
+                                commands::CommandResult::action(action),
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                            app.needs_redraw = true;
+                        }
+                    }
                 }
                 persist_sidebar_settings_if_dirty(app);
                 continue;
@@ -4085,48 +4224,57 @@ async fn run_event_loop(
                 continue;
             }
 
-            // WorkflowPanel keyboard surface (#4121): after a click grants
-            // focus, t/space toggles expand, c/x cancels, j/k changes phase.
-            // Esc drops focus back to the composer without cancelling the run.
+            // Clicking the WorkflowPanel gives its non-text controls focus,
+            // but ordinary characters always return directly to the composer.
+            // This keeps the panel keyboard-accessible without stealing the
+            // first t/c/j/k (or any other letter) of a new chat.
+            if app.view_stack.is_empty() && handle_workflow_panel_key(app, &key) {
+                submit_initial_input_if_ready(app, config, &engine_handle).await?;
+                continue;
+            }
+
+            // The Ocean work surface is a real focus owner. Route its keys
+            // before global transcript/composer navigation so PageUp/Down,
+            // Home/End, arrows, and row actions stay panel-local.
             if app.view_stack.is_empty()
-                && app
-                    .workflow_panel
-                    .as_ref()
-                    .is_some_and(|panel| panel.keyboard_focus)
+                && let Some(action) = crate::tui::work_surface::handle_key(app, key)
             {
-                let mut handled = false;
-                match key.code {
-                    KeyCode::Esc => {
-                        if let Some(panel) = app.workflow_panel.as_mut() {
-                            panel.keyboard_focus = false;
-                        }
-                        app.needs_redraw = true;
-                        handled = true;
-                    }
-                    KeyCode::Char(ch)
-                        if key.modifiers == KeyModifiers::NONE
-                            || key.modifiers == KeyModifiers::SHIFT =>
-                    {
-                        if let Some(panel) = app.workflow_panel.as_mut()
-                            && panel.handle_key(ch)
-                        {
-                            if matches!(ch, 'c' | 'C' | 'x' | 'X')
-                                && let Some(run_id) = panel.take_cancel_emit()
+                if let Some(action) = action {
+                    match action {
+                        crate::tui::app::SidebarRowAction::Command(command) => {
+                            if execute_command_input(
+                                terminal,
+                                app,
+                                &mut engine_handle,
+                                &task_manager,
+                                config,
+                                &mut web_config_session,
+                                &command,
+                            )
+                            .await?
                             {
-                                app.status_message = Some(format!(
-                                    "Cancelling workflow {run_id}… (dispatch via /workflow cancel {run_id})"
-                                ));
+                                return Ok(());
                             }
-                            app.needs_redraw = true;
-                            handled = true;
+                        }
+                        crate::tui::app::SidebarRowAction::CancelAgent { agent_id } => {
+                            app.status_message = Some(format!("Cancelling {agent_id}..."));
+                            if engine_handle
+                                .send(Op::CancelSubAgent {
+                                    agent_id: agent_id.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                app.status_message = Some(format!("Could not cancel {agent_id}"));
+                            }
+                        }
+                        other => {
+                            let _ = crate::tui::mouse_ui::apply_sidebar_row_action(app, other);
                         }
                     }
-                    _ => {}
                 }
-                if handled {
-                    submit_initial_input_if_ready(app, config, &engine_handle).await?;
-                    continue;
-                }
+                submit_initial_input_if_ready(app, config, &engine_handle).await?;
+                continue;
             }
 
             // Handle onboarding flow
@@ -4325,7 +4473,7 @@ async fn run_event_loop(
                 if !app.view_stack.is_empty() {
                     let events = app.view_stack.handle_key(key);
                     app.needs_redraw = true;
-                    if handle_view_events(
+                    if handle_view_events_boxed(
                         terminal,
                         app,
                         config,
@@ -4415,16 +4563,9 @@ async fn run_event_loop(
                 continue;
             }
 
-            if key.code == KeyCode::F(1) {
-                if app.view_stack.top_kind() == Some(ModalKind::Help) {
-                    app.view_stack.pop();
-                } else {
-                    app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
-                }
-                continue;
-            }
-
-            if key.code == KeyCode::Char('/') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Help: Alt+?, F1, and Ctrl+/ — one matcher. Ambiguous printable
+            // Option glyphs stay composer input on international layouts.
+            if crate::tui::shell_key_routing::is_help_shortcut(&key) {
                 if app.view_stack.top_kind() == Some(ModalKind::Help) {
                     app.view_stack.pop();
                 } else {
@@ -4556,10 +4697,7 @@ async fn run_event_loop(
                 continue;
             }
 
-            if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-                && key.modifiers.contains(KeyModifiers::ALT)
-                && !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::SUPER)
+            if crate::tui::shell_key_routing::is_context_inspector_shortcut(&key)
                 && app.view_stack.is_empty()
             {
                 open_context_inspector(app);
@@ -4569,7 +4707,7 @@ async fn run_event_loop(
             if !app.view_stack.is_empty() {
                 let events = app.view_stack.handle_key(key);
                 app.needs_redraw = true;
-                if handle_view_events(
+                if handle_view_events_boxed(
                     terminal,
                     app,
                     config,
@@ -4644,7 +4782,9 @@ async fn run_event_loop(
             let is_plain_char = matches!(key.code, KeyCode::Char(_)) && !has_ctrl_alt_or_super;
             let is_enter = matches!(key.code, KeyCode::Enter);
 
-            if key_shortcuts::is_macos_option_v_legacy_key(&key) {
+            // Tool details: Alt+V / Option+V only. Bare `v` always types `v`
+            // in every focus state (TUI-DOG-002).
+            if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) {
                 open_tool_details_pager(app);
                 continue;
             }
@@ -4708,17 +4848,6 @@ async fn run_event_loop(
                         && app.input.is_empty()
                         && open_pager_for_last_message(app) =>
                 {
-                    continue;
-                }
-                // This detail shortcut intentionally precedes vim-normal-mode
-                // handling: visual selection has no useful empty-composer
-                // target, while selected tool cards do.
-                KeyCode::Char('v')
-                    if key.modifiers == KeyModifiers::NONE
-                        && app.input.is_empty()
-                        && detail_target_cell_index(app).is_some() =>
-                {
-                    open_tool_details_pager(app);
                     continue;
                 }
                 KeyCode::Char('o')
@@ -4902,14 +5031,12 @@ async fn run_event_loop(
                             current_streaming_text.clear();
                             stream_display_clock.reset();
                             let prompt_restored = app.restore_last_submitted_prompt_if_empty();
-                            app.status_message = Some(
-                                if prompt_restored {
-                                    "Request cancelled; prompt restored to composer"
-                                } else {
-                                    "Request cancelled"
-                                }
-                                .to_string(),
-                            );
+                            let base = if prompt_restored {
+                                "Request cancelled; prompt restored to composer"
+                            } else {
+                                "Request cancelled"
+                            };
+                            app.status_message = Some(parent_stop_status(app, base));
                             app.disarm_quit();
                         }
                         CtrlCDisposition::ConfirmExit => {
@@ -4977,13 +5104,15 @@ async fn run_event_loop(
                                 app.hunt.tokens_used = 0;
                                 app.hunt.time_used_seconds = 0;
                                 app.hunt.continuation_count = 0;
-                                app.status_message = Some("Paused command cancelled".to_string());
+                                app.status_message =
+                                    Some(parent_stop_status(app, "Paused command cancelled"));
                             } else {
                                 engine_handle.cancel();
                                 mark_active_turn_cancelled_locally(app);
                                 current_streaming_text.clear();
                                 stream_display_clock.reset();
-                                app.status_message = Some("Request cancelled".to_string());
+                                app.status_message =
+                                    Some(parent_stop_status(app, "Request cancelled"));
                             }
                         }
                         EscapeAction::PauseCommand => {
@@ -5213,20 +5342,9 @@ async fn run_event_loop(
                 {
                     app.status_message = Some("No next tool output".to_string());
                 }
-                // `Alt+?` opens the searchable help overlay (#93). F1 and
-                // Ctrl+/ are also bound; bare `?` is reserved as text input
-                // so users can start a message with "?" without losing the
-                // first character.
-                KeyCode::Char('?')
-                    if key_shortcuts::alt_nav_modifiers(key.modifiers)
-                        && app.input.is_empty()
-                        && !slash_menu_open =>
-                {
-                    if app.view_stack.top_kind() != Some(ModalKind::Help) {
-                        app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
-                    }
-                    continue;
-                }
+                // Help chords (Alt+?, F1, Ctrl+/) are handled above via
+                // shell_key_routing::is_help_shortcut so printable layout
+                // characters stay text.
                 // Shift+Enter steers a running turn. When idle, the
                 // normal composer-newline branch below still handles it
                 // as a multiline input gesture.
@@ -5673,12 +5791,6 @@ async fn run_event_loop(
                     apply_mode_update(app, &engine_handle, AppMode::Plan).await;
                     continue;
                 }
-                KeyCode::Char('v') | KeyCode::Char('V')
-                    if key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    open_tool_details_pager(app);
-                    continue;
-                }
                 // Vim composer: Normal-mode motion / operator keys.
                 // Only fires when vim is enabled, the input is focused (no modal
                 // open on top), and the key has no modifier (pure char).
@@ -5754,6 +5866,83 @@ fn decision_card_number_from_key(key: &event::KeyEvent) -> Option<usize> {
     Some((c as u8 - b'1' + 1) as usize)
 }
 
+/// Route only non-text controls to a focused workflow panel.
+///
+/// Returning `false` for every character is deliberate: the caller then lets
+/// the normal composer path insert it. A prior bare-letter contract used
+/// t/c/j/k here, which made the first matching letter of a new chat disappear
+/// after the user clicked the workflow card.
+fn handle_workflow_panel_key(app: &mut App, key: &event::KeyEvent) -> bool {
+    if !app
+        .workflow_panel
+        .as_ref()
+        .is_some_and(|panel| panel.keyboard_focus)
+    {
+        return false;
+    }
+
+    if matches!(key.code, KeyCode::Char(_)) {
+        if let Some(panel) = app.workflow_panel.as_mut() {
+            panel.keyboard_focus = false;
+        }
+        app.needs_redraw = true;
+        return false;
+    }
+
+    if !key.modifiers.is_empty() && key.code != KeyCode::Esc {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(panel) = app.workflow_panel.as_mut() {
+                panel.keyboard_focus = false;
+            }
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Enter => {
+            if let Some(panel) = app.workflow_panel.as_mut() {
+                let _ = panel.toggle_expanded();
+            }
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Down => {
+            if let Some(panel) = app.workflow_panel.as_mut() {
+                panel.select_next_phase();
+            }
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Up => {
+            if let Some(panel) = app.workflow_panel.as_mut() {
+                panel.select_prev_phase();
+            }
+            app.needs_redraw = true;
+            true
+        }
+        KeyCode::Delete => {
+            let Some(run_id) = app
+                .workflow_panel
+                .as_ref()
+                .and_then(|panel| panel.lifecycle.is_running().then(|| panel.run_id.clone()))
+            else {
+                return false;
+            };
+            app.input = format!("/workflow cancel {run_id}");
+            app.cursor_position = app.input.chars().count();
+            app.status_message = Some(app.tr(MessageId::SidebarDestructiveArmed).into_owned());
+            if let Some(panel) = app.workflow_panel.as_mut() {
+                panel.keyboard_focus = false;
+            }
+            app.needs_redraw = true;
+            true
+        }
+        _ => false,
+    }
+}
+
 fn dispatch_hotbar_slot(
     app: &mut App,
     config: &Config,
@@ -5807,7 +5996,7 @@ fn persist_sidebar_settings_if_dirty(app: &mut App) {
     app.sidebar_width_dirty = false;
     app.sidebar_focus_dirty = false;
 
-    if let Ok(mut settings) = Settings::load() {
+    if let Ok(mut settings) = Settings::load_persisted() {
         if width_dirty {
             settings.update_sidebar_width(app.sidebar_width_percent);
         }
@@ -6644,6 +6833,7 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
 
     *config = previous_config;
     app.api_provider = previous_provider;
+    app.billing_presentation = crate::route_billing::for_route(config, previous_provider);
     app.set_model_selection(previous_model.clone());
     app.provider_models
         .insert(previous_provider.as_str().to_string(), previous_model);
@@ -6664,7 +6854,7 @@ fn rollback_provider_after_auth_failure(app: &mut App, config: &mut Config) -> O
             "provider",
             previous_provider.as_str(),
         )?;
-        let mut settings = crate::settings::Settings::load()?;
+        let mut settings = crate::settings::Settings::load_persisted()?;
         settings.default_provider = Some(previous_provider.as_str().to_string());
         settings.set_model_for_provider(
             previous_provider.as_str(),
@@ -7441,6 +7631,7 @@ async fn dispatch_user_message(
     if let Some(selection) = auto_selection.as_ref() {
         if app.auto_model {
             app.last_effective_model = Some(effective_model.clone());
+            app.last_effective_provider = Some(effective_provider);
             let mut status = format!(
                 "Auto model selected: {} / {effective_model} via {}",
                 selection.provider.display_name(),
@@ -7456,6 +7647,7 @@ async fn dispatch_user_message(
         }
     } else {
         app.last_effective_model = None;
+        app.last_effective_provider = None;
     }
 
     app.pending_turn_route = Some((effective_provider, effective_model.clone(), app.auto_model));
@@ -7808,7 +8000,7 @@ async fn apply_model_picker_choice(
     // can't be written rather than aborting the in-memory change.
     let mut persist_warning: Option<String> = None;
     let persist_result = (|| -> anyhow::Result<()> {
-        let mut settings = crate::settings::Settings::load()?;
+        let mut settings = crate::settings::Settings::load_persisted()?;
         if model_changed {
             if matches!(
                 app.api_provider,
@@ -7893,7 +8085,7 @@ async fn apply_picker_effort_choice(
     app.update_model_compaction_budget();
 
     let persist_warning = (|| -> anyhow::Result<()> {
-        let mut settings = crate::settings::Settings::load()?;
+        let mut settings = crate::settings::Settings::load_persisted()?;
         settings.set(
             "reasoning_effort",
             effort.as_setting_for_provider(app.api_provider),
@@ -7969,6 +8161,7 @@ async fn switch_provider(
                         config,
                         runtime_status,
                     )
+                    .map(|picker| picker.with_provider_health(&app.provider_health))
                 {
                     app.view_stack.push(picker);
                     app.status_message = Some(format!(
@@ -8014,6 +8207,7 @@ async fn switch_provider(
     let new_endpoint = display_base_url_host(&new_base_url);
     let cache_scope_changed = previous_provider != target || previous_model != new_model;
     app.api_provider = target;
+    app.billing_presentation = crate::route_billing::for_route(config, target);
     app.max_subagents = config
         .max_subagents_for_provider(target)
         .clamp(1, crate::config::MAX_SUBAGENTS);
@@ -8071,7 +8265,7 @@ async fn switch_provider(
             &provider_key,
         )?;
 
-        let mut settings = crate::settings::Settings::load()?;
+        let mut settings = crate::settings::Settings::load_persisted()?;
         settings.default_provider = Some(provider_key);
         if model_override.is_some() {
             settings.set_model_for_provider(target.as_str(), &new_model);
@@ -8174,6 +8368,7 @@ async fn apply_provider_fallback_switch(
         return;
     }
     *config = next_config;
+    app.billing_presentation = crate::route_billing::for_route(config, target);
 
     let new_base_url = resolved_endpoint;
     let new_endpoint = display_base_url_host(&new_base_url);
@@ -8468,6 +8663,10 @@ async fn apply_command_result(
                 }
             }
             AppAction::ModeChanged(_mode) => {
+                sync_mode_update(app, engine_handle).await;
+            }
+            AppAction::ApprovalPolicyPersisted { policy } => {
+                config.approval_policy = policy;
                 sync_mode_update(app, engine_handle).await;
             }
             AppAction::SendMessage(content) => {
@@ -8773,7 +8972,8 @@ async fn apply_command_result(
                             config,
                             runtime_status,
                             app.provider_picker_memory.as_ref(),
-                        ),
+                        )
+                        .with_provider_health(&app.provider_health),
                     );
                 }
             }
@@ -8786,7 +8986,8 @@ async fn apply_command_result(
                             provider,
                             config,
                             runtime_status,
-                        ),
+                        )
+                        .with_provider_health(&app.provider_health),
                     );
                     app.status_message = Some("Provider setup catalog opened.".to_string());
                 }
@@ -8826,8 +9027,8 @@ async fn apply_command_result(
                     // Avoids re-reading settings.toml from disk on every
                     // `/theme` invocation.
                     let original = app.theme_id.name().to_string();
-                    app.view_stack.push(
-                        crate::tui::theme_picker::ThemePickerView::new_with_treatment(
+                    app.view_stack.push_boxed(
+                        crate::tui::theme_picker::ThemePickerView::boxed_with_treatment(
                             original,
                             app.ocean_treatment,
                             app.ui_locale,
@@ -8978,6 +9179,8 @@ async fn apply_command_result(
                     Ok(new_config) => {
                         *config = new_config.clone();
                         app.api_provider = config.api_provider();
+                        app.billing_presentation =
+                            crate::route_billing::for_route(config, app.api_provider);
                         let new_model = config.default_model();
                         app.set_model_selection(new_model.clone());
                         app.set_active_context_window_override(
@@ -9684,7 +9887,7 @@ fn plan_next_step_prompt() -> String {
     [
         "Action required: choose the next step for this plan.",
         "  1) Accept + implement in Act mode",
-        "  2) Accept + implement with Full Access (Act + bypass)",
+        "  2) Accept + implement with Full Access (trusted workspace)",
         "  3) Revise the plan / ask follow-ups",
         "  4) Return to Act mode without implementing",
         "",
@@ -9721,6 +9924,16 @@ async fn apply_plan_choice(
     engine_handle: &EngineHandle,
     choice: PlanChoice,
 ) -> Result<()> {
+    let acceptance = match choice {
+        PlanChoice::AcceptAgent => PlanAcceptance::AcceptAct,
+        PlanChoice::AcceptYolo => PlanAcceptance::AcceptFullAccess,
+        PlanChoice::RevisePlan => PlanAcceptance::Revise,
+        PlanChoice::ExitPlan => PlanAcceptance::Exit,
+    };
+    project_accepted_plan(&app.plan_state, &app.todos, acceptance)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to project accepted plan: {err}"))?;
+
     match choice {
         PlanChoice::AcceptAgent => {
             apply_mode_update(app, engine_handle, AppMode::Agent).await;
@@ -9915,6 +10128,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
 
     if app.launch.visible {
         crate::tui::underwater::render_launch_screen(size, f.buffer_mut(), app);
+        crate::tui::underwater::record_launch_row_areas(size, &mut app.launch);
         if !app.view_stack.is_empty() {
             let buf = f.buffer_mut();
             app.view_stack.render(size, buf);
@@ -9927,7 +10141,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     } else {
         2
     };
-    let footer_height = 1;
+    let footer_height = crate::tui::phase_strip::height();
     let slash_menu_entries = visible_slash_menu_entries(app, SLASH_MENU_LIMIT);
     let mention_menu_limit = app.mention_menu_limit;
     let mention_menu_entries =
@@ -9935,7 +10149,8 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     if !mention_menu_entries.is_empty() && app.mention_menu_selected >= mention_menu_entries.len() {
         app.mention_menu_selected = mention_menu_entries.len().saturating_sub(1);
     }
-    let top_work_strip_height = super::sidebar::top_work_strip_height(app, size.width, size.height);
+    let top_work_strip_height =
+        super::work_surface::height(app, size.width, size.height, classic_shell);
 
     // Defensive two-pass layout: pin the header to the absolute top row,
     // then split the remaining body area for chat / preview / composer /
@@ -9992,14 +10207,32 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     let workflow_panel_height =
         desired_workflow_panel_height.min(auxiliary_budget.saturating_sub(preview_height));
 
-    // Composer first, footer last: the phase line is the shell's stable bottom
-    // anchor. Reversing this order in the underwater path pinched the prompt
-    // between two chrome rows and made compact terminals feel stacked.
-    let (composer_slot, footer_slot) = (4, 5);
-    let tail_constraints = [
-        Constraint::Length(composer_height),
-        Constraint::Length(footer_height),
-    ];
+    // Ocean live phases put the phase strip above the composer so activity
+    // stays attached to the transcript and the prompt is the final bottom
+    // object. Idle/typing keep a quiet phase under the prompt. Classic keeps
+    // the legacy composer-then-footer stack.
+    let phase = crate::tui::underwater::ShellPhase::from_app(app);
+    let phase_above = !classic_shell
+        && crate::tui::phase_strip::PhaseStripPlacement::for_phase(phase).is_above_composer();
+    let (composer_slot, footer_slot, tail_constraints) = if phase_above {
+        (
+            5,
+            4,
+            [
+                Constraint::Length(footer_height),
+                Constraint::Length(composer_height),
+            ],
+        )
+    } else {
+        (
+            4,
+            5,
+            [
+                Constraint::Length(composer_height),
+                Constraint::Length(footer_height),
+            ],
+        )
+    };
 
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -10009,13 +10242,18 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             Constraint::Min(1),                        // Chat area
             Constraint::Length(workflow_panel_height), // Workflow panel (#4121)
             Constraint::Length(preview_height),        // Pending input preview (0 if empty)
-            tail_constraints[0],                       // Footer/composer order by shell
-            tail_constraints[1],                       // Composer/footer order by shell
+            tail_constraints[0],
+            tail_constraints[1],
         ])
         .split(body_area);
 
+    let (work_chat_area, side_work_area) =
+        super::work_surface::split_chat(app, body_chunks[1], classic_shell);
+
     if top_work_strip_height > 0 {
-        super::sidebar::render_top_work_strip(f, body_chunks[0], app);
+        super::work_surface::render(f, body_chunks[0], app);
+    } else if let Some(work_area) = side_work_area {
+        super::work_surface::render(f, work_area, app);
     }
 
     if classic_shell {
@@ -10029,6 +10267,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
     // the strip above, Fleet owns `/fleet`, and dense context owns its
     // inspector. Keeping the sidebar here was the architectural reason the
     // rejected build still read as the old TUI under a gradient.
+    let shell_ocean;
     {
         // Defensive backstop (#400): fill the entire body area with ink
         // background before any sub-widgets render, so cells that end up
@@ -10036,17 +10275,17 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         // resize) don't retain stale content from a previous frame.
         Block::default()
             .style(Style::default().bg(app.ui_theme.surface_bg))
-            .render(body_chunks[1], f.buffer_mut());
+            .render(work_chat_area, f.buffer_mut());
 
         // When the file-tree pane is visible and the terminal is wide
         // enough, reserve the left ~25% for the file tree.
         let mut chat_area =
-            if app.file_tree.is_some() && body_chunks[1].width >= SIDEBAR_VISIBLE_MIN_WIDTH {
+            if app.file_tree.is_some() && work_chat_area.width >= SIDEBAR_VISIBLE_MIN_WIDTH {
                 app.file_tree_visible = true;
                 let split = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
-                    .split(body_chunks[1]);
+                    .split(work_chat_area);
                 let tree_area = split[0];
                 let remaining = split[1];
 
@@ -10058,7 +10297,7 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
                 remaining
             } else {
                 app.file_tree_visible = false;
-                body_chunks[1]
+                work_chat_area
             };
         app.last_sidebar_host_width = Some(chat_area.width);
         let sidebar_area = if classic_shell
@@ -10083,7 +10322,8 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
             app.sidebar_hover_tooltip = None;
         }
 
-        let chat_widget = ChatWidget::new(app, chat_area);
+        let chat_widget = ChatWidget::new(app, chat_area).with_ocean_viewport(size);
+        shell_ocean = chat_widget.ocean_column();
         let buf = f.buffer_mut();
         chat_widget.render(chat_area, buf);
 
@@ -10112,11 +10352,19 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         if let Some(panel) = app.workflow_panel.as_ref() {
             let area = body_chunks[2];
             app.viewport.last_workflow_panel_area = Some(area);
+            app.viewport.last_workflow_cancel_area =
+                panel.cancel_hint_span(area.width).map(|(start, end)| Rect {
+                    x: area.x.saturating_add(start),
+                    y: area.y,
+                    width: end.saturating_sub(start),
+                    height: 1,
+                });
             let buf = f.buffer_mut();
             panel.render(area, buf);
         }
     } else {
         app.viewport.last_workflow_panel_area = None;
+        app.viewport.last_workflow_cancel_area = None;
     }
 
     // Render pending-input preview (queued/steered messages, if any).
@@ -10162,7 +10410,9 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         // Compute scroll offset and top padding for mouse coordinate mapping.
         let input_text = app.composer_display_input();
         let input_cursor = app.composer_display_cursor();
-        let content_width = usize::from(inner.width.max(1));
+        let content_geometry =
+            crate::tui::widgets::composer_content_geometry(inner, app.is_history_search_active());
+        let content_width = content_geometry.text_width();
         let menu_lines = ComposerWidget::new(
             app,
             composer_max_height,
@@ -10203,6 +10453,34 @@ fn render(f: &mut Frame, app: &mut App, config: &Config) {
         render_footer(f, body_chunks[footer_slot], app);
     } else {
         crate::tui::underwater::render_footer(body_chunks[footer_slot], f.buffer_mut(), app);
+    }
+
+    // The underwater shell is one water column, not a stack of independently
+    // shaded panels. Continue the transcript's absolute-row ramp through each
+    // ordinary shell surface after its foreground has rendered. Semantic
+    // backgrounds such as selection, hover, errors, and code blocks do not
+    // match these base colors and therefore remain intact.
+    if let Some(column) = shell_ocean {
+        column.paint_matching(header_area, f.buffer_mut(), app.ui_theme.header_bg);
+        if top_work_strip_height > 0 {
+            column.paint_matching(body_chunks[0], f.buffer_mut(), app.ui_theme.surface_bg);
+        }
+        if let Some(side_area) = side_work_area {
+            column.paint_matching(side_area, f.buffer_mut(), app.ui_theme.surface_bg);
+        }
+        column.paint_matching(work_chat_area, f.buffer_mut(), app.ui_theme.surface_bg);
+        column.paint_matching(body_chunks[2], f.buffer_mut(), app.ui_theme.surface_bg);
+        column.paint_matching(body_chunks[3], f.buffer_mut(), app.ui_theme.surface_bg);
+        column.paint_matching(
+            body_chunks[composer_slot],
+            f.buffer_mut(),
+            app.ui_theme.composer_bg,
+        );
+        column.paint_matching(
+            body_chunks[footer_slot],
+            f.buffer_mut(),
+            app.ui_theme.footer_bg,
+        );
     }
     // Toast stack overlay (#439): when multiple status toasts are queued,
     // surface the older ones as a 1-2 line strip above the footer so a
@@ -10498,6 +10776,90 @@ fn restore_hotbar_defaults(app: &mut App, config: &mut Config) {
     app.needs_redraw = true;
 }
 
+fn prepare_config_update_result(
+    mut result: commands::CommandResult,
+    persist: bool,
+) -> commands::CommandResult {
+    // Live previews can fire on every navigation tick. Suppress routine
+    // confirmations, but preserve errors and AppAction so one canonical path
+    // remains responsible for both user-visible output and side effects.
+    if !persist && !result.is_error {
+        result.message = None;
+    }
+    result
+}
+
+fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
+    if app.view_stack.top_kind() == Some(ModalKind::Config) {
+        let filter = app.view_stack.pop().and_then(|mut view| {
+            view.as_any_mut()
+                .downcast_mut::<ConfigView>()
+                .map(|config_view| config_view.filter_query().to_string())
+        });
+        let mut config_view = ConfigView::new_for_app(app);
+        if let Some(filter) = filter {
+            config_view.restore_filter(filter);
+        }
+        config_view.focus_key(focus_key);
+        app.view_stack.push(config_view);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_config_updated(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    config: &mut Config,
+    task_manager: &SharedTaskManager,
+    engine_handle: &mut EngineHandle,
+    web_config_session: &mut Option<WebConfigSession>,
+    key: String,
+    value: String,
+    persist: bool,
+) -> Result<bool> {
+    let result = prepare_config_update_result(
+        commands::set_config_value(app, &key, &value, persist),
+        persist,
+    );
+    let normalized_value = value.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    let cleared_root_approval = !result.is_error
+        && persist
+        && key == "approval_policy"
+        && matches!(
+            normalized_value.as_str(),
+            "default" | "tui-default" | "use-tui-default"
+        );
+    // Theme / background changes require a full terminal repaint because
+    // ratatui's incremental diff cannot see colors remapped by the backend.
+    if matches!(
+        key.as_str(),
+        "theme" | "ui_theme" | "background_color" | "background" | "bg"
+    ) {
+        app.force_next_full_repaint = true;
+    }
+    if apply_command_result(
+        terminal,
+        app,
+        engine_handle,
+        task_manager,
+        config,
+        web_config_session,
+        result,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+
+    let focus_key = if cleared_root_approval {
+        "permission_posture"
+    } else {
+        &key
+    };
+    refresh_config_view_if_open(app, focus_key);
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_view_events(
     terminal: &mut AppTerminal,
@@ -10768,72 +11130,20 @@ async fn handle_view_events(
                 value,
                 persist,
             } => {
-                let result = commands::set_config_value(app, &key, &value, persist);
-                // Theme / background changes require a full terminal repaint
-                // because ratatui's incremental diff may miss color-only
-                // changes in cells that were rendered with theme-resolved
-                // colors (sidebar panels) rather than palette constants that
-                // go through the backend remap layer.  A full repaint
-                // (terminal clear + all cells redrawn) guarantees every cell
-                // picks up the new theme immediately.
-                if matches!(
-                    key.as_str(),
-                    "theme" | "ui_theme" | "background_color" | "background" | "bg"
-                ) {
-                    app.force_next_full_repaint = true;
-                }
-                // Only surface the "key = value" confirmation when the
-                // change is being persisted. Live-preview events
-                // (`persist: false`, e.g. arrow keys in the theme picker)
-                // fire on every navigation tick and would otherwise spam
-                // a `System` cell into the transcript per row visited.
-                if persist && let Some(msg) = result.message {
-                    app.add_message(HistoryCell::System { content: msg });
-                }
-
-                if let Some(action) = result.action {
-                    match action {
-                        AppAction::UpdateCompaction(compaction) => {
-                            apply_model_and_compaction_update(
-                                engine_handle,
-                                compaction,
-                                app.mode,
-                                app.active_route_limits,
-                            )
-                            .await;
-                        }
-                        AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
-                            let _ = engine_handle
-                                .send(Op::SetStreamChunkTimeout { timeout_secs })
-                                .await;
-                        }
-                        AppAction::UpdateSubagentRuntimeConfig {
-                            enabled,
-                            max_subagents,
-                            launch_concurrency,
-                            max_spawn_depth,
-                            api_timeout_secs,
-                            heartbeat_timeout_secs,
-                        } => {
-                            let _ = engine_handle
-                                .send(Op::SetSubagentRuntimeConfig {
-                                    enabled,
-                                    max_subagents,
-                                    launch_concurrency,
-                                    max_spawn_depth,
-                                    api_timeout_secs,
-                                    heartbeat_timeout_secs,
-                                })
-                                .await;
-                        }
-                        AppAction::OpenConfigView => {}
-                        _ => {}
-                    }
-                }
-
-                if app.view_stack.top_kind() == Some(ModalKind::Config) {
-                    app.view_stack.pop();
-                    app.view_stack.push(ConfigView::new_for_app(app));
+                if handle_config_updated(
+                    terminal,
+                    app,
+                    config,
+                    task_manager,
+                    engine_handle,
+                    web_config_session,
+                    key,
+                    value,
+                    persist,
+                )
+                .await?
+                {
+                    return Ok(true);
                 }
             }
             ViewEvent::StatusItemsUpdated { items, final_save } => {
@@ -10939,44 +11249,29 @@ async fn handle_view_events(
                 // make the whole agents dir fail to load on the duplicate).
                 // Overwriting the SAME file is fine — that is an intentional
                 // re-draft of this profile.
-                // Fail CLOSED: if the agents dir can't be read/parsed we
-                // cannot prove there's no id collision, so refuse rather than
-                // write into a dir that already fails to load.
+                // The collision gate only needs file identities. Accept
+                // otherwise legacy profile fields here so an old, unrelated
+                // profile cannot block saving a current one. Malformed TOML,
+                // unreadable files, and invalid ids still fail closed because
+                // then we cannot prove there is no collision.
                 let existing_profiles =
-                    crate::fleet::profile::load_workspace_agent_profiles(&app.workspace);
+                    crate::fleet::profile::load_workspace_agent_profile_identities(&app.workspace);
                 if let Err(err) = &existing_profiles {
-                    let zh = app.ui_locale == crate::localization::Locale::ZhHans;
-                    app.status_message = Some(if zh {
-                        format!(
-                            "无法校验现有配置（.codewhale/agents 中有文件无法读取：{err}）；请先修复再保存。"
-                        )
-                    } else {
-                        format!(
-                            "Could not verify existing profiles (a file in .codewhale/agents is unreadable: {err}); fix it before saving."
-                        )
-                    });
+                    let message = tr(app.ui_locale, MessageId::FleetProfileIdentityVerifyFailed)
+                        .replace("{error}", &format!("{err:#}"));
+                    app.set_sticky_status(message, StatusToastLevel::Error, None);
                     app.needs_redraw = true;
                     continue;
                 }
                 let id_conflict = existing_profiles
                     .into_iter()
                     .flatten()
-                    .find(|p| p.id == draft.id && p.source != target);
+                    .find(|p| p.id.eq_ignore_ascii_case(&draft.id) && p.source != target);
                 if let Some(existing) = id_conflict {
-                    let zh = app.ui_locale == crate::localization::Locale::ZhHans;
-                    app.status_message = Some(if zh {
-                        format!(
-                            "配置 id `{}` 已被 {} 占用；请重新起草为不同的角色或先移除旧文件。",
-                            draft.id,
-                            existing.source.display()
-                        )
-                    } else {
-                        format!(
-                            "Profile id `{}` is already used by {}; redraft with a different role or remove the old file first.",
-                            draft.id,
-                            existing.source.display()
-                        )
-                    });
+                    let message = tr(app.ui_locale, MessageId::FleetProfileIdConflict)
+                        .replace("{id}", &draft.id)
+                        .replace("{path}", &existing.source.display().to_string());
+                    app.set_sticky_status(message, StatusToastLevel::Error, None);
                     app.needs_redraw = true;
                     continue;
                 }
@@ -10995,18 +11290,10 @@ async fn handle_view_events(
                         app.api_provider,
                     )
                 {
-                    let zh = app.ui_locale == crate::localization::Locale::ZhHans;
-                    app.status_message = Some(if zh {
-                        format!(
-                            "配置指定的 provider `{provider_id}` 尚未配置凭据（{}）；请先在 /provider 中设置，再保存。",
-                            provider.env_vars_label()
-                        )
-                    } else {
-                        format!(
-                            "Profile pins provider `{provider_id}`, which has no configured credentials ({}); set it up in /provider before saving.",
-                            provider.env_vars_label()
-                        )
-                    });
+                    let message = tr(app.ui_locale, MessageId::FleetProfileProviderUnconfigured)
+                        .replace("{provider}", provider_id)
+                        .replace("{env}", &provider.env_vars_label());
+                    app.set_sticky_status(message, StatusToastLevel::Error, None);
                     app.needs_redraw = true;
                     continue;
                 }
@@ -11061,7 +11348,8 @@ async fn handle_view_events(
                             Some(app.api_provider),
                             config,
                             runtime_status,
-                        ),
+                        )
+                        .with_provider_health(&app.provider_health),
                     );
                     app.status_message =
                         Some("Provider setup opened from /setup readiness.".to_string());
@@ -11199,6 +11487,7 @@ async fn handle_view_events(
                 }
                 let model_override = provider_picker_model_override(app, provider);
                 switch_provider(app, engine_handle, config, provider, model_override).await;
+                refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerApiKeySubmitted {
                 provider,
@@ -11209,6 +11498,7 @@ async fn handle_view_events(
                     set_active_custom_provider_in_memory(config, &provider_id);
                 }
                 apply_provider_picker_api_key(app, engine_handle, config, provider, api_key).await;
+                refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerSetupConfirmed {
                 provider,
@@ -11228,6 +11518,7 @@ async fn handle_view_events(
                     model,
                 )
                 .await;
+                refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerCustomProviderSubmitted {
                 provider_id,
@@ -11245,6 +11536,7 @@ async fn handle_view_events(
                     api_key_env,
                 )
                 .await;
+                refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerKimiOAuthEnabled { provider } => {
                 apply_provider_picker_auth_mode(
@@ -11256,6 +11548,7 @@ async fn handle_view_events(
                     "Linked Kimi CLI OAuth",
                 )
                 .await;
+                refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
@@ -11326,6 +11619,65 @@ async fn handle_view_events(
     }
 
     Ok(false)
+}
+
+/// Keep the very large modal-event dispatcher out of the already-large TUI
+/// loop future. Config previews take a dedicated small path: polling the full
+/// dispatcher on top of the event loop exceeds the macOS main-thread stack in
+/// debug builds before a theme preview can reach its next frame.
+#[allow(clippy::too_many_arguments)]
+fn handle_view_events_boxed<'a>(
+    terminal: &'a mut AppTerminal,
+    app: &'a mut App,
+    config: &'a mut Config,
+    task_manager: &'a SharedTaskManager,
+    engine_handle: &'a mut EngineHandle,
+    web_config_session: &'a mut Option<WebConfigSession>,
+    events: Vec<ViewEvent>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + 'a>> {
+    Box::pin(async move {
+        for event in events {
+            match event {
+                ViewEvent::ConfigUpdated {
+                    key,
+                    value,
+                    persist,
+                } => {
+                    if handle_config_updated(
+                        terminal,
+                        app,
+                        config,
+                        task_manager,
+                        engine_handle,
+                        web_config_session,
+                        key,
+                        value,
+                        persist,
+                    )
+                    .await?
+                    {
+                        return Ok(true);
+                    }
+                }
+                other => {
+                    if Box::pin(handle_view_events(
+                        terminal,
+                        app,
+                        config,
+                        task_manager,
+                        engine_handle,
+                        web_config_session,
+                        vec![other],
+                    ))
+                    .await?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    })
 }
 
 fn push_approval_request_view(
@@ -11406,8 +11758,60 @@ async fn apply_approval_decision(
         ReviewDecision::Abort => {
             engine_handle.cancel();
             mark_active_turn_cancelled_locally(app);
-            app.status_message = Some("Request cancelled".to_string());
+            app.status_message = Some(parent_stop_status(app, "Request cancelled"));
         }
+    }
+}
+
+struct RuntimePresetFileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl RuntimePresetFileSnapshot {
+    fn capture(path: PathBuf) -> Result<Self> {
+        let contents = match std::fs::read(&path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to snapshot {}", path.display()));
+            }
+        };
+        Ok(Self { path, contents })
+    }
+
+    fn restore(&self) -> Result<()> {
+        match &self.contents {
+            Some(contents) => crate::utils::write_atomic(&self.path, contents)
+                .with_context(|| format!("failed to restore {}", self.path.display())),
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("failed to remove {}", self.path.display()))
+                }
+            },
+        }
+    }
+}
+
+fn runtime_preset_error_with_rollback(
+    error: anyhow::Error,
+    snapshots: &[&RuntimePresetFileSnapshot],
+) -> anyhow::Error {
+    let rollback_errors = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.restore().err())
+        .map(|error| format!("{error:#}"))
+        .collect::<Vec<_>>();
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        anyhow::anyhow!(
+            "{error:#}; runtime preset rollback also failed: {}",
+            rollback_errors.join("; ")
+        )
     }
 }
 
@@ -11417,57 +11821,117 @@ fn apply_setup_runtime_preset(
     preset: crate::tui::setup::SetupRuntimePreset,
     state: codewhale_config::SetupState,
 ) -> Result<String> {
-    let mut settings = Settings::load().context("failed to load settings")?;
-    settings.default_mode = preset.default_mode().to_string();
-    settings.save().context("failed to save settings")?;
-
-    let config_path = app.config_path.as_deref();
-    if let Some(policy) = preset.approval_policy() {
-        crate::config_persistence::persist_root_string_key(config_path, "approval_policy", policy)
-            .context("failed to persist approval_policy")?;
-        config.approval_policy = Some(policy.to_string());
+    if let Some(source) = config.runtime_preset_blocker(
+        app.config_path.as_deref(),
+        app.config_profile.as_deref(),
+        &app.workspace,
+    ) {
+        anyhow::bail!(
+            "Runtime presets cannot override {source}; change that controlling source first"
+        );
     }
-    crate::config_persistence::persist_root_bool_key(
-        config_path,
-        "allow_shell",
-        preset.allow_shell(),
-    )
-    .context("failed to persist allow_shell")?;
+    if preset == crate::tui::setup::SetupRuntimePreset::HighTrustLocal {
+        let approval = config.approval_policy_control(
+            app.config_path.as_deref(),
+            app.config_profile.as_deref(),
+            &app.workspace,
+        );
+        if !approval.editable_root() {
+            anyhow::bail!(
+                "Full Access cannot override {}; change that controlling source first",
+                approval.label()
+            );
+        }
+    }
+
+    let settings_path = Settings::path().context("failed to resolve settings path")?;
+    let settings_snapshot = RuntimePresetFileSnapshot::capture(settings_path)?;
+    let mut settings = Settings::load_persisted().context("failed to load settings")?;
+    settings.default_mode = preset.default_mode().to_string();
+    settings.permission_posture = Some(preset.permission_posture().to_string());
+
+    // Persist into the same file Config::load actually selected. When an env
+    // override names a missing file, reads intentionally fall back to an
+    // existing home config; writing to the missing override would otherwise
+    // leave the controlling key untouched and shadow the home config on the
+    // next launch.
+    let selected_config_path = crate::config::resolve_load_config_path(app.config_path.clone())
+        .or_else(|| app.config_path.clone());
+    let config_path = crate::config_persistence::config_toml_path(selected_config_path.as_deref())
+        .context("failed to resolve config path")?;
+    let config_snapshot = RuntimePresetFileSnapshot::capture(config_path.clone())?;
+    if let Err(error) =
+        crate::config_persistence::mutate_config_document(&config_path, |document| {
+            if let Some(policy) = preset.approval_policy() {
+                crate::config_persistence::set_document_value(
+                    document,
+                    &["approval_policy"],
+                    policy,
+                )?;
+            } else {
+                crate::config_persistence::unset_document_value(document, &["approval_policy"])?;
+            }
+            crate::config_persistence::set_document_value(
+                document,
+                &["allow_shell"],
+                preset.allow_shell(),
+            )?;
+            crate::config_persistence::set_document_value(
+                document,
+                &["sandbox_mode"],
+                preset.sandbox_mode(),
+            )
+        })
+        .context("failed to persist runtime posture")
+    {
+        return Err(runtime_preset_error_with_rollback(
+            error,
+            &[&settings_snapshot, &config_snapshot],
+        ));
+    }
+    if let Err(error) = settings.save().context("failed to save settings") {
+        return Err(runtime_preset_error_with_rollback(
+            error,
+            &[&settings_snapshot, &config_snapshot],
+        ));
+    }
+    if let Err(error) = state
+        .save()
+        .context("failed to persist setup runtime posture state")
+    {
+        return Err(runtime_preset_error_with_rollback(
+            error,
+            &[&settings_snapshot, &config_snapshot],
+        ));
+    }
+
+    // Durable writes succeeded as one transaction. Only now may live state
+    // move to the new posture.
+    if let Some(policy) = preset.approval_policy() {
+        config.approval_policy = Some(policy.to_string());
+        app.mark_approval_policy_locked();
+    } else {
+        config.approval_policy = None;
+        app.clear_saved_approval_policy_lock();
+    }
     config.allow_shell = Some(preset.allow_shell());
-    crate::config_persistence::persist_root_string_key(
-        config_path,
-        "sandbox_mode",
-        preset.sandbox_mode(),
-    )
-    .context("failed to persist sandbox_mode")?;
     config.sandbox_mode = Some(preset.sandbox_mode().to_string());
 
+    let approval_mode = ApprovalMode::from_config_value(
+        preset
+            .approval_policy()
+            .unwrap_or(preset.permission_posture()),
+    )
+    .unwrap_or(ApprovalMode::Suggest);
+    let trust_mode = match preset {
+        crate::tui::setup::SetupRuntimePreset::AskFirst => false,
+        crate::tui::setup::SetupRuntimePreset::NormalAgent => app.agent_trust_baseline(),
+        crate::tui::setup::SetupRuntimePreset::HighTrustLocal => true,
+    };
+    app.set_agent_runtime_baseline(preset.allow_shell(), trust_mode, approval_mode);
     let mode = AppMode::from_setting(preset.default_mode());
     app.set_mode(mode);
-    app.allow_shell = preset.allow_shell();
-    if let Some(policy) = preset.approval_policy() {
-        app.approval_mode =
-            ApprovalMode::from_config_value(policy).unwrap_or(ApprovalMode::Suggest);
-    }
-    match preset {
-        crate::tui::setup::SetupRuntimePreset::AskFirst => {
-            app.trust_mode = false;
-            app.yolo = false;
-        }
-        crate::tui::setup::SetupRuntimePreset::NormalAgent => {
-            app.yolo = false;
-        }
-        crate::tui::setup::SetupRuntimePreset::HighTrustLocal => {
-            app.approval_mode = ApprovalMode::Bypass;
-            app.trust_mode = true;
-            app.yolo = true;
-        }
-    }
     app.needs_redraw = true;
-
-    state
-        .save()
-        .context("failed to persist setup runtime posture state")?;
 
     Ok(format!("Applied {}.", preset.result_summary()))
 }
@@ -11771,6 +12235,23 @@ trait ProviderKeyVerifier {
 
 struct LiveProviderKeyVerifier;
 
+#[cfg(test)]
+fn provider_verification_error_category(reason: &str) -> crate::error_taxonomy::ErrorCategory {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("http 401") || lower.contains("status 401") {
+        crate::error_taxonomy::ErrorCategory::Authentication
+    } else if lower.contains("http 403") || lower.contains("status 403") {
+        crate::error_taxonomy::ErrorCategory::Authorization
+    } else if ["500", "502", "503", "504"]
+        .iter()
+        .any(|status| lower.contains(&format!("http {status}")))
+    {
+        crate::error_taxonomy::ErrorCategory::Network
+    } else {
+        crate::error_taxonomy::classify_error_message(reason)
+    }
+}
+
 impl ProviderKeyVerifier for LiveProviderKeyVerifier {
     fn verify<'a>(
         &'a self,
@@ -11814,6 +12295,7 @@ async fn apply_provider_picker_api_key_with_verifier(
                     runtime_status,
                     api_key,
                 )
+                .map(|picker| picker.with_provider_health(&app.provider_health))
             {
                 app.view_stack.push(picker);
                 app.status_message = Some(format!(
@@ -11841,6 +12323,7 @@ async fn apply_provider_picker_api_key_with_verifier(
                     runtime_status,
                     reason,
                 )
+                .map(|picker| picker.with_provider_health(&app.provider_health))
             {
                 app.view_stack.push(picker);
                 app.status_message = Some(format!(
@@ -12238,6 +12721,7 @@ fn restore_loaded_session_provider(app: &mut App, config: &mut Config, model_pro
 
     app.api_provider = provider;
     config.provider = Some(provider.as_str().to_string());
+    app.billing_presentation = crate::route_billing::for_route(config, provider);
     app.max_subagents = config
         .max_subagents_for_provider(provider)
         .clamp(1, crate::config::MAX_SUBAGENTS);
@@ -13003,6 +13487,15 @@ fn status_animation_interval_ms(app: &App) -> u64 {
     }
 }
 
+fn animation_interval_ms(app: &App, status_motion: bool, underwater_motion: bool) -> u64 {
+    match (status_motion, underwater_motion) {
+        (true, true) => status_animation_interval_ms(app).min(UI_UNDERWATER_ANIMATION_MS),
+        (true, false) => status_animation_interval_ms(app),
+        (false, true) => UI_UNDERWATER_ANIMATION_MS,
+        (false, false) => UI_UNDERWATER_ANIMATION_MS,
+    }
+}
+
 fn active_poll_ms(app: &App) -> u64 {
     if app.low_motion {
         96
@@ -13438,6 +13931,34 @@ mod provider_key_validation_tests {
             }),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn provider_key_check_classifies_transport_failures_truthfully() {
+        assert_eq!(
+            provider_verification_error_category("connection refused"),
+            crate::error_taxonomy::ErrorCategory::Network
+        );
+        assert_eq!(
+            provider_verification_error_category("request timed out"),
+            crate::error_taxonomy::ErrorCategory::Timeout
+        );
+        assert_eq!(
+            provider_verification_error_category("HTTP 429 rate limit"),
+            crate::error_taxonomy::ErrorCategory::RateLimit
+        );
+        assert_eq!(
+            provider_verification_error_category("HTTP 401 unauthorized"),
+            crate::error_taxonomy::ErrorCategory::Authentication
+        );
+        assert_eq!(
+            provider_verification_error_category("HTTP 403 forbidden"),
+            crate::error_taxonomy::ErrorCategory::Authorization
+        );
+        assert_eq!(
+            provider_verification_error_category("HTTP 500 upstream failure"),
+            crate::error_taxonomy::ErrorCategory::Network
+        );
     }
 
     #[tokio::test]

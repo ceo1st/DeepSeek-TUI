@@ -24,7 +24,7 @@ use codewhale_config::{
     FleetRole, FleetSlot,
 };
 
-use super::profile::{AgentProfile, load_workspace_agent_profiles};
+use super::profile::{AgentProfile, load_workspace_agent_profiles_tolerant};
 
 /// Which layer a roster member came from. Higher layers override lower ones
 /// by id (Workspace > Config > BuiltIn).
@@ -86,8 +86,14 @@ impl FleetRoster {
             merge_member(&mut built_ins, &mut extras, member);
         }
 
-        match load_workspace_agent_profiles(workspace) {
-            Ok(profiles) => {
+        match load_workspace_agent_profiles_tolerant(workspace) {
+            Ok((profiles, issues)) => {
+                for issue in issues {
+                    tracing::warn!(
+                        workspace = %workspace.display(),
+                        "fleet roster: skipping invalid workspace agent profile: {issue}"
+                    );
+                }
                 for member in profiles {
                     merge_member(&mut built_ins, &mut extras, member);
                 }
@@ -432,6 +438,33 @@ mod tests {
         assert_eq!(
             roster.members().len(),
             FleetRoster::built_in_members().len() + 1
+        );
+    }
+
+    #[test]
+    fn invalid_legacy_profile_does_not_hide_valid_scout_neighbor() {
+        let tmp = TempDir::new().unwrap();
+        write_workspace_profile(
+            tmp.path(),
+            "reviewer.toml",
+            "id = \"reviewer\"\nmodel_class_hint = \"heavy\"\n",
+        );
+        write_workspace_profile(
+            tmp.path(),
+            "scout.toml",
+            "id = \"scout\"\nrole_hint = \"scout\"\nprovider = \"deepseek\"\nmodel = \"deepseek-v4-flash\"\n",
+        );
+
+        let roster = FleetRoster::load(&FleetConfigToml::default(), tmp.path());
+
+        let scout = roster.get("scout").expect("valid scout remains visible");
+        assert_eq!(scout.origin, ProfileOrigin::Workspace);
+        assert_eq!(scout.profile.provider.as_deref(), Some("deepseek"));
+        assert_eq!(scout.profile.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            roster.get("reviewer").unwrap().origin,
+            ProfileOrigin::BuiltIn,
+            "invalid legacy override must fall back to the safe built-in"
         );
     }
 

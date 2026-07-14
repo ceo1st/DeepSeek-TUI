@@ -51,8 +51,8 @@ const SYSTEM_LAYER_MARKERS: &[(&str, &str, PromptLayerKind)] = &[
     ("Environment", "## Environment", PromptLayerKind::Static),
     ("Skills", "## Skills", PromptLayerKind::Static),
     (
-        "Context management",
-        "## Context Management",
+        "Core execution",
+        "## Core Execution",
         PromptLayerKind::Static,
     ),
     ("Compact template", "## Compact", PromptLayerKind::Static),
@@ -915,7 +915,7 @@ mod tests {
     fn inspector_text_prompt_shows_layer_map() {
         let mut app = test_app();
         app.system_prompt = Some(SystemPrompt::Text(
-            "You are CodeWhale.\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Context Management\nKeep compact\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
+            "You are CodeWhale.\n\n<project_instructions source=\"AGENTS.md\">\nRules\n</project_instructions>\n\n## Project Context Pack\n{}\n\n## Environment\n- lang: en\n\n## Skills\n- rust\n\n## Core Execution\nInspect, edit, verify.\n\n## Compact\nTemplate\n\n## Repo Working Set\nsrc/".to_string(),
         ));
 
         let text = build_context_inspector_text(&app, Locale::En);
@@ -926,7 +926,7 @@ mod tests {
         assert!(text.contains("Project context pack"));
         assert!(text.contains("Environment"));
         assert!(text.contains("Skills"));
-        assert!(text.contains("Context management"));
+        assert!(text.contains("Core execution"));
         assert!(text.contains("Compact template"));
         assert!(text.contains("Volatile working set"));
         assert!(text.contains("changes by session/turn"));

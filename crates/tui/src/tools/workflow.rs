@@ -457,7 +457,7 @@ impl ToolSpec for WorkflowTool {
                 "token_budget": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional shared Workflow budget hint and default child token budget ceiling."
+                    "description": "Optional shared Workflow admission hint. Usage is reconciled when children report completion; already-running parallel children can take aggregate spent past the hint, while later and descendant spawns are rejected once exhausted."
                 },
                 "wait": {
                     "type": "boolean",
@@ -3603,6 +3603,11 @@ export default workflow({
 
         assert!(registry.contains("workflow"));
         assert!(registry.contains("agent"));
+        assert!(registry.contains("agents/list"));
+        assert!(registry.contains("agents/message"));
+        assert!(registry.contains("agents/followup"));
+        assert!(registry.contains("agents/interrupt"));
+        assert!(registry.contains("agents/wait"));
         assert!(
             registry
                 .to_api_tools()

@@ -138,7 +138,9 @@ fn permission_summary(app: &App) -> String {
     };
     format!(
         "{trust}, approvals {}, {shell}",
-        app.approval_mode.label().to_ascii_lowercase()
+        app.approval_mode
+            .permission_chip_label()
+            .to_ascii_lowercase()
     )
 }
 

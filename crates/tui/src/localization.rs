@@ -893,6 +893,9 @@ pub enum MessageId {
     PhaseIdle,
     PhaseDraft,
     PhaseWorking,
+    /// Metered verification pass (tests/checks) — distinct from `working`
+    /// so checking reads differently from searching (ocean state model).
+    PhaseVerifying,
     PhaseWaitingOnYou,
     PhaseDone,
     PhaseFailed,
@@ -970,6 +973,12 @@ pub enum MessageId {
     FleetRosterOperatorFirst,
     FleetRosterOperatorRow,
     FleetReadyNotice,
+    /// Sticky error when Fleet profile save cannot prove collision safety.
+    FleetProfileIdentityVerifyFailed,
+    /// Sticky error when the drafted profile id collides with another file.
+    FleetProfileIdConflict,
+    /// Sticky error when the drafted profile pins an unconfigured provider.
+    FleetProfileProviderUnconfigured,
     // Workflow panel.
     WorkflowStatusWaiting,
     WorkflowDebrief,
@@ -979,6 +988,10 @@ pub enum MessageId {
     SidebarOpenControl,
     SidebarStopControl,
     SidebarDestructiveArmed,
+    /// Row-local Stop confirm label once armed (TUI-DOG-006).
+    WorkSurfaceStopConfirmControl,
+    /// Transient label while a confirmed Stop is in flight.
+    WorkSurfaceStoppingControl,
     // Composer slash menu.
     ComposerSlashMenuHint,
     // Approval modal — repository law band.
@@ -1768,6 +1781,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::PhaseIdle,
     MessageId::PhaseDraft,
     MessageId::PhaseWorking,
+    MessageId::PhaseVerifying,
     MessageId::PhaseWaitingOnYou,
     MessageId::PhaseDone,
     MessageId::PhaseFailed,
@@ -1837,6 +1851,9 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::FleetRosterOperatorFirst,
     MessageId::FleetRosterOperatorRow,
     MessageId::FleetReadyNotice,
+    MessageId::FleetProfileIdentityVerifyFailed,
+    MessageId::FleetProfileIdConflict,
+    MessageId::FleetProfileProviderUnconfigured,
     MessageId::WorkflowStatusWaiting,
     MessageId::WorkflowDebrief,
     MessageId::SidebarTasksLabel,
@@ -1844,6 +1861,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SidebarOpenControl,
     MessageId::SidebarStopControl,
     MessageId::SidebarDestructiveArmed,
+    MessageId::WorkSurfaceStopConfirmControl,
+    MessageId::WorkSurfaceStoppingControl,
     MessageId::ComposerSlashMenuHint,
     MessageId::ApprovalRepoLawBadge,
     MessageId::ApprovalRepoLawTitle,

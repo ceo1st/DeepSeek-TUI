@@ -148,7 +148,7 @@ impl ShellTier {
     }
 
     #[must_use]
-    fn for_chrome_width(width: u16) -> Self {
+    pub fn for_chrome_width(width: u16) -> Self {
         if width < 60 {
             Self::Compact
         } else if width < 110 {
@@ -166,6 +166,10 @@ pub enum ShellPhase {
     Idle,
     Typing,
     Working,
+    /// A live verification pass (tests/checks/lints). Same clock family as
+    /// `Working` but rendered as the metered braille tick — checking, not
+    /// searching (ocean state model).
+    Verifying,
     Waiting,
     Approval,
     Done,
@@ -211,6 +215,9 @@ impl ShellPhase {
                 .as_ref()
                 .is_some_and(|active| !active.is_empty())
         {
+            if verification_run_active(app) {
+                return Self::Verifying;
+            }
             return Self::Working;
         }
         if matches!(app.runtime_turn_status.as_deref(), Some("completed")) {
@@ -228,6 +235,7 @@ impl ShellPhase {
             Self::Idle => tr(locale, MessageId::PhaseIdle),
             Self::Typing => tr(locale, MessageId::PhaseDraft),
             Self::Working => tr(locale, MessageId::PhaseWorking),
+            Self::Verifying => tr(locale, MessageId::PhaseVerifying),
             Self::Waiting | Self::Approval => tr(locale, MessageId::PhaseWaitingOnYou),
             Self::Done => tr(locale, MessageId::PhaseDone),
             Self::Failed => tr(locale, MessageId::PhaseFailed),
@@ -240,9 +248,55 @@ impl ShellPhase {
             Self::Idle => app.ui_theme.text_muted,
             Self::Done => app.ui_theme.success,
             Self::Typing => app.ui_theme.accent_primary,
-            Self::Working => app.ui_theme.status_working,
-            Self::Waiting | Self::Approval | Self::Failed => app.ui_theme.error_fg,
+            // Verifying shares the live seafoam hue; the tick-vs-bubble
+            // marker carries the checking/searching distinction.
+            Self::Working | Self::Verifying => app.ui_theme.status_working,
+            Self::Waiting | Self::Approval => app.ui_theme.accent_action,
+            Self::Failed => app.ui_theme.error_fg,
         }
+    }
+}
+
+/// True when the live active cell is running a verification-shaped tool:
+/// the verifier tool itself or an exec whose program is a known test/check
+/// runner. Conservative by design — misclassifying real work as `verifying`
+/// would lie; plain `working` never does.
+fn verification_run_active(app: &App) -> bool {
+    use crate::tui::history::{HistoryCell, ToolCell, ToolStatus};
+    let Some(active) = app.active_cell.as_ref() else {
+        return false;
+    };
+    active.entries().iter().any(|cell| {
+        let HistoryCell::Tool(tool) = cell else {
+            return false;
+        };
+        match tool {
+            ToolCell::Exec(exec) if exec.status == ToolStatus::Running => {
+                exec_is_verification(&exec.command)
+            }
+            ToolCell::Generic(generic) if generic.status == ToolStatus::Running => {
+                let name = generic.name.to_ascii_lowercase();
+                name.contains("verif") || name == "read_lints"
+            }
+            _ => false,
+        }
+    })
+}
+
+fn exec_is_verification(command: &str) -> bool {
+    let trimmed = command.trim_start();
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens.next().unwrap_or("");
+    let second = tokens.next().unwrap_or("");
+    match first {
+        "cargo" => matches!(second, "test" | "check" | "clippy" | "nextest"),
+        "go" => matches!(second, "test" | "vet"),
+        "npm" | "pnpm" | "yarn" | "bun" => matches!(second, "test" | "lint" | "check"),
+        "make" => matches!(second, "test" | "check" | "lint"),
+        "python" | "python3" => trimmed.contains("-m pytest") || trimmed.contains("-m unittest"),
+        "pytest" | "jest" | "vitest" | "tsc" | "eslint" | "ruff" | "mypy" | "clippy-driver"
+        | "golangci-lint" | "shellcheck" => true,
+        _ => false,
     }
 }
 
@@ -255,7 +309,7 @@ fn completion_elapsed_ms(app: &App) -> Option<u128> {
         .filter(|elapsed| *elapsed < COMPLETION_BREATH_MS)
 }
 
-fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, Cow<'static, str>) {
+pub(crate) fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, Cow<'static, str>) {
     let locale = app.ui_locale;
     match phase {
         ShellPhase::Idle => ("·", phase.label(locale)),
@@ -271,6 +325,15 @@ fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, Cow<'static, str
                 let index = (elapsed.as_millis() / 300) as usize % WORKING_BUBBLE_FRAMES.len();
                 WORKING_BUBBLE_FRAMES[index]
             };
+            (frame, phase.label(locale))
+        }
+        ShellPhase::Verifying => {
+            // Metered braille tick on the shared live clock — checking, not
+            // searching. Reduced motion holds the legible mid frame.
+            let frame = crate::tui::spinner::verification_tick_frame(
+                app.turn_started_at,
+                app.low_motion || !app.fancy_animations,
+            );
             (frame, phase.label(locale))
         }
         ShellPhase::Waiting | ShellPhase::Approval => ("◆", phase.label(locale)),
@@ -370,7 +433,7 @@ pub fn render_launch_screen(area: Rect, buf: &mut Buffer, app: &App) {
         .style(Style::default().bg(app.ui_theme.surface_bg))
         .render(area, buf);
     let width = usize::from(area.width);
-    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let version = format!("v{}", env!("DEEPSEEK_BUILD_VERSION"));
     let workspace_budget = width.saturating_sub(version.width() + 6);
     let workspace = truncate_to_width(
         &crate::utils::display_path(&app.workspace),
@@ -521,6 +584,25 @@ pub fn render_launch_screen(area: Rect, buf: &mut Buffer, app: &App) {
     );
 }
 
+/// Record the launch row rects immediately after the launch frame is painted.
+/// The coordinates mirror the renderer's responsive row placement exactly.
+pub fn record_launch_row_areas(area: Rect, launch: &mut crate::tui::app::LaunchState) {
+    launch.row_areas.clear();
+    let rows_start = if area.height >= 16 { 4 } else { 3 };
+    for index in 0..LAUNCH_ROWS.len() {
+        let y = rows_start + u16::try_from(index).unwrap_or(0);
+        if y >= area.height.saturating_sub(3) {
+            break;
+        }
+        launch.row_areas.push(Rect {
+            x: area.x,
+            y: area.y.saturating_add(y),
+            width: area.width,
+            height: 1,
+        });
+    }
+}
+
 fn compact_tokens(tokens: i64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -542,6 +624,8 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         .style(Style::default().bg(app.ui_theme.header_bg))
         .render(area, buf);
 
+    let (effective_provider, effective_model) = app.effective_route_display();
+    let route_label = format!("{} · {effective_model}", effective_provider.display_name());
     let mut left = vec![
         Span::styled(
             "cw",
@@ -550,10 +634,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(
-            app.model_display_label(),
-            Style::default().fg(app.ui_theme.text_muted),
-        ),
+        Span::styled(route_label, Style::default().fg(app.ui_theme.text_muted)),
         Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
         Span::styled(
             mode_label(app.ui_locale, app.mode),
@@ -565,6 +646,26 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         ),
     ];
     if tier != ShellTier::Compact {
+        // The Underwater shell owns its header rather than delegating to the
+        // classic renderer, so render the selected status mark here too.
+        // "cw" is already the leading brand mark; the other choices deserve
+        // their visible indicator beside it.
+        if let Some(indicator) = crate::tui::widgets::header_status_indicator_frame(
+            (!app.low_motion && app.fancy_animations)
+                .then_some(app.turn_started_at)
+                .flatten(),
+            &app.status_indicator,
+        )
+        .filter(|indicator| *indicator != "cw")
+        {
+            left.push(Span::raw(" "));
+            left.push(Span::styled(
+                indicator,
+                Style::default()
+                    .fg(app.ui_theme.info)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         left.push(Span::styled(
             " · ",
             Style::default().fg(app.ui_theme.text_dim),
@@ -575,19 +676,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         ));
     }
 
-    let running_agents = crate::tui::subagent_routing::running_agent_count(app);
     let mut right = Vec::new();
-    if tier == ShellTier::Wide && running_agents > 0 {
-        right.push(Span::styled(
-            tr(app.ui_locale, MessageId::HeaderAgentsChip)
-                .replace("{count}", &running_agents.to_string()),
-            Style::default().fg(app.ui_theme.text_muted),
-        ));
-        right.push(Span::styled(
-            " · ",
-            Style::default().fg(app.ui_theme.text_dim),
-        ));
-    }
     if tier != ShellTier::Compact
         && let Some((used, max, percent)) = crate::tui::ui::context_usage_snapshot(app)
     {
@@ -609,7 +698,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
             right.push(Span::raw("  "));
         }
         right.push(Span::styled(
-            format!("v{}", env!("CARGO_PKG_VERSION")),
+            format!("v{}", env!("DEEPSEEK_BUILD_VERSION")),
             Style::default().fg(app.ui_theme.text_hint),
         ));
     }
@@ -657,86 +746,13 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     }
 }
 
-/// Render the fixed one-line footer. It owns phase, cost, and the keys that
-/// open detail; route, permission, repository, MCP, and context do not repeat.
+/// Render the fixed one-line phase band.
 ///
-/// Transient notices come from the app's toast system, never the legacy
-/// `status_message` sink: informational acknowledgements carry a TTL and
-/// expire on their own, warnings and errors hold as sticky toasts until
-/// resolved, and a notice from one view can no longer outlive its moment
-/// and read as permanent idle chrome.
+/// Ocean placement (above vs below the composer) is owned by
+/// [`crate::tui::phase_strip`]; this entry point only paints the band so
+/// classic callers and tests keep a stable name.
 pub fn render_footer(area: Rect, buf: &mut Buffer, app: &mut App) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let status_toast = app.active_status_toast();
-    let phase = ShellPhase::from_app(app);
-    let tier = ShellTier::for_chrome_width(area.width);
-    Block::default()
-        .style(Style::default().bg(app.ui_theme.footer_bg))
-        .render(area, buf);
-
-    let (marker, phase_label) = phase_marker(app, phase);
-    let phase_style = Style::default().fg(phase.color(app)).add_modifier(
-        if matches!(phase, ShellPhase::Waiting | ShellPhase::Approval) {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        },
-    );
-    let mut left = vec![
-        Span::styled(marker, phase_style),
-        Span::raw(" "),
-        Span::styled(phase_label.clone(), phase_style),
-    ];
-    if tier != ShellTier::Compact
-        && phase != ShellPhase::Done
-        && let Some(toast) = status_toast.filter(|toast| {
-            !toast.text.trim().is_empty() && toast.text.trim() != phase_label.as_ref()
-        })
-    {
-        left.push(Span::styled(
-            " · ",
-            Style::default().fg(app.ui_theme.text_dim),
-        ));
-        left.push(Span::styled(
-            truncate_to_width(toast.text.trim(), 40),
-            Style::default().fg(crate::tui::ui::status_color(toast.level)),
-        ));
-    }
-    let cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    if cost > 0.000_001 && tier != ShellTier::Compact {
-        left.push(Span::styled(
-            " · ",
-            Style::default().fg(app.ui_theme.text_dim),
-        ));
-        left.push(Span::styled(
-            app.format_cost_amount(cost),
-            Style::default().fg(app.ui_theme.text_muted),
-        ));
-    }
-
-    let hint_keys = tr(app.ui_locale, MessageId::FooterHintKeys);
-    let hint_output = tr(app.ui_locale, MessageId::FooterHintOutput);
-    let hint_context = tr(app.ui_locale, MessageId::FooterHintContext);
-    let right_text = match tier {
-        ShellTier::Compact => format!("Alt+?:{hint_keys}"),
-        ShellTier::Normal => format!("v:{hint_output} · Alt+?:{hint_keys}"),
-        ShellTier::Wide => {
-            format!("v:{hint_output} · Alt+C:{hint_context} · Alt+?:{hint_keys}")
-        }
-    };
-    let right_width = right_text.width();
-    let available = usize::from(area.width);
-    let left_width = span_width(&left);
-    if left_width + right_width < available {
-        left.push(Span::raw(" ".repeat(available - left_width - right_width)));
-        left.push(Span::styled(
-            right_text,
-            Style::default().fg(app.ui_theme.text_hint),
-        ));
-    }
-    Paragraph::new(Line::from(left)).render(area, buf);
+    crate::tui::phase_strip::render(area, buf, app);
 }
 
 /// Build the post-launch idle composition. It is deliberately not a command
@@ -750,17 +766,33 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(""); usize::from(area.height / 4)];
     if tier != ShellTier::Compact && area.height >= 14 && area.width >= 28 {
         let mark = [
-            "   ˚",
-            " ▗▄▄▄▄▄▄▄▄▄▄▄▄▄▖    ▚▞",
-            "▐██·████████████▙▄▄▄▞",
-            " ▝▀▀▀▀▀▀▀▀▀▀▀▀▀▘",
+            vec![Span::styled(
+                "   ˚",
+                Style::default().fg(app.ui_theme.accent_secondary),
+            )],
+            vec![Span::styled(
+                " ▗▄▄▄▄▄▄▄▄▄▄▄▄▄▖    ▚▞",
+                Style::default().fg(app.ui_theme.accent_primary),
+            )],
+            vec![
+                Span::styled("▐██", Style::default().fg(app.ui_theme.accent_primary)),
+                Span::styled("·", Style::default().fg(app.ui_theme.text_body)),
+                Span::styled(
+                    "████████████▙▄▄▄▞",
+                    Style::default().fg(app.ui_theme.accent_primary),
+                ),
+            ],
+            vec![Span::styled(
+                " ▝▀▀▀▀▀▀▀▀▀▀▀▀▀▘",
+                Style::default().fg(app.ui_theme.accent_primary),
+            )],
         ];
         for row in mark {
-            let inset = " ".repeat(width.saturating_sub(row.width()) / 2);
-            lines.push(Line::from(Span::styled(
-                format!("{inset}{row}"),
-                Style::default().fg(app.ui_theme.accent_primary),
-            )));
+            let row_width = span_width(&row);
+            let inset = " ".repeat(width.saturating_sub(row_width) / 2);
+            let mut spans = vec![Span::raw(inset)];
+            spans.extend(row);
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(""));
     }
@@ -853,7 +885,21 @@ mod tests {
             status: None,
             workspace_session_count: 2,
             worktree_available: true,
+            row_areas: Vec::new(),
         }
+    }
+
+    #[test]
+    fn launch_row_hitboxes_follow_responsive_render_rows() {
+        let mut launch = launch();
+        record_launch_row_areas(Rect::new(3, 2, 80, 24), &mut launch);
+        assert_eq!(launch.row_areas.len(), 5);
+        assert_eq!(launch.row_areas[0], Rect::new(3, 6, 80, 1));
+        assert_eq!(launch.row_areas[4], Rect::new(3, 10, 80, 1));
+
+        record_launch_row_areas(Rect::new(3, 2, 40, 10), &mut launch);
+        assert_eq!(launch.row_areas.len(), 4);
+        assert_eq!(launch.row_areas[0], Rect::new(3, 5, 40, 1));
     }
 
     fn footer_text(app: &mut App) -> String {
@@ -1023,6 +1069,73 @@ mod tests {
         let (marker, label) = phase_marker(&app, ShellPhase::from_app(&app));
         assert_eq!(marker, "✕");
         assert_eq!(label, "failed");
+    }
+
+    #[test]
+    fn verifying_phase_meters_a_tick_for_test_runs_only() {
+        use crate::tui::active_cell::ActiveCell;
+        use crate::tui::history::{ExecCell, ExecSource, HistoryCell, ToolCell, ToolStatus};
+
+        let running_exec = |command: &str| {
+            HistoryCell::Tool(ToolCell::Exec(ExecCell {
+                command: command.to_string(),
+                status: ToolStatus::Running,
+                output: None,
+                live_output: None,
+                shell_task_id: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
+                started_at: None,
+                duration_ms: None,
+                source: ExecSource::Assistant,
+                interaction: None,
+                output_summary: None,
+            }))
+        };
+
+        let mut app = test_app();
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.turn_started_at = Some(Instant::now() - Duration::from_secs(3));
+
+        // A live test run reads as `verifying` with the metered tick.
+        let mut active = ActiveCell::new();
+        active.push_tool("exec-1", running_exec("cargo test -p codewhale-tui"));
+        app.active_cell = Some(active);
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Verifying);
+        app.low_motion = true;
+        let (marker, label) = phase_marker(&app, ShellPhase::Verifying);
+        assert_eq!(marker, crate::tui::spinner::VERIFY_TICK_FRAMES[4]);
+        assert_eq!(label, "verifying");
+        app.low_motion = false;
+
+        // An ordinary build stays `working` — checking must not lie.
+        let mut active = ActiveCell::new();
+        active.push_tool("exec-2", running_exec("cargo build --release"));
+        app.active_cell = Some(active);
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Working);
+
+        // Verifying is a live phase: strip sits above the composer and
+        // shares the live seafoam hue.
+        assert!(
+            crate::tui::phase_strip::PhaseStripPlacement::for_phase(ShellPhase::Verifying)
+                .is_above_composer()
+        );
+        assert_eq!(
+            ShellPhase::Verifying.color(&app),
+            app.ui_theme.status_working
+        );
+    }
+
+    #[test]
+    fn attention_and_failure_keep_distinct_semantic_hues() {
+        let app = test_app();
+        assert_eq!(ShellPhase::Waiting.color(&app), app.ui_theme.accent_action);
+        assert_eq!(ShellPhase::Approval.color(&app), app.ui_theme.accent_action);
+        assert_eq!(ShellPhase::Failed.color(&app), app.ui_theme.error_fg);
+        assert_ne!(
+            ShellPhase::Waiting.color(&app),
+            ShellPhase::Failed.color(&app)
+        );
     }
 
     #[test]

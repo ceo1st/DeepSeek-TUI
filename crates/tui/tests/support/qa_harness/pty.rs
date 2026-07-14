@@ -165,6 +165,17 @@ impl PtySession {
         Ok(())
     }
 
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("pty resize")
+    }
+
     /// Drain any bytes the reader thread has pushed into the buffer. Returns
     /// the bytes read this call. Non-blocking — returns immediately even if
     /// the buffer is empty.

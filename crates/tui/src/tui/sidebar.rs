@@ -9,7 +9,7 @@ use std::fmt::Write;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::localization::{Locale, MessageId, tr};
+use crate::localization::Locale;
 use crate::tui::app::HuntVerdict;
 
 use ratatui::{
@@ -20,7 +20,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthStr;
 
 use crate::deepseek_theme::Theme;
 use crate::palette;
@@ -108,398 +107,6 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App, config: &Config)
     if let Some(hotbar_area) = hotbar_area {
         render_hotbar_panel(f, hotbar_area, app, config);
     }
-}
-
-/// Height of the transcript-top Tasks / To-do strip from the underwater TUI
-/// action spec. It collapses completely when neither durable background work
-/// nor current work state exists, preserving the full launch water field.
-pub(crate) fn top_work_strip_height(app: &mut App, _width: u16, terminal_height: u16) -> u16 {
-    let has_tasks = app
-        .task_panel
-        .iter()
-        .any(|task| task.kind == TaskPanelEntryKind::Background);
-    let has_todo = sidebar_work_summary(app).has_useful_content();
-    match (has_tasks, has_todo, terminal_height) {
-        (false, false, _) => 0,
-        (true, true, 0..=12) => 3,
-        (true, true, 13..=16) => 5,
-        (true, true, _) => 7,
-        (_, _, 0..=12) => 3,
-        _ => 4,
-    }
-}
-
-/// Render durable Tasks and the current To-do above the transcript. This is a
-/// compact proof strip; dense telemetry remains in the inspectors.
-pub(crate) fn render_top_work_strip(f: &mut Frame, area: Rect, app: &mut App) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    Block::default()
-        .style(Style::default().bg(app.ui_theme.surface_bg))
-        .render(area, f.buffer_mut());
-
-    let summary = sidebar_work_summary(app);
-    let has_tasks = app
-        .task_panel
-        .iter()
-        .any(|task| task.kind == TaskPanelEntryKind::Background);
-    let has_todo = summary.has_useful_content();
-    if has_tasks && has_todo && area.height <= 3 {
-        render_compact_top_work_strip(f, area, &summary, app);
-        render_top_strip_rule(f, area, app);
-        return;
-    }
-    if has_tasks && !has_todo {
-        render_top_tasks(
-            f,
-            Rect {
-                height: area.height.saturating_sub(1),
-                ..area
-            },
-            app,
-        );
-        render_top_strip_rule(f, area, app);
-        return;
-    }
-    if has_todo && !has_tasks {
-        render_top_todo(
-            f,
-            Rect {
-                height: area.height.saturating_sub(1),
-                ..area
-            },
-            &summary,
-            app,
-        );
-        render_top_strip_rule(f, area, app);
-        return;
-    }
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3)])
-        .split(Rect {
-            height: area.height.saturating_sub(1),
-            ..area
-        });
-
-    render_top_tasks(f, sections[0], app);
-    render_top_todo(f, sections[1], &summary, app);
-
-    render_top_strip_rule(f, area, app);
-}
-
-fn render_compact_top_work_strip(
-    f: &mut Frame,
-    area: Rect,
-    summary: &SidebarWorkSummary,
-    app: &mut App,
-) {
-    let task = app
-        .task_panel
-        .iter()
-        .find(|task| task.kind == TaskPanelEntryKind::Background);
-    let todo = summary
-        .checklist_items
-        .iter()
-        .find(|item| item.status == TodoStatus::InProgress)
-        .or_else(|| {
-            summary
-                .checklist_items
-                .iter()
-                .find(|item| item.status == TodoStatus::Pending)
-        });
-    let mut lines = Vec::new();
-    let mut hover_rows = Vec::new();
-    let mut full_lines = Vec::new();
-
-    if let Some(task) = task {
-        let stoppable = matches!(
-            task.status.as_str(),
-            "running" | "queued" | "waiting" | "needs_user"
-        );
-        let open_word = tr(app.ui_locale, MessageId::SidebarOpenControl);
-        let stop_word = tr(app.ui_locale, MessageId::SidebarStopControl);
-        let controls = if stoppable {
-            format!(" {open_word} {stop_word}")
-        } else {
-            format!(" {open_word}")
-        };
-        let prefix = format!(
-            "{} {} · ",
-            tr(app.ui_locale, MessageId::SidebarTasksLabel),
-            app.task_panel.len()
-        );
-        let label_width = usize::from(area.width)
-            .saturating_sub(
-                UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(controls.as_str()),
-            )
-            .max(1);
-        let label = truncate_line_to_width(&task.prompt_summary, label_width);
-        let text = format!("{prefix}{label}{controls}");
-        lines.push(Line::from(Span::styled(
-            text.clone(),
-            Style::default().fg(app.ui_theme.text_body),
-        )));
-        let (show, stop) = background_task_click_actions(task);
-        let stop_width = UnicodeWidthStr::width(stop_word.as_ref());
-        let visible_width = UnicodeWidthStr::width(text.as_str()).min(area.width as usize);
-        let stop_action = stoppable.then_some(SidebarRowAction::PrefillCommand(stop));
-        let stop_zone_start_col = stop_action.as_ref().map(|_| {
-            area.x
-                .saturating_add(visible_width.saturating_sub(stop_width) as u16)
-        });
-        hover_rows.push(SidebarHoverRow {
-            row_y: area.y,
-            display_text: text,
-            full_text: task.prompt_summary.clone(),
-            detail: Some(format!("{} · {}", task.status, task.id)),
-            is_truncated: label != task.prompt_summary,
-            click_action: Some(SidebarRowAction::Command(show)),
-            stop_action,
-            stop_zone_start_col,
-            stop_zone_end_col: stop_zone_start_col
-                .map(|start| start.saturating_add(stop_width as u16)),
-        });
-        full_lines.push(task.prompt_summary.clone());
-    }
-    if let Some(item) = todo {
-        let completed = summary
-            .checklist_items
-            .iter()
-            .filter(|candidate| candidate.status == TodoStatus::Completed)
-            .count();
-        let prefix = format!(
-            "{} {completed}/{} · ",
-            tr(app.ui_locale, MessageId::SidebarTodoLabel),
-            summary.checklist_items.len()
-        );
-        let label = truncate_line_to_width(
-            &item.content,
-            usize::from(area.width)
-                .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
-                .max(1),
-        );
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{label}"),
-            Style::default().fg(app.ui_theme.accent_primary),
-        )));
-        full_lines.push(item.content.clone());
-    }
-    Paragraph::new(lines).render(
-        Rect {
-            height: area.height.saturating_sub(1),
-            ..area
-        },
-        f.buffer_mut(),
-    );
-    app.sidebar_hover.sections.push(SidebarHoverSection {
-        content_area: area,
-        lines: full_lines,
-        rows: hover_rows,
-    });
-}
-
-fn render_top_strip_rule(f: &mut Frame, area: Rect, app: &App) {
-    let rule_y = area.bottom().saturating_sub(1);
-    for x in area.left()..area.right() {
-        f.buffer_mut()[(x, rule_y)]
-            .set_symbol("─")
-            .set_fg(app.ui_theme.border)
-            .set_bg(app.ui_theme.surface_bg);
-    }
-}
-
-fn render_top_tasks(f: &mut Frame, area: Rect, app: &mut App) {
-    let tasks = app
-        .task_panel
-        .iter()
-        .filter(|task| task.kind == TaskPanelEntryKind::Background)
-        .collect::<Vec<_>>();
-    let waiting_for_user = tasks
-        .iter()
-        .any(|task| matches!(task.status.as_str(), "waiting" | "needs_user"));
-    let width = usize::from(area.width.saturating_sub(2)).max(1);
-    let tasks_label = tr(app.ui_locale, MessageId::SidebarTasksLabel);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("▾ {tasks_label}"),
-            Style::default().fg(app.ui_theme.accent_primary).bold(),
-        ),
-        Span::styled(
-            format!(" {}", tasks.len()),
-            Style::default().fg(app.ui_theme.text_muted),
-        ),
-    ])];
-    let mut hover_rows = Vec::new();
-    let mut hover_lines = vec![tasks_label.into_owned()];
-    for (visible_index, task) in tasks.into_iter().take(2).enumerate() {
-        let (mark, mark_color, label_color) = match task.status.as_str() {
-            "waiting" | "needs_user" => ("◆", app.ui_theme.error_fg, app.ui_theme.error_fg),
-            "running" => (
-                background_task_spinner_prefix(task, app.low_motion || waiting_for_user)
-                    .unwrap_or("›"),
-                if waiting_for_user {
-                    app.ui_theme.text_dim
-                } else {
-                    app.ui_theme.status_working
-                },
-                if waiting_for_user {
-                    app.ui_theme.text_dim
-                } else {
-                    app.ui_theme.text_body
-                },
-            ),
-            "queued" => ("☐", app.ui_theme.text_muted, app.ui_theme.text_muted),
-            "completed" | "success" => ("✓", app.ui_theme.success, app.ui_theme.text_muted),
-            "failed" => ("✕", app.ui_theme.error_fg, app.ui_theme.text_body),
-            "canceled" => ("✕", app.ui_theme.text_dim, app.ui_theme.text_dim),
-            _ => ("·", app.ui_theme.text_muted, app.ui_theme.text_muted),
-        };
-        let duration = task.duration_ms.map(format_duration_ms).unwrap_or_default();
-        let duration_width = UnicodeWidthStr::width(duration.as_str());
-        let stoppable = matches!(task.status.as_str(), "running" | "waiting" | "needs_user");
-        let open_word = tr(app.ui_locale, MessageId::SidebarOpenControl);
-        let stop_word = tr(app.ui_locale, MessageId::SidebarStopControl);
-        let controls = if area.width < 60 && stoppable {
-            format!(" {open_word} {stop_word}")
-        } else if area.width < 60 {
-            format!(" {open_word}")
-        } else if stoppable {
-            format!(" [↗ {open_word}] [× {stop_word}]")
-        } else {
-            format!(" [↗ {open_word}]")
-        };
-        let controls_width = UnicodeWidthStr::width(controls.as_str());
-        let summary_width = width
-            .saturating_sub(3 + UnicodeWidthStr::width(mark) + duration_width + controls_width + 2)
-            .max(1);
-        let summary = truncate_line_to_width(&task.prompt_summary, summary_width);
-        let used = 3 + UnicodeWidthStr::width(mark) + UnicodeWidthStr::width(summary.as_str());
-        let gap = if duration.is_empty() {
-            0
-        } else {
-            width
-                .saturating_sub(used + duration_width + controls_width)
-                .max(2)
-        };
-        let line = Line::from(vec![
-            Span::raw("  "),
-            Span::styled(mark, Style::default().fg(mark_color)),
-            Span::raw(" "),
-            Span::styled(summary, Style::default().fg(label_color)),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(duration, Style::default().fg(app.ui_theme.text_hint)),
-            Span::styled(controls, Style::default().fg(app.ui_theme.info)),
-        ]);
-        let display_text = spans_to_text(&line.spans);
-        let (show, stop) = background_task_click_actions(task);
-        let display_width = UnicodeWidthStr::width(display_text.as_str());
-        let stop_label = if area.width < 60 {
-            stop_word.clone().into_owned()
-        } else {
-            format!("[× {stop_word}]")
-        };
-        let stop_width = UnicodeWidthStr::width(stop_label.as_str());
-        let visible_width = display_width.min(area.width as usize);
-        let stop_action = stoppable.then_some(SidebarRowAction::PrefillCommand(stop));
-        let stop_zone_start_col = stop_action.as_ref().map(|_| {
-            area.x.saturating_add(
-                visible_width
-                    .saturating_sub(stop_width)
-                    .min(u16::MAX as usize) as u16,
-            )
-        });
-        let stop_zone_end_col =
-            stop_zone_start_col.map(|start| start.saturating_add(stop_width as u16));
-        hover_lines.push(task.prompt_summary.clone());
-        hover_rows.push(SidebarHoverRow {
-            row_y: area.y.saturating_add(1 + visible_index as u16),
-            display_text: display_text.clone(),
-            full_text: task.prompt_summary.clone(),
-            detail: Some(format!("{} · {}", task.status, task.id)),
-            is_truncated: display_text != task.prompt_summary,
-            click_action: Some(SidebarRowAction::Command(show)),
-            stop_action,
-            stop_zone_start_col,
-            stop_zone_end_col,
-        });
-        lines.push(line);
-    }
-    Paragraph::new(lines).render(area, f.buffer_mut());
-    app.sidebar_hover.sections.push(SidebarHoverSection {
-        content_area: area,
-        lines: hover_lines,
-        rows: hover_rows,
-    });
-}
-
-fn render_top_todo(f: &mut Frame, area: Rect, summary: &SidebarWorkSummary, app: &App) {
-    let total = summary.checklist_items.len();
-    let completed = summary
-        .checklist_items
-        .iter()
-        .filter(|item| item.status == TodoStatus::Completed)
-        .count();
-    let width = usize::from(area.width.saturating_sub(2)).max(1);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "▾ To-do",
-            Style::default().fg(app.ui_theme.accent_primary).bold(),
-        ),
-        Span::styled(
-            if total == 0 {
-                String::new()
-            } else {
-                format!(" {completed}/{total}")
-            },
-            Style::default().fg(app.ui_theme.text_muted),
-        ),
-    ])];
-
-    let active = summary
-        .checklist_items
-        .iter()
-        .find(|item| item.status == TodoStatus::InProgress)
-        .or_else(|| {
-            summary
-                .checklist_items
-                .iter()
-                .find(|item| item.status == TodoStatus::Pending)
-        });
-    if let Some(item) = active {
-        let mark = if item.status == TodoStatus::InProgress {
-            "▸"
-        } else {
-            "☐"
-        };
-        let color = if item.status == TodoStatus::InProgress {
-            app.ui_theme.accent_primary
-        } else {
-            app.ui_theme.text_muted
-        };
-        let label = truncate_line_to_width(&format!("  {mark} {}", item.content), width);
-        lines.push(Line::from(Span::styled(label, Style::default().fg(color))));
-
-        if let Some(next) = summary
-            .checklist_items
-            .iter()
-            .find(|candidate| candidate.id != item.id && candidate.status == TodoStatus::Pending)
-        {
-            let label = truncate_line_to_width(&format!("  ☐ {}", next.content), width);
-            lines.push(Line::from(Span::styled(
-                label,
-                Style::default().fg(app.ui_theme.text_muted),
-            )));
-        }
-    } else if let Some(goal) = summary.goal_objective.as_deref() {
-        let label = truncate_line_to_width(&format!("  ◆ {goal}"), width);
-        lines.push(Line::from(Span::styled(
-            label,
-            Style::default().fg(app.ui_theme.text_body),
-        )));
-    }
-    Paragraph::new(lines).render(area, f.buffer_mut());
 }
 
 fn split_sidebar_hotbar_area(area: Rect, show_hotbar: bool) -> (Rect, Option<Rect>) {
@@ -687,9 +294,16 @@ fn render_hotbar_panel(f: &mut Frame, area: Rect, app: &mut App, config: &Config
         &title,
         hotbar_panel_lines(&slots, content_width, &app.ui_theme),
         hotbar_panel_hover_texts(&slots),
-        Vec::new(),
+        hotbar_panel_row_actions(),
         app,
     );
+}
+
+fn hotbar_panel_row_actions() -> Vec<Option<SidebarRowAction>> {
+    (1..=codewhale_config::HOTBAR_SLOT_COUNT)
+        .step_by(HOTBAR_ROW_COLUMNS)
+        .map(|slot| Some(SidebarRowAction::HotbarSlot(slot)))
+        .collect()
 }
 
 fn hotbar_panel_enabled(app: &App, config: &Config) -> bool {
@@ -1787,13 +1401,12 @@ struct SidebarToolRow {
 /// Row sets shared by the Tasks panel line renderer and hover-text builder.
 ///
 /// Computed once per frame in `render_sidebar_tasks` (#3898): both consumers
-/// previously recomputed `active_tool_rows` / `reasoning_task_rows` /
-/// `background_task_rows` (a clone+sort of `app.task_panel`) independently,
+/// previously recomputed `active_tool_rows` / `background_task_rows` (a
+/// clone+sort of `app.task_panel`) independently,
 /// doubling the work and risking the two passes disagreeing across an
 /// `Instant::elapsed` TTL boundary within the same frame.
 struct TaskPanelRowSets {
     active: Vec<SidebarToolRow>,
-    reasoning: Vec<TaskPanelEntry>,
     background: Vec<TaskPanelEntry>,
     recent: Vec<SidebarToolRow>,
 }
@@ -1801,7 +1414,6 @@ struct TaskPanelRowSets {
 fn task_panel_row_sets(app: &App) -> TaskPanelRowSets {
     let explicit_tasks_focus = app.sidebar_focus == SidebarFocus::Tasks;
     let active = active_tool_rows(app);
-    let reasoning = reasoning_task_rows(app);
     // Auto/Pinned mode deliberately skips live-tool dedup (passes an empty
     // slice), matching the previous per-consumer call sites.
     let background = background_task_rows(app, if explicit_tasks_focus { &active } else { &[] });
@@ -1812,7 +1424,6 @@ fn task_panel_row_sets(app: &App) -> TaskPanelRowSets {
     };
     TaskPanelRowSets {
         active,
-        reasoning,
         background,
         recent,
     }
@@ -1861,12 +1472,6 @@ fn task_panel_rows(
     if explicit_tasks_focus && !active_rows.is_empty() && lines.len() < max_rows {
         push_sidebar_label_theme(&mut lines, "Live tools", theme);
         push_tool_rows(&mut lines, active_rows, content_width, max_rows, theme);
-    }
-
-    let reasoning_rows = &row_sets.reasoning;
-    if explicit_tasks_focus && !reasoning_rows.is_empty() && lines.len() < max_rows {
-        push_sidebar_label_theme(&mut lines, "Model reasoning", theme);
-        push_reasoning_rows(&mut lines, reasoning_rows, content_width, max_rows, theme);
     }
 
     let background_rows = &row_sets.background;
@@ -1992,7 +1597,6 @@ fn task_panel_rows(
         || (lines.len() == 1
             && app.runtime_turn_id.is_some()
             && active_rows.is_empty()
-            && reasoning_rows.is_empty()
             && background_rows.is_empty())
     {
         lines.push(Line::from(Span::styled(
@@ -2020,12 +1624,6 @@ fn task_panel_hover_texts(app: &App, row_sets: &TaskPanelRowSets, max_rows: usiz
     if explicit_tasks_focus && !active_rows.is_empty() && texts.len() < max_rows {
         texts.push("Live tools".to_string());
         push_tool_row_hover_texts(&mut texts, active_rows, max_rows);
-    }
-
-    let reasoning_rows = &row_sets.reasoning;
-    if explicit_tasks_focus && !reasoning_rows.is_empty() && texts.len() < max_rows {
-        texts.push("Model reasoning".to_string());
-        push_reasoning_row_hover_texts(&mut texts, reasoning_rows, max_rows);
     }
 
     let background_rows = &row_sets.background;
@@ -2098,7 +1696,6 @@ fn task_panel_hover_texts(app: &App, row_sets: &TaskPanelRowSets, max_rows: usiz
         || (texts.len() == 1
             && app.runtime_turn_id.is_some()
             && active_rows.is_empty()
-            && reasoning_rows.is_empty()
             && background_rows.is_empty())
     {
         texts.push("No live tools or background jobs".to_string());
@@ -2128,69 +1725,6 @@ fn push_tool_row_hover_texts(texts: &mut Vec<String>, rows: &[SidebarToolRow], m
         texts.push(label);
         if !row.summary.trim().is_empty() && texts.len() < max_rows {
             texts.push(format!("  {}", row.summary));
-        }
-    }
-}
-
-fn push_reasoning_rows(
-    lines: &mut Vec<Line<'static>>,
-    rows: &[TaskPanelEntry],
-    content_width: usize,
-    max_rows: usize,
-    theme: &palette::UiTheme,
-) {
-    for task in rows {
-        if lines.len() >= max_rows {
-            break;
-        }
-        let color = match task.status.as_str() {
-            "running" => theme.warning,
-            "completed" => theme.success,
-            "failed" => theme.error_fg,
-            _ => theme.text_muted,
-        };
-        let duration = task
-            .duration_ms
-            .map(format_duration_ms)
-            .unwrap_or_else(|| "-".to_string());
-        lines.push(Line::from(Span::styled(
-            truncate_line_to_width(
-                &format!("thinking {} {duration}", task.status),
-                content_width,
-            ),
-            Style::default().fg(color),
-        )));
-        if !task.prompt_summary.trim().is_empty() && lines.len() < max_rows {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {}",
-                    truncate_line_to_width(
-                        &task.prompt_summary,
-                        content_width.saturating_sub(2).max(1)
-                    )
-                ),
-                Style::default().fg(theme.text_dim),
-            )));
-        }
-    }
-}
-
-fn push_reasoning_row_hover_texts(
-    texts: &mut Vec<String>,
-    rows: &[TaskPanelEntry],
-    max_rows: usize,
-) {
-    for task in rows {
-        if texts.len() >= max_rows {
-            break;
-        }
-        let duration = task
-            .duration_ms
-            .map(format_duration_ms)
-            .unwrap_or_else(|| "-".to_string());
-        texts.push(format!("thinking {} {duration}", task.status));
-        if !task.prompt_summary.trim().is_empty() && texts.len() < max_rows {
-            texts.push(format!("  {}", task.prompt_summary));
         }
     }
 }
@@ -2623,17 +2157,6 @@ fn background_task_rows(app: &App, active_rows: &[SidebarToolRow]) -> Vec<TaskPa
         .iter()
         .filter(|task| task.kind == TaskPanelEntryKind::Background)
         .filter(|task| !background_task_duplicates_live_tool(task, active_rows))
-        .cloned()
-        .collect();
-    rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
-    rows
-}
-
-fn reasoning_task_rows(app: &App) -> Vec<TaskPanelEntry> {
-    let mut rows: Vec<TaskPanelEntry> = app
-        .task_panel
-        .iter()
-        .filter(|task| task.kind == TaskPanelEntryKind::ModelReasoning)
         .cloned()
         .collect();
     rows.sort_by_key(|task| (task_status_rank(task.status.as_str()), task.id.clone()));
@@ -3304,12 +2827,12 @@ fn indented_detail_line(indent: &str, body: &str, content_width: usize) -> Strin
     )
 }
 
-/// #4094: reference to a worker's full output transcript, surfaced as a
+/// #4094: reference to a worker's transcript projection, surfaced as a
 /// `handle_read` handle instead of dumping the (possibly huge) transcript
 /// inline — the inline dump is the freeze/emptiness risk this issue tracks.
 /// The child transcript is addressable as the `agent:<id>/full_transcript` var
-/// handle (see `subagent_session_projection`), so the panel hands the user a
-/// copyable reference to the fuller artifact rather than the bytes themselves.
+/// handle (see `subagent_session_projection`); its JSON names the private
+/// complete artifact, while clicking Open loads that artifact directly.
 ///
 /// Returns `None` for workers that have not produced anything inspectable yet,
 /// so an empty transcript is never advertised. This is the one place a raw
@@ -3482,10 +3005,10 @@ fn subagent_panel_rows(
             agent_id: row.id.clone(),
         }));
 
-        // #4094: hand the user a copyable handle to the worker's *full* output
-        // transcript instead of dumping it inline — the inline dump is this
-        // issue's freeze/emptiness risk. The bounded dossier above is the
-        // preview; this is the "inspect/copy more" affordance the AC calls for.
+        // #4094: hand the user a copyable bounded projection instead of
+        // dumping the transcript inline — the inline dump is this issue's
+        // freeze/emptiness risk. Clicking the row opens the complete private
+        // artifact; handle_read exposes bounded slices and its artifact path.
         // Guarded by `max_rows` so the panel stays bounded, and width-clamped so
         // narrow terminals never overflow.
         if let Some(handle) = subagent_output_handle(row) {
@@ -3495,7 +3018,7 @@ fn subagent_panel_rows(
             lines.push(Line::from(Span::styled(
                 indented_detail_line(
                     "  ",
-                    &format!("\u{25B8} full output \u{00B7} handle_read {handle}"),
+                    &format!("\u{25B8} complete chat: open \u{00B7} handle_read {handle}"),
                     content_width.max(1),
                 ),
                 Style::default().fg(theme.text_muted),
@@ -3808,27 +3331,40 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn context_panel_cost_line(app: &App) -> String {
     let displayed_total = app.displayed_session_cost_for_currency(app.cost_currency);
-    if displayed_total == 0.0
-        && !crate::pricing::has_pricing_for_provider(app.api_provider, &app.model)
-    {
-        return format!("cost: n/a (no pricing data for {})", app.model);
-    }
-
-    let session_cost = app.session_cost_for_currency(app.cost_currency);
-    let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
-    let real_total = session_cost + agent_cost;
-    // Only show the additive breakdown when it matches the displayed
-    // total; when the high-water mark is in effect (post-reconciliation),
-    // the breakdown would not sum to the displayed value (#244).
-    if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
-        format!(
-            "cost: {} (session {} + agents {})",
-            app.format_cost_amount(displayed_total),
-            app.format_cost_amount(session_cost),
-            app.format_cost_amount(agent_cost)
-        )
-    } else {
-        format!("cost: {}", app.format_cost_amount(displayed_total))
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        displayed_total,
+        app.cost_display_currency(app.cost_currency),
+        None,
+    );
+    match &chip {
+        crate::route_billing::UsageChip::Money(_)
+            if crate::route_billing::has_priced_metered_basis(
+                app.billing_presentation,
+                app.api_provider,
+                &app.model,
+            ) =>
+        {
+            let session_cost = app.session_cost_for_currency(app.cost_currency);
+            let agent_cost = app.subagent_cost_for_currency(app.cost_currency);
+            let real_total = session_cost + agent_cost;
+            // Only show the additive breakdown when it matches the displayed
+            // total; when the high-water mark is in effect (post-reconciliation),
+            // the breakdown would not sum to the displayed value (#244).
+            if (displayed_total - real_total).abs() < COST_EQ_TOLERANCE {
+                format!(
+                    "cost: {} (session {} + agents {})",
+                    app.format_cost_amount(displayed_total),
+                    app.format_cost_amount(session_cost),
+                    app.format_cost_amount(agent_cost)
+                )
+            } else {
+                crate::route_billing::format_usage_line(&chip)
+            }
+        }
+        _ => crate::route_billing::format_usage_line(&chip),
     }
 }
 
@@ -3989,8 +3525,10 @@ fn agent_stop_action_for_click(action: &SidebarRowAction) -> Option<SidebarRowAc
         }),
         SidebarRowAction::Command(_)
         | SidebarRowAction::PrefillCommand(_)
+        | SidebarRowAction::HotbarSlot(_)
         | SidebarRowAction::OpenAgentDetail { .. }
-        | SidebarRowAction::CancelAgent { .. } => None,
+        | SidebarRowAction::CancelAgent { .. }
+        | SidebarRowAction::InspectText { .. } => None,
     }
 }
 
@@ -4004,12 +3542,11 @@ mod tests {
         agent_row_hover_text, auto_sidebar_panels, background_task_spinner_prefix,
         context_panel_cost_line, editorial_tool_rows, hotbar_panel_enabled,
         hotbar_panel_hover_texts, hotbar_panel_lines, hotbar_panel_slots, is_hotbar_disabled,
-        normalize_activity_text, render_sidebar, render_top_work_strip, sidebar_agent_rows,
-        sidebar_hover_rows, sidebar_work_summary, sort_sidebar_agent_rows_as_tree,
-        subagent_output_handle, subagent_panel_hover_texts, subagent_panel_lines,
-        subagent_panel_rows, task_panel_hover_texts, task_panel_lines, task_panel_row_sets,
-        task_panel_rows, top_work_strip_height, work_panel_empty_hint, work_panel_hover_texts,
-        work_panel_lines,
+        normalize_activity_text, render_sidebar, sidebar_agent_rows, sidebar_hover_rows,
+        sidebar_work_summary, sort_sidebar_agent_rows_as_tree, subagent_output_handle,
+        subagent_panel_hover_texts, subagent_panel_lines, subagent_panel_rows,
+        task_panel_hover_texts, task_panel_lines, task_panel_row_sets, task_panel_rows,
+        work_panel_empty_hint, work_panel_hover_texts, work_panel_lines,
     };
     use crate::config::Config;
     use crate::localization::Locale;
@@ -4025,10 +3562,7 @@ mod tests {
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
-    use crate::tui::spinner::{
-        BRAILLE_SPINNER_FRAME_MS, BRAILLE_SPINNER_STILL_FRAME, LIVE_MARKER_DELAY_MS,
-        LIVE_STATIC_MARKER,
-    };
+    use crate::tui::spinner::{BRAILLE_SPINNER_FRAME_MS, LIVE_MARKER_DELAY_MS, LIVE_STATIC_MARKER};
     use ratatui::{Terminal, backend::TestBackend, text::Line};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -4062,137 +3596,6 @@ mod tests {
         App::new(options, &Config::default())
     }
 
-    #[test]
-    fn top_work_strip_places_tasks_and_todo_above_transcript_contract() {
-        let mut app = create_test_app();
-        app.task_panel.push(TaskPanelEntry {
-            id: "task-1".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "verify the underwater layout".to_string(),
-            duration_ms: Some(1_200),
-            kind: TaskPanelEntryKind::Background,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-        });
-        {
-            let mut todos = app.todos.try_lock().expect("todos lock");
-            todos.add(
-                "move work state to the top".to_string(),
-                TodoStatus::InProgress,
-            );
-        }
-
-        let backend = TestBackend::new(100, 7);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render_top_work_strip(frame, frame.area(), &mut app))
-            .expect("draw top work strip");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("Tasks"));
-        assert!(rendered.contains("verify the underwater layout"));
-        assert!(rendered.contains("1.2s"));
-        assert!(rendered.contains("To-do"));
-        assert!(rendered.contains("move work state to the top"));
-    }
-
-    #[test]
-    fn compact_top_work_strip_preserves_labels_and_task_controls_at_40x12() {
-        let mut app = create_test_app();
-        app.task_panel.push(TaskPanelEntry {
-            id: "shell-compact".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "verify compact bottom budget".to_string(),
-            duration_ms: Some(900),
-            kind: TaskPanelEntryKind::Background,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-        });
-        app.todos
-            .try_lock()
-            .expect("todos lock")
-            .add("keep prompt readable".to_string(), TodoStatus::InProgress);
-
-        assert_eq!(top_work_strip_height(&mut app, 40, 12), 3);
-        let backend = TestBackend::new(40, 3);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render_top_work_strip(frame, frame.area(), &mut app))
-            .expect("compact top work strip");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("Tasks"), "{rendered}");
-        assert!(rendered.contains("open stop"), "{rendered}");
-        assert!(rendered.contains("To-do"), "{rendered}");
-        assert!(rendered.contains("keep prompt"), "{rendered}");
-        assert_eq!(app.sidebar_hover.sections.len(), 1);
-        let row = &app.sidebar_hover.sections[0].rows[0];
-        assert!(matches!(
-            row.click_action,
-            Some(SidebarRowAction::Command(_))
-        ));
-        assert!(matches!(
-            row.stop_action,
-            Some(SidebarRowAction::PrefillCommand(_))
-        ));
-    }
-
-    #[test]
-    fn waiting_task_freezes_other_motion_and_owns_attention() {
-        let mut app = create_test_app();
-        for (id, status) in [("run", "running"), ("ask", "waiting")] {
-            app.task_panel.push(TaskPanelEntry {
-                id: id.to_string(),
-                status: status.to_string(),
-                prompt_summary: format!("{id} task"),
-                duration_ms: Some(2_000),
-                kind: TaskPanelEntryKind::Background,
-                stale: false,
-                elapsed_since_output_ms: None,
-                owner_agent_id: None,
-                owner_agent_name: None,
-            });
-        }
-
-        let backend = TestBackend::new(100, 4);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| render_top_work_strip(frame, frame.area(), &mut app))
-            .expect("draw top work strip");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(
-            rendered.contains("◆"),
-            "waiting row keeps a still coral mark"
-        );
-        assert!(
-            rendered.contains(BRAILLE_SPINNER_STILL_FRAME),
-            "other live rows freeze while the user owns the next move"
-        );
-    }
-
     fn sidebar_tool_row(name: &str, status: ToolStatus) -> SidebarToolRow {
         SidebarToolRow {
             name: name.to_string(),
@@ -4218,11 +3621,9 @@ mod tests {
     fn context_panel_cost_line_shows_na_for_unpriced_zero_cost_model() {
         let mut app = create_test_app();
         app.model = "unknown-provider/unknown-model".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
 
-        assert_eq!(
-            context_panel_cost_line(&app),
-            "cost: n/a (no pricing data for unknown-provider/unknown-model)"
-        );
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
     }
 
     #[test]
@@ -4230,17 +3631,35 @@ mod tests {
         let mut app = create_test_app();
         app.api_provider = crate::config::ApiProvider::OpenaiCodex;
         app.model = "gpt-5.5".to_string();
+        app.billing_presentation =
+            crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
+        app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(12.34));
 
-        assert_eq!(
-            context_panel_cost_line(&app),
-            "cost: n/a (no pricing data for gpt-5.5)"
-        );
+        let line = context_panel_cost_line(&app);
+        assert_eq!(line, "usage: Codex OAuth quota");
+        assert!(!line.contains('$'), "OAuth must not invent dollars: {line}");
+    }
+
+    #[test]
+    fn context_panel_cost_line_marks_unpriced_metered_as_unknown() {
+        let mut app = create_test_app();
+        app.api_provider = crate::config::ApiProvider::NvidiaNim;
+        app.model = "deepseek-ai/deepseek-v4-pro".to_string();
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
+
+        assert_eq!(context_panel_cost_line(&app), "cost: unknown");
     }
 
     #[test]
     fn context_panel_cost_line_uses_usd_for_usd_only_model_in_cny_mode() {
         let mut app = create_test_app();
         app.model = "kimi-k2.6".to_string();
+        // This test is about METERED currency rendering; pin the route class
+        // and a metered provider so the session default (which may be a
+        // subscription/OAuth route with no API pricing basis) cannot change
+        // what is under test (TUI-DOG-010).
+        app.api_provider = crate::config::ApiProvider::Moonshot;
+        app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
         app.cost_currency = crate::pricing::CostCurrency::Cny;
         app.accrue_session_cost_estimate(crate::pricing::CostEstimate::usd_only(0.42));
 
@@ -4382,6 +3801,17 @@ mod tests {
                 .iter()
                 .all(|slot| slot.state == HotbarSlotState::Empty),
             "fresh config resolves to no bound slots"
+        );
+    }
+
+    #[test]
+    fn hotbar_rows_register_one_typed_action_per_rendered_row() {
+        assert_eq!(
+            super::hotbar_panel_row_actions(),
+            vec![
+                Some(SidebarRowAction::HotbarSlot(1)),
+                Some(SidebarRowAction::HotbarSlot(5)),
+            ]
         );
     }
 
@@ -5717,39 +5147,6 @@ mod tests {
     }
 
     #[test]
-    fn tasks_panel_renders_model_reasoning_outside_background_commands() {
-        let mut app = create_test_app();
-        app.sidebar_focus = SidebarFocus::Tasks;
-        app.task_panel.push(TaskPanelEntry {
-            id: "reasoning-1".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "model reasoning".to_string(),
-            duration_ms: Some(4_200),
-            kind: TaskPanelEntryKind::ModelReasoning,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-        });
-
-        let text = lines_to_text(&task_panel_lines(&app, 80, 8));
-
-        assert!(
-            text.iter().any(|line| line == "Model reasoning"),
-            "reasoning section missing: {text:?}"
-        );
-        assert!(
-            text.iter()
-                .any(|line| line.contains("thinking running 4.2s")),
-            "reasoning row should show live thinking duration: {text:?}"
-        );
-        assert!(
-            !text.iter().any(|line| line.contains("Bash jobs")),
-            "reasoning must not be counted as a background command: {text:?}"
-        );
-    }
-
-    #[test]
     fn tasks_panel_auto_mode_shows_only_live_background_jobs() {
         let mut app = create_test_app();
         app.low_motion = false;
@@ -5782,17 +5179,6 @@ mod tests {
                 output_summary: Some("found AgentProgress".to_string()),
                 is_diff: false,
             })));
-        app.task_panel.push(TaskPanelEntry {
-            id: "reasoning-1".to_string(),
-            status: "running".to_string(),
-            prompt_summary: "model reasoning".to_string(),
-            duration_ms: Some(4_200),
-            kind: TaskPanelEntryKind::ModelReasoning,
-            stale: false,
-            elapsed_since_output_ms: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-        });
         app.task_panel.push(TaskPanelEntry {
             id: "shell_live".to_string(),
             status: "running".to_string(),
@@ -5830,6 +5216,30 @@ mod tests {
                 "auto Tasks should not show {hidden:?}: {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn tasks_panel_keeps_model_reasoning_in_transcript_only() {
+        let mut app = create_test_app();
+        app.sidebar_focus = SidebarFocus::Tasks;
+        app.runtime_turn_id = Some("turn_reasoning".to_string());
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.history.push(HistoryCell::Thinking {
+            content: "private chain of thought".to_string(),
+            streaming: true,
+            duration_secs: Some(1.0),
+        });
+
+        let text = lines_to_text(&task_panel_lines(&app, 96, 12));
+
+        assert!(
+            !text.iter().any(|line| {
+                line.contains("Model reasoning")
+                    || line.contains("private chain of thought")
+                    || line.contains("thinking")
+            }),
+            "reasoning belongs to transcript detail, not Activity: {text:?}"
+        );
     }
 
     #[test]

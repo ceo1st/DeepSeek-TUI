@@ -1,10 +1,8 @@
 # Recursive self-improvement prompt
 
-CodeWhale is built for open-source and open-weight coding models. DeepSeek V4
-Pro is the first-class path today because its cache economics make long agent
-loops practical, but the contribution shape should remain portable to other
-open/open-weight paths as they mature. One practical way to help is to let
-CodeWhale inspect itself and return a small, reviewable improvement.
+CodeWhale works across supported coding-model routes. One practical way to
+help is to let CodeWhale inspect itself and return a small, reviewable
+improvement.
 
 This is the "100-to-1 model": one clear prompt, many bounded agent runs, one
 artifact a maintainer can review. It is not a scorecard and not permission to
@@ -44,7 +42,7 @@ rewrite the project. It is a contribution shape.
 Paste this into CodeWhale from the repository root:
 
 ```text
-You are running inside CodeWhale on DeepSeek V4 Pro.
+You are running inside CodeWhale. Use the model route selected for this run.
 
 Your task is to improve CodeWhale itself by finding exactly one small,
 reviewable place where the harness, docs, tests, or contributor workflow causes
@@ -83,7 +81,7 @@ Output:
 从仓库根目录把这段粘贴到 CodeWhale：
 
 ```text
-你正在 DeepSeek V4 Pro 驱动的 CodeWhale 中运行。
+你正在 CodeWhale 中运行。请使用本次运行所选的模型路由。
 
 你的任务是改进 CodeWhale 本身：只找一个很小、可审查的点，看看这个
 智能体框架、文档、测试或贡献流程哪里让人不顺手，然后产出一个维护者
@@ -119,7 +117,7 @@ Output:
 リポジトリのルートで、このプロンプトを CodeWhale に貼り付けます。
 
 ```text
-あなたは DeepSeek V4 Pro 上の CodeWhale の中で動いています。
+あなたは CodeWhale の中で動いています。この実行で選択されたモデルルートを使ってください。
 
 目的は CodeWhale 自体を改善することです。ただし、対象はひとつだけに
 絞ります。ハーネス、ドキュメント、テスト、またはコントリビューター

@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{ApiProvider, Config};
+use crate::config::{ApiProvider, ApprovalPolicyControl, Config};
 use crate::features::{FEATURES, Stage};
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
@@ -965,6 +965,7 @@ impl ViewStack {
         // is unchanged.
         for view in &self.views {
             let region = view.occupied_region(area);
+            crate::tui::osc8::overlay_frame_links(region, Vec::new());
             render_modal_backdrop(region, buf);
             view.render(area, buf);
         }
@@ -1124,6 +1125,8 @@ struct ConfigEdit {
     cursor: usize,
     select_all: bool,
     scope: ConfigScope,
+    choices: Option<Vec<String>>,
+    selected_choice: usize,
 }
 
 pub struct ConfigView {
@@ -1142,7 +1145,9 @@ pub struct ConfigView {
     /// panel scroll rail truthful when the stored scroll predates a resize.
     last_render_scroll: Cell<usize>,
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
+    last_choice_hitboxes: RefCell<Vec<(u16, usize)>>,
     last_mouse_selected: Option<usize>,
+    api_provider: ApiProvider,
 }
 
 const CONFIG_MIN_KEY_COLUMN_WIDTH: usize = 19;
@@ -1157,13 +1162,76 @@ impl ConfigView {
         let settings = Settings::load_persisted().unwrap_or_else(|_| Settings::default());
         let config = Config::load(app.config_path.clone(), app.config_profile.as_deref())
             .unwrap_or_default();
+        let permission_control = config.approval_policy_control(
+            app.config_path.as_deref(),
+            app.config_profile.as_deref(),
+            &app.workspace,
+        );
+        let saved_permission_row = match permission_control {
+            ApprovalPolicyControl::Unset => ConfigRow {
+                section: ConfigSection::Permissions,
+                key: "permission_posture".to_string(),
+                value: settings
+                    .permission_posture
+                    .as_deref()
+                    .unwrap_or("ask")
+                    .to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ApprovalPolicyControl::RootConfig => ConfigRow {
+                section: ConfigSection::Permissions,
+                key: "approval_policy".to_string(),
+                value: config
+                    .approval_policy
+                    .as_deref()
+                    .unwrap_or("ask")
+                    .to_string(),
+                editable: permission_control.editable_root(),
+                scope: ConfigScope::Saved,
+            },
+            source => ConfigRow {
+                section: ConfigSection::Permissions,
+                key: "managed_approval_policy".to_string(),
+                value: format!(
+                    "{} · {}",
+                    app.approval_mode.permission_chip_label(),
+                    source.label()
+                ),
+                editable: false,
+                scope: ConfigScope::Saved,
+            },
+        };
+        let approval_session_editable = matches!(permission_control, ApprovalPolicyControl::Unset);
+        let shell_control = config.allow_shell_control(
+            app.config_path.as_deref(),
+            app.config_profile.as_deref(),
+            &app.workspace,
+        );
+        let shell_row = if shell_control.editable_root() {
+            ConfigRow {
+                section: ConfigSection::Permissions,
+                key: "allow_shell".to_string(),
+                value: app.allow_shell.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            }
+        } else {
+            ConfigRow {
+                section: ConfigSection::Permissions,
+                key: "managed_allow_shell".to_string(),
+                value: format!("{} · {}", app.allow_shell, shell_control.label()),
+                editable: false,
+                scope: ConfigScope::Saved,
+            }
+        };
         let mut rows = vec![
             ConfigRow {
                 section: ConfigSection::Provider,
                 key: "provider".to_string(),
-                value: app.api_provider.as_str().to_string(),
+                value: config_provider_row_value(app, &config),
                 editable: true,
-                scope: ConfigScope::Session,
+                scope: ConfigScope::Saved,
             },
             ConfigRow {
                 section: ConfigSection::Provider,
@@ -1210,10 +1278,11 @@ impl ConfigView {
             ConfigRow {
                 section: ConfigSection::Permissions,
                 key: "approval_mode".to_string(),
-                value: app.approval_mode.label().to_string(),
-                editable: true,
+                value: app.approval_mode.permission_chip_label().to_string(),
+                editable: approval_session_editable,
                 scope: ConfigScope::Session,
             },
+            saved_permission_row,
             ConfigRow {
                 section: ConfigSection::Permissions,
                 key: "default_mode".to_string(),
@@ -1221,13 +1290,7 @@ impl ConfigView {
                 editable: true,
                 scope: ConfigScope::Saved,
             },
-            ConfigRow {
-                section: ConfigSection::Permissions,
-                key: "allow_shell".to_string(),
-                value: app.allow_shell.to_string(),
-                editable: true,
-                scope: ConfigScope::Saved,
-            },
+            shell_row,
             ConfigRow {
                 section: ConfigSection::Network,
                 key: "stream_chunk_timeout_secs".to_string(),
@@ -1267,6 +1330,13 @@ impl ConfigView {
             },
             ConfigRow {
                 section: ConfigSection::Display,
+                key: "work_surface_placement".to_string(),
+                value: settings.work_surface_placement.clone(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Display,
                 key: "calm_mode".to_string(),
                 value: settings.calm_mode.to_string(),
                 editable: true,
@@ -1283,6 +1353,13 @@ impl ConfigView {
                 section: ConfigSection::Display,
                 key: "fancy_animations".to_string(),
                 value: settings.fancy_animations.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Display,
+                key: "launch_screen".to_string(),
+                value: settings.launch_screen.to_string(),
                 editable: true,
                 scope: ConfigScope::Saved,
             },
@@ -1483,12 +1560,33 @@ impl ConfigView {
             last_visible_rows: Cell::new(0),
             last_render_scroll: Cell::new(0),
             last_row_hitboxes: RefCell::new(Vec::new()),
+            last_choice_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
+            api_provider: app.api_provider,
         }
     }
 
     fn tr(&self, id: MessageId) -> Cow<'static, str> {
         tr(self.locale, id)
+    }
+
+    /// Keep the user's place when the host rebuilds this view after applying
+    /// a setting to the live app.
+    pub(crate) fn focus_key(&mut self, key: &str) {
+        if let Some(index) = self.rows.iter().position(|row| row.key == key) {
+            self.selected = index;
+            self.adjust_scroll(self.visible_rows_cached());
+        }
+    }
+
+    /// Snapshot the active search so live config updates can rebuild the
+    /// modal without making the user's filtered result set jump away.
+    pub(crate) fn filter_query(&self) -> &str {
+        &self.filter
+    }
+
+    pub(crate) fn restore_filter(&mut self, filter: String) {
+        self.update_filter(|current| *current = filter);
     }
 
     fn visible_rows_cached(&self) -> usize {
@@ -1506,6 +1604,7 @@ impl ConfigView {
         let section_en = row.section.label(Locale::En).to_lowercase();
         let label = config_label_for_key(&row.key).to_lowercase();
         let key = row.key.to_lowercase();
+        let raw_value = row.value.to_lowercase();
         let value = self.row_display_value(row).to_lowercase();
         let scope = row.scope.label(self.locale).to_lowercase();
         let scope_en = row.scope.label(Locale::En).to_lowercase();
@@ -1516,6 +1615,7 @@ impl ConfigView {
                 || section_en.contains(term)
                 || label.contains(term)
                 || key.contains(term)
+                || raw_value.contains(term)
                 || value.contains(term)
                 || scope.contains(term)
                 || scope_en.contains(term)
@@ -1663,7 +1763,134 @@ impl ConfigView {
         self.adjust_scroll(visible_rows);
     }
 
+    fn toggle_selected_boolean(&self) -> Option<ViewAction> {
+        let row = self.rows.get(self.selected_row_index()?)?;
+        if !row.editable || !config_boolean_key(&row.key) {
+            return None;
+        }
+        let value = if canonical_config_choice(&row.key, &row.value) == "true" {
+            "false"
+        } else {
+            "true"
+        };
+        Some(ViewAction::Emit(ViewEvent::ConfigUpdated {
+            key: row.key.clone(),
+            value: value.to_string(),
+            persist: row.scope.persist(),
+        }))
+    }
+
+    fn open_selected_catalog_picker(&self) -> Option<ViewAction> {
+        let row = self.rows.get(self.selected_row_index()?)?;
+        let command = match row.key.as_str() {
+            "provider" if row.editable => "/provider",
+            "model" | "default_model" if row.editable => "/model",
+            _ => return None,
+        };
+        Some(ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+            action: CommandPaletteAction::ExecuteCommand {
+                command: command.to_string(),
+            },
+        }))
+    }
+
+    fn move_choice(&mut self, delta: isize) {
+        let Some(edit) = self.editing.as_mut() else {
+            return;
+        };
+        let Some(choices) = edit.choices.as_ref() else {
+            return;
+        };
+        let max = choices.len().saturating_sub(1);
+        edit.selected_choice = if delta.is_negative() {
+            edit.selected_choice.saturating_sub(delta.unsigned_abs())
+        } else {
+            (edit.selected_choice + delta as usize).min(max)
+        };
+    }
+
+    fn handle_choice_key(&mut self, key: KeyEvent) -> ViewAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.editing = None;
+                self.status = Some(self.tr(MessageId::ConfigEditCancelled).to_string());
+                ViewAction::None
+            }
+            KeyCode::Enter => {
+                let Some(edit) = self.editing.take() else {
+                    return ViewAction::None;
+                };
+                let Some(value) = edit
+                    .choices
+                    .as_ref()
+                    .and_then(|choices| choices.get(edit.selected_choice))
+                    .cloned()
+                else {
+                    return ViewAction::None;
+                };
+                ViewAction::Emit(ViewEvent::ConfigUpdated {
+                    key: edit.key,
+                    value,
+                    persist: edit.scope.persist(),
+                })
+            }
+            KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+                self.move_choice(-1);
+                ViewAction::None
+            }
+            KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => {
+                self.move_choice(1);
+                ViewAction::None
+            }
+            KeyCode::PageUp => {
+                self.move_choice(-5);
+                ViewAction::None
+            }
+            KeyCode::PageDown => {
+                self.move_choice(5);
+                ViewAction::None
+            }
+            KeyCode::Home => {
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.selected_choice = 0;
+                }
+                ViewAction::None
+            }
+            KeyCode::End => {
+                if let Some(edit) = self.editing.as_mut()
+                    && let Some(choices) = edit.choices.as_ref()
+                {
+                    edit.selected_choice = choices.len().saturating_sub(1);
+                }
+                ViewAction::None
+            }
+            KeyCode::Char(digit @ '1'..='9') => {
+                if let Some(edit) = self.editing.as_mut()
+                    && let Some(choices) = edit.choices.as_ref()
+                {
+                    let index = digit as usize - '1' as usize;
+                    if index < choices.len() {
+                        edit.selected_choice = index;
+                    }
+                }
+                ViewAction::None
+            }
+            KeyCode::Char(' ') => {
+                self.move_choice(1);
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn handle_editing_key(&mut self, key: KeyEvent) -> ViewAction {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|edit| edit.choices.is_some())
+        {
+            return self.handle_choice_key(key);
+        }
         match key.code {
             KeyCode::Esc => {
                 self.editing = None;
@@ -1795,6 +2022,16 @@ impl ConfigView {
             _ => original_value.clone(),
         };
 
+        let choices = config_choice_values(&key, self.api_provider);
+        let selected_choice = choices
+            .as_ref()
+            .and_then(|choices| {
+                let current = canonical_config_choice(&key, &initial_value);
+                choices
+                    .iter()
+                    .position(|choice| canonical_config_choice(&key, choice) == current)
+            })
+            .unwrap_or(0);
         let buffer: Vec<char> = initial_value.chars().collect();
         self.editing = Some(ConfigEdit {
             key,
@@ -1803,6 +2040,8 @@ impl ConfigView {
             buffer,
             select_all: true,
             scope: row.scope,
+            choices,
+            selected_choice,
         });
         self.status = None;
     }
@@ -1838,12 +2077,31 @@ impl ConfigView {
         if let Some(runtime_value) = runtime_value
             && row.value.parse::<bool>().ok() != Some(runtime_value)
         {
+            let saved =
+                config_choice_label(&row.key, &canonical_config_choice(&row.key, &row.value));
+            let effective = config_choice_label(&row.key, &runtime_value.to_string());
             return format!(
                 "{}{}",
-                row.value,
+                saved,
                 self.tr(MessageId::ConfigRowEffective)
-                    .replace("{currency}", &runtime_value.to_string())
+                    .replace("{currency}", &effective)
             );
+        }
+
+        // Preserve the exact saved currency alias in the table (for example
+        // `rmb`) while the chooser highlights its canonical `cny` option.
+        if row.key == "cost_currency" {
+            return row.value.clone();
+        }
+
+        if config_choice_values(&row.key, self.api_provider).is_some() {
+            if config_default_placeholder_message(&row.key).is_some_and(|message_id| {
+                row.value == tr(self.locale, message_id) || row.value == tr(Locale::En, message_id)
+            }) {
+                return "Provider default".to_string();
+            }
+            let canonical = canonical_config_choice(&row.key, &row.value);
+            return config_choice_label(&row.key, &canonical);
         }
 
         row.value.clone()
@@ -1854,11 +2112,22 @@ impl ConfigView {
         let row = self.rows.get(row_idx)?;
         let label = config_label_for_key(&row.key);
         let hint = config_hint_for_key(&row.key);
+        let action = if row.key == "provider" {
+            "Enter opens provider picker"
+        } else if config_boolean_key(&row.key) {
+            "Enter/Space toggles"
+        } else if config_choice_values(&row.key, self.api_provider).is_some() {
+            "Enter opens choices"
+        } else if row.editable {
+            "Enter edits"
+        } else {
+            "read only"
+        };
         if !hint.is_empty() {
-            return Some(format!("{label}: {hint}"));
+            return Some(format!("{label}: {hint} · {action}"));
         }
         if row.editable {
-            Some(format!("{label}: Enter to edit ({})", row.key))
+            Some(format!("{label}: {action} ({})", row.key))
         } else {
             Some(format!("{label}: read-only status ({})", row.key))
         }
@@ -1873,10 +2142,32 @@ fn config_base_url_row_key(provider: ApiProvider) -> &'static str {
     }
 }
 
+fn config_provider_row_value(app: &App, config: &Config) -> String {
+    if app.api_provider == ApiProvider::Custom
+        && let Some(provider_id) = config
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty())
+        && config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom_provider_config(provider_id))
+            .is_some()
+    {
+        return provider_id.to_string();
+    }
+    app.api_provider.as_str().to_string()
+}
+
 fn config_base_url_row_value(app: &App) -> String {
     Config::load(app.config_path.clone(), app.config_profile.as_deref())
         .map(|mut config| {
-            config.provider = Some(app.api_provider.as_str().to_string());
+            // A named custom provider is represented at runtime as `Custom`,
+            // but its table lookup still needs the original provider ID.
+            if app.api_provider != ApiProvider::Custom {
+                config.provider = Some(app.api_provider.as_str().to_string());
+            }
             config.deepseek_base_url()
         })
         .unwrap_or_else(|_| tr(app.ui_locale, MessageId::ConfigUnavailable).to_string())
@@ -1960,18 +2251,24 @@ fn config_label_for_key(key: &str) -> String {
         "model" => "Current model",
         "default_model" => "Default model",
         "reasoning_effort" => "Reasoning level",
-        "approval_mode" => "Current approval mode",
+        "approval_mode" => "This session's permission",
+        "permission_posture" => "New sessions' permission",
+        "approval_policy" => "New sessions' permission (config)",
+        "managed_approval_policy" => "New sessions' permission (managed)",
         "default_mode" => "Startup mode",
         "allow_shell" => "Shell access",
+        "managed_allow_shell" => "Shell access (managed)",
         "stream_chunk_timeout_secs" => "Stream timeout",
         "theme" => "Theme",
         "locale" => "Language",
         "background_color" => "Background",
         "ocean_treatment" => "Ocean treatment",
-        "calm_mode" => "Calm mode",
-        "low_motion" => "Low motion",
-        "fancy_animations" => "Animations",
-        "show_thinking" => "Show thinking",
+        "work_surface_placement" => "Work surface placement",
+        "calm_mode" => "Quiet transcript",
+        "low_motion" => "Reduce motion",
+        "fancy_animations" => "Ocean motion",
+        "launch_screen" => "Launch screen",
+        "show_thinking" => "Model reasoning in chat",
         "show_tool_details" => "Tool detail level",
         "status_indicator" => "Status indicator",
         "synchronized_output" => "Output pacing",
@@ -2029,12 +2326,20 @@ fn config_hint_for_key(key: &str) -> &'static str {
     match key {
         "model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-*",
         "provider" => "deepseek | openrouter | xiaomi-mimo | fireworks | siliconflow | ...",
-        "approval_mode" => "auto | suggest | never",
-        "allow_shell" => "true enables shell in Act mode with approvals on the next turn",
+        "approval_mode" => "this session only: Ask | Auto-Review | Full Access | Never",
+        "permission_posture" => "default for new sessions: Ask | Auto-Review | Full Access",
+        "approval_policy" => {
+            "config.toml override for new sessions; choose Use TUI default to unlock Ask | Auto-Review | Full Access"
+        }
+        "managed_approval_policy" => {
+            "a project, profile, environment, managed config, or organization requirement controls this value"
+        }
+        "managed_allow_shell" => {
+            "a project, profile, environment, or managed config controls shell access"
+        }
+        "allow_shell" => "on exposes shell tools in Agent mode; permission rules still apply",
         "auto_compact"
-        | "calm_mode"
-        | "low_motion"
-        | "show_thinking"
+        | "launch_screen"
         | "show_tool_details"
         | "composer_border"
         | "paste_burst_detection" => "on/off, true/false, yes/no, 1/0",
@@ -2058,13 +2363,19 @@ fn config_hint_for_key(key: &str) -> &'static str {
             LOCALE_HINT.get_or_init(|| crate::localization::configured_locale_values(" | "))
         }
         "background_color" => "#RRGGBB | default",
-        "ocean_treatment" => "ombre | flat",
+        "work_surface_placement" => "top | left | right",
         "base_url" => "global DeepSeek/root fallback; e.g. https://api.deepseek.com/beta",
         "provider_url" => {
             "current provider endpoint; Xiaomi: token-plan | pay-as-you-go | custom URL"
         }
         "cost_currency" => "usd | cny",
-        "default_mode" => "agent | plan | yolo",
+        "calm_mode" => "quietens transcript chrome and tool detail; independent of ocean motion",
+        "low_motion" => "on overrides decorative motion; model output is unchanged",
+        "fancy_animations" => "on animates fish, bubbles, and live ocean state",
+        "ocean_treatment" => "ombre | flat (appearance; independent of motion)",
+        "show_thinking" => "show or hide model reasoning in chat; task lists stay concise",
+        "synchronized_output" => "auto | on | off; terminal redraw pacing, not model speed",
+        "default_mode" => "agent | plan",
         "sidebar_width" => "10..=50",
         "sidebar_focus" => "auto | work | tasks | agents | context | hidden",
         "max_history" => "integer (0 allowed)",
@@ -2096,6 +2407,168 @@ fn config_default_placeholder_message(key: &str) -> Option<MessageId> {
         "default_model" | "background_color" => Some(MessageId::ConfigDefaultValue),
         "reasoning_effort" => Some(MessageId::ConfigDefaultReasoning),
         _ => None,
+    }
+}
+
+fn config_boolean_key(key: &str) -> bool {
+    matches!(
+        key,
+        "allow_shell"
+            | "calm_mode"
+            | "low_motion"
+            | "fancy_animations"
+            | "launch_screen"
+            | "show_thinking"
+            | "show_tool_details"
+            | "composer_border"
+            | "bracketed_paste"
+            | "paste_burst_detection"
+            | "workspace_follow_symlinks"
+            | "context_panel"
+            | "auto_compact"
+            | "prefer_external_pdftotext"
+    )
+}
+
+fn config_choice_values(key: &str, provider: ApiProvider) -> Option<Vec<String>> {
+    let values = match key {
+        key if config_boolean_key(key) => vec!["false", "true"],
+        "approval_mode" => vec!["ask", "auto-review", "full-access", "never"],
+        "permission_posture" => vec!["ask", "auto-review", "full-access"],
+        "approval_policy" => vec!["use-tui-default", "ask", "auto-review", "never"],
+        "default_mode" => vec!["agent", "plan"],
+        "reasoning_effort" if provider == ApiProvider::OpenaiCodex => {
+            vec!["default", "low", "medium", "high", "xhigh"]
+        }
+        "reasoning_effort" => {
+            vec!["default", "auto", "off", "low", "medium", "high", "max"]
+        }
+        "ocean_treatment" => vec!["ombre", "flat"],
+        "work_surface_placement" => vec!["top", "left", "right"],
+        "status_indicator" => vec!["cw", "whale", "dots", "off"],
+        "synchronized_output" => vec!["auto", "on", "off"],
+        "cost_currency" => vec!["usd", "cny"],
+        "transcript_spacing" | "composer_density" => {
+            vec!["compact", "comfortable", "spacious"]
+        }
+        "tool_collapse" => vec!["compact", "expanded", "calm"],
+        "composer_vim_mode" => vec!["normal", "vim"],
+        "mention_menu_behavior" => vec!["fuzzy", "browser"],
+        "sidebar_focus" => vec!["pinned", "auto", "tasks", "agents", "context", "hidden"],
+        "theme" => {
+            return Some(
+                crate::palette::SELECTABLE_THEMES
+                    .iter()
+                    .map(|id| id.name().to_string())
+                    .collect(),
+            );
+        }
+        "locale" => {
+            let mut values = vec!["auto".to_string()];
+            values.extend(
+                Locale::shipped()
+                    .iter()
+                    .map(|locale| locale.tag().to_string()),
+            );
+            return Some(values);
+        }
+        _ => return None,
+    };
+    Some(values.into_iter().map(str::to_string).collect())
+}
+
+fn canonical_config_choice(key: &str, value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+    match key {
+        key if config_boolean_key(key) => match normalized.as_str() {
+            "true" | "on" | "yes" | "1" | "enabled" => "true".to_string(),
+            _ => "false".to_string(),
+        },
+        "approval_mode" | "permission_posture" | "approval_policy" => match normalized.as_str() {
+            "ask" | "suggest" | "on-request" | "untrusted" => "ask".to_string(),
+            "auto" | "auto-review" => "auto-review".to_string(),
+            "full" | "full-access" | "bypass" | "yolo" => "full-access".to_string(),
+            "never" | "deny" => "never".to_string(),
+            _ => normalized,
+        },
+        "reasoning_effort" => {
+            if matches!(normalized.as_str(), "" | "(default)" | "config-default") {
+                "default".to_string()
+            } else if normalized == "max" && value.trim().eq_ignore_ascii_case("xhigh") {
+                "xhigh".to_string()
+            } else {
+                normalized
+            }
+        }
+        "cost_currency" => match normalized.as_str() {
+            "rmb" | "yuan" | "cny" => "cny".to_string(),
+            _ => "usd".to_string(),
+        },
+        "default_mode" => match normalized.as_str() {
+            "plan" => "plan".to_string(),
+            // Old saved Operate/YOLO values are represented by the safe
+            // startup workspace; permission posture is shown separately.
+            _ => "agent".to_string(),
+        },
+        _ => normalized,
+    }
+}
+
+fn config_choice_label(key: &str, value: &str) -> String {
+    match (key, value) {
+        (key, "true") if config_boolean_key(key) => "On".to_string(),
+        (key, "false") if config_boolean_key(key) => "Off".to_string(),
+        ("approval_mode" | "permission_posture" | "approval_policy", "ask") => "Ask".to_string(),
+        ("approval_mode" | "permission_posture" | "approval_policy", "auto-review") => {
+            "Auto-Review".to_string()
+        }
+        ("approval_policy", "use-tui-default") => "Use TUI permission default".to_string(),
+        ("approval_mode" | "permission_posture", "full-access") => "Full Access".to_string(),
+        ("approval_mode" | "approval_policy", "never") => "Never".to_string(),
+        ("default_mode", "agent") => "Agent".to_string(),
+        ("default_mode", "plan") => "Plan (read only)".to_string(),
+        ("reasoning_effort", "default") => "Provider default".to_string(),
+        ("status_indicator", "cw") => "CodeWhale mark".to_string(),
+        ("status_indicator", "whale") => "Animated whale".to_string(),
+        ("status_indicator", "dots") => "Animated dots".to_string(),
+        ("status_indicator", "off") => "Off".to_string(),
+        ("sidebar_focus", "pinned") => "Work pinned".to_string(),
+        ("sidebar_focus", "tasks") => "Activity".to_string(),
+        ("sidebar_focus", "agents") => "Workers".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn config_choice_detail(key: &str, value: &str) -> &'static str {
+    match (key, value) {
+        ("approval_mode" | "permission_posture" | "approval_policy", "ask") => {
+            "Ask before tools that can make consequential changes."
+        }
+        ("approval_mode" | "permission_posture" | "approval_policy", "auto-review") => {
+            "Review tool risk automatically and ask when a decision needs you."
+        }
+        ("approval_policy", "use-tui-default") => {
+            "Remove the root config override and use the saved TUI permission choice."
+        }
+        ("approval_mode" | "permission_posture", "full-access") => {
+            "Run tools without approval prompts; workspace rules still apply."
+        }
+        ("approval_mode" | "approval_policy", "never") => {
+            "Block every tool that requires approval."
+        }
+        ("default_mode", "agent") => "Start ready to collaborate and use tools.",
+        ("default_mode", "plan") => "Start in a read-only planning workspace.",
+        ("low_motion", "true") => "Stops decorative movement without changing model output.",
+        ("low_motion", "false") => "Allows motion selected by the other appearance settings.",
+        ("fancy_animations", "true") => "Animates fish, bubbles, and live ocean state.",
+        ("fancy_animations", "false") => "Keeps the ocean treatment but makes it static.",
+        ("show_thinking", "true") => "Show model reasoning blocks in the transcript.",
+        ("show_thinking", "false") => {
+            "Keep model reasoning hidden; answers and tools remain visible."
+        }
+        ("ocean_treatment", "ombre") => "Use one continuous ocean color field.",
+        ("ocean_treatment", "flat") => "Use a single flat background color.",
+        _ => "",
     }
 }
 
@@ -2225,6 +2698,9 @@ impl ModalView for ConfigView {
                     .and_then(|idx| self.rows.get(idx))
                     .is_some_and(|row| row.editable)
                 {
+                    if let Some(action) = self.open_selected_catalog_picker() {
+                        return action;
+                    }
                     self.start_edit();
                 }
                 ViewAction::None
@@ -2235,9 +2711,22 @@ impl ModalView for ConfigView {
                     .and_then(|idx| self.rows.get(idx))
                     .is_some_and(|row| row.editable)
                 {
+                    if let Some(action) = self.open_selected_catalog_picker() {
+                        return action;
+                    }
+                    if let Some(action) = self.toggle_selected_boolean() {
+                        return action;
+                    }
                     self.start_edit();
                 }
                 ViewAction::None
+            }
+            KeyCode::Char(' ') if self.filter.is_empty() => {
+                if let Some(action) = self.toggle_selected_boolean() {
+                    action
+                } else {
+                    ViewAction::None
+                }
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL) && !ch.is_control() =>
@@ -2250,8 +2739,44 @@ impl ModalView for ConfigView {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|edit| edit.choices.is_some())
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.move_choice(-1),
+                MouseEventKind::ScrollDown => self.move_choice(1),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(choice) = self
+                        .last_choice_hitboxes
+                        .borrow()
+                        .iter()
+                        .find_map(|(y, choice)| (*y == mouse.row).then_some(*choice))
+                        && let Some(edit) = self.editing.as_mut()
+                    {
+                        edit.selected_choice = choice;
+                    }
+                }
+                _ => {}
+            }
+            return ViewAction::None;
+        }
         if self.editing.is_some() {
             return ViewAction::None;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_selection(-3);
+                self.last_mouse_selected = None;
+                return ViewAction::None;
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_selection(3);
+                self.last_mouse_selected = None;
+                return ViewAction::None;
+            }
+            _ => {}
         }
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return ViewAction::None;
@@ -2269,6 +2794,12 @@ impl ModalView for ConfigView {
             self.adjust_scroll(self.visible_rows_cached());
             self.last_mouse_selected = Some(row_idx);
             if activate && self.rows.get(row_idx).is_some_and(|row| row.editable) {
+                if let Some(action) = self.open_selected_catalog_picker() {
+                    return action;
+                }
+                if let Some(action) = self.toggle_selected_boolean() {
+                    return action;
+                }
                 self.start_edit();
             }
         }
@@ -2285,7 +2816,16 @@ impl ModalView for ConfigView {
         let inner =
             render_underwater_surface(area, buf, self.tr(MessageId::ConfigModalTitle).to_string());
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
-            let footer_text = self.tr(MessageId::ConfigEditFooter).to_string();
+            *self.last_choice_hitboxes.borrow_mut() = Vec::new();
+            let footer_text = if edit.choices.is_some() {
+                if inner.width < 56 || inner.height <= 8 {
+                    " ↑/↓ choose · Enter apply · Esc ".to_string()
+                } else {
+                    " ↑/↓ choose · Enter apply · Esc cancel · 1-9 jump ".to_string()
+                }
+            } else {
+                self.tr(MessageId::ConfigEditFooter).to_string()
+            };
             let reserved_footer_lines =
                 wrapped_footer_lines(&footer_text, inner.width, Style::default()).len();
             // Spacer rows are secondary chrome: give them up before the
@@ -2328,22 +2868,88 @@ impl ModalView for ConfigView {
             if spacious {
                 lines.push(Line::from(""));
             }
-            lines.push(render_config_editor_value_line(edit, self.locale));
-            if spacious {
-                lines.push(Line::from(""));
-            }
-            let hint = config_hint_for_key(&edit.key);
-            if !hint.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        self.tr(MessageId::ConfigEditHintLabel),
+            if let Some(choices) = edit.choices.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    "Choose:",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+
+                // Large catalogs (providers and themes) remain bounded by the
+                // terminal. Keep the active option centered and mouse-hitbox
+                // only the slice that is actually visible.
+                let selected_detail = choices
+                    .get(edit.selected_choice)
+                    .map(|choice| config_choice_detail(&edit.key, choice))
+                    .unwrap_or("");
+                let available_rows =
+                    usize::from(inner.height).saturating_sub(reserved_footer_lines + lines.len());
+                // At the minimum supported height, the choices themselves are
+                // the primary object. Shed the explanatory detail before any
+                // option; larger surfaces keep one row for that detail.
+                let detail_rows = usize::from(!selected_detail.is_empty() && available_rows > 3);
+                let option_budget = available_rows.saturating_sub(detail_rows).max(1);
+                let visible_options = option_budget.min(choices.len());
+                let max_start = choices.len().saturating_sub(visible_options);
+                let start = edit
+                    .selected_choice
+                    .saturating_sub(visible_options / 2)
+                    .min(max_start);
+                let end = (start + visible_options).min(choices.len());
+                let mut hitboxes = Vec::new();
+
+                for (choice_idx, choice) in choices.iter().enumerate().take(end).skip(start) {
+                    let selected = choice_idx == edit.selected_choice;
+                    let marker = if selected { "›" } else { " " };
+                    let label = config_choice_label(&edit.key, choice);
+                    let line_y = inner.y.saturating_add(lines.len() as u16);
+                    hitboxes.push((line_y, choice_idx));
+                    let mut line = Line::from(format!(
+                        "  {marker} {:>2}. {}",
+                        choice_idx + 1,
+                        truncate_view_text(&label, usize::from(inner.width).saturating_sub(8))
+                    ));
+                    line.style = if selected {
+                        Style::default()
+                            .fg(palette::SELECTION_TEXT)
+                            .bg(palette::SELECTION_BG)
+                            .bold()
+                    } else {
+                        Style::default().fg(palette::TEXT_PRIMARY)
+                    };
+                    lines.push(line);
+                }
+                *self.last_choice_hitboxes.borrow_mut() = hitboxes;
+
+                if !selected_detail.is_empty()
+                    && lines.len() + reserved_footer_lines < usize::from(inner.height)
+                {
+                    lines.push(Line::from(Span::styled(
+                        crate::tui::ui_text::semantic_truncate(
+                            selected_detail,
+                            usize::from(inner.width),
+                        ),
                         Style::default().fg(palette::TEXT_MUTED),
-                    ),
-                    Span::raw(hint),
-                ]));
+                    )));
+                }
+            } else {
+                lines.push(render_config_editor_value_line(edit, self.locale));
+                if spacious {
+                    lines.push(Line::from(""));
+                }
+                let hint = config_hint_for_key(&edit.key);
+                if !hint.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            self.tr(MessageId::ConfigEditHintLabel),
+                            Style::default().fg(palette::TEXT_MUTED),
+                        ),
+                        Span::raw(hint),
+                    ]));
+                }
             }
             (lines, footer_text)
         } else {
+            *self.last_choice_hitboxes.borrow_mut() = Vec::new();
             let content_height = usize::from(inner.height);
             let items = self.visible_items();
             let match_count = self.matching_row_indices().len();
@@ -3108,8 +3714,9 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionHint, ConfigListItem, ConfigView, EmptyState, HelpView, ListDetailLayout, ModalKind,
-        ModalView, ViewAction, ViewEvent, ViewStack, action_footer_lines, centered_modal_area,
+        ActionHint, ConfigListItem, ConfigScope, ConfigView, EmptyState, HelpView,
+        ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, ViewStack,
+        action_footer_lines, canonical_config_choice, centered_modal_area, config_choice_values,
         config_label_for_key, render_modal_footer, render_underwater_surface, subagent_view_agents,
         truncate_view_text,
     };
@@ -3368,10 +3975,19 @@ mod tests {
     }
 
     fn create_test_app() -> App {
+        static NEXT_CONFIG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let config_id = NEXT_CONFIG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let isolated_config_path = std::env::temp_dir().join(format!(
+            "codewhale-config-view-test-{}-{config_id}.toml",
+            std::process::id()
+        ));
         let options = TuiOptions {
             model: "deepseek-v4-pro".to_string(),
             workspace: PathBuf::from("."),
-            config_path: None,
+            // ConfigView consults the app's persisted config. Point generic
+            // tests at a unique absent file so developer or concurrent test
+            // settings cannot silently change which controls are editable.
+            config_path: Some(isolated_config_path),
             config_profile: None,
             allow_shell: false,
             use_alt_screen: true,
@@ -3597,6 +4213,7 @@ mod tests {
         assert!(keys.contains(&"reasoning_effort"));
         assert!(keys.contains(&"base_url"));
         assert!(keys.contains(&"approval_mode"));
+        assert!(keys.contains(&"permission_posture"));
         assert!(keys.contains(&"allow_shell"));
         assert!(keys.contains(&"stream_chunk_timeout_secs"));
         assert!(keys.contains(&"theme"));
@@ -3646,6 +4263,161 @@ mod tests {
                 })
                 .all(|row| !row.editable)
         );
+    }
+
+    #[test]
+    fn config_view_permission_row_tracks_the_controlling_saved_source() {
+        let explicit_dir = TempDir::new().expect("explicit config tempdir");
+        let explicit_path = explicit_dir.path().join("config.toml");
+        fs::write(&explicit_path, "approval_policy = \"auto\"\n").expect("explicit config");
+        let mut app = create_test_app();
+        app.config_path = Some(explicit_path);
+
+        let mut explicit = ConfigView::new_for_app(&app);
+        let row = explicit
+            .rows
+            .iter()
+            .find(|row| row.key == "approval_policy")
+            .expect("explicit approval policy row");
+        assert_eq!(row.value, "auto");
+        assert!(row.editable);
+        assert_eq!(row.scope, ConfigScope::Saved);
+        assert!(
+            explicit
+                .rows
+                .iter()
+                .all(|row| row.key != "permission_posture")
+        );
+        explicit.selected = explicit
+            .rows
+            .iter()
+            .position(|row| row.key == "approval_policy")
+            .expect("approval row index");
+        explicit.start_edit();
+        let use_tui_default = explicit
+            .editing
+            .as_ref()
+            .and_then(|edit| edit.choices.as_ref())
+            .and_then(|choices| {
+                choices
+                    .iter()
+                    .position(|choice| choice == "use-tui-default")
+            })
+            .expect("TUI default choice");
+        explicit
+            .editing
+            .as_mut()
+            .expect("choice editor")
+            .selected_choice = use_tui_default;
+        match explicit.handle_choice_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            ViewAction::Emit(ViewEvent::ConfigUpdated {
+                key,
+                value,
+                persist,
+            }) => {
+                assert_eq!(key, "approval_policy");
+                assert_eq!(value, "use-tui-default");
+                assert!(persist);
+            }
+            other => panic!("expected saved ConfigUpdated event, got {other:?}"),
+        }
+
+        let managed_dir = TempDir::new().expect("managed config tempdir");
+        let requirements_path = managed_dir.path().join("requirements.toml");
+        fs::write(
+            &requirements_path,
+            "allowed_approval_policies = [\"never\"]\n",
+        )
+        .expect("requirements config");
+        let config_path = managed_dir.path().join("config.toml");
+        let requirements_value =
+            toml::Value::String(requirements_path.to_string_lossy().into_owned()).to_string();
+        fs::write(
+            &config_path,
+            format!("approval_policy = \"never\"\nrequirements_path = {requirements_value}\n"),
+        )
+        .expect("managed config");
+        app.config_path = Some(config_path);
+
+        let managed = ConfigView::new_for_app(&app);
+        let row = managed
+            .rows
+            .iter()
+            .find(|row| row.key == "managed_approval_policy")
+            .expect("managed approval policy row");
+        assert!(!row.editable);
+        assert_eq!(row.scope, ConfigScope::Saved);
+        assert!(
+            managed
+                .rows
+                .iter()
+                .all(|row| row.key != "permission_posture" && row.key != "approval_policy")
+        );
+    }
+
+    #[test]
+    fn config_view_provider_uses_full_picker_and_preserves_custom_provider_id() {
+        let dir = TempDir::new().expect("custom provider tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+provider = "acme_ai"
+
+[providers.acme_ai]
+kind = "openai-compatible"
+base_url = "https://api.example.invalid/v1"
+model = "acme-model"
+api_key_env = "ACME_API_KEY"
+"#,
+        )
+        .expect("custom provider config");
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+        app.api_provider = crate::config::ApiProvider::Custom;
+        let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "provider")
+            .expect("provider row");
+
+        let row = &view.rows[view.selected];
+        assert_eq!(row.value, "acme_ai");
+        assert_eq!(row.scope, ConfigScope::Saved);
+        assert!(
+            config_choice_values("provider", app.api_provider).is_none(),
+            "provider must not be truncated to the generic enum chooser"
+        );
+
+        match view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::ExecuteCommand { command },
+            }) => assert_eq!(command, "/provider"),
+            other => panic!("expected full provider picker command, got {other:?}"),
+        }
+        assert!(view.editing.is_none());
+    }
+
+    #[test]
+    fn config_view_model_rows_use_the_full_model_picker() {
+        let app = create_test_app();
+        for key in ["model", "default_model"] {
+            let mut view = ConfigView::new_for_app(&app);
+            view.selected = view
+                .rows
+                .iter()
+                .position(|row| row.key == key)
+                .expect("model row");
+
+            match view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+                ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                    action: CommandPaletteAction::ExecuteCommand { command },
+                }) => assert_eq!(command, "/model", "row {key}"),
+                other => panic!("expected full model picker for {key}, got {other:?}"),
+            }
+            assert!(view.editing.is_none());
+        }
     }
 
     #[test]
@@ -4147,12 +4919,11 @@ base_url = "https://api.xiaomimimo.com/v1"
     fn config_view_enter_and_ctrl_u_emit_config_updated() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
-
-        // Navigate to the "model" row (index 2, after provider and base_url)
-        for _ in 0..2 {
-            view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        }
-        assert_eq!(view.rows[view.selected].key, "model");
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "stream_chunk_timeout_secs")
+            .expect("stream timeout row");
 
         let start = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(start, ViewAction::None));
@@ -4166,7 +4937,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             .expect("editing should remain active after Ctrl+U");
         assert!(cleared.buffer.is_empty());
 
-        for ch in "deepseek-v4-flash".chars() {
+        for ch in "55".chars() {
             let action = view.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
             assert!(matches!(action, ViewAction::None));
         }
@@ -4178,13 +4949,129 @@ base_url = "https://api.xiaomimimo.com/v1"
                 value,
                 persist,
             }) => {
-                assert_eq!(key, "model");
-                assert_eq!(value, "deepseek-v4-flash");
+                assert_eq!(key, "stream_chunk_timeout_secs");
+                assert_eq!(value, "55");
                 assert!(!persist);
             }
             other => panic!("expected config update emit, got {other:?}"),
         }
         assert!(view.editing.is_none());
+    }
+
+    #[test]
+    fn config_view_boolean_rows_toggle_without_text_editing() {
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "low_motion")
+            .expect("low_motion row");
+        let expected =
+            if canonical_config_choice("low_motion", &view.rows[view.selected].value) == "true" {
+                "false"
+            } else {
+                "true"
+            };
+
+        let action = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match action {
+            ViewAction::Emit(ViewEvent::ConfigUpdated {
+                key,
+                value,
+                persist,
+            }) => {
+                assert_eq!(key, "low_motion");
+                assert_eq!(value, expected);
+                assert!(persist);
+            }
+            other => panic!("expected direct boolean update, got {other:?}"),
+        }
+        assert!(view.editing.is_none());
+    }
+
+    #[test]
+    fn config_view_enum_rows_use_a_bounded_choice_list() {
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "default_mode")
+            .expect("default_mode row");
+
+        let start = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(start, ViewAction::None));
+        let edit = view.editing.as_ref().expect("choice editor");
+        assert_eq!(
+            edit.choices.as_deref(),
+            Some(&["agent".to_string(), "plan".to_string()][..])
+        );
+        assert!(
+            edit.choices
+                .as_ref()
+                .expect("startup choices")
+                .iter()
+                .all(|choice| choice != "operate" && choice != "yolo")
+        );
+
+        let _ = view.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        let apply = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match apply {
+            ViewAction::Emit(ViewEvent::ConfigUpdated {
+                key,
+                value,
+                persist,
+            }) => {
+                assert_eq!(key, "default_mode");
+                assert_eq!(value, "plan");
+                assert!(persist);
+            }
+            other => panic!("expected startup choice update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_view_mouse_wheel_moves_rows_and_choice_selection() {
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        let first_row = view.selected;
+
+        let _ = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            view.selected > first_row,
+            "wheel should move the settings list"
+        );
+
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "default_mode")
+            .expect("default_mode row");
+        view.start_edit();
+        view.editing
+            .as_mut()
+            .expect("choice editor")
+            .selected_choice = 0;
+        let _ = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            view.editing
+                .as_ref()
+                .expect("choice editor")
+                .selected_choice,
+            1
+        );
     }
 
     #[test]
@@ -4226,11 +5113,13 @@ base_url = "https://api.xiaomimimo.com/v1"
             row: y,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(matches!(second, ViewAction::None));
-        assert!(
-            view.editing.is_some(),
-            "second click should activate editing"
-        );
+        match second {
+            ViewAction::Emit(ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::ExecuteCommand { command },
+            }) => assert_eq!(command, "/model"),
+            other => panic!("second click should open the model picker, got {other:?}"),
+        }
+        assert!(view.editing.is_none());
     }
 
     #[test]
@@ -4285,6 +5174,11 @@ base_url = "https://api.xiaomimimo.com/v1"
     fn config_view_typing_replaces_on_first_char() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "base_url")
+            .expect("base_url row");
 
         let _ = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let edit = view.editing.as_ref().expect("editing should be active");
@@ -4300,6 +5194,11 @@ base_url = "https://api.xiaomimimo.com/v1"
         let mut app = create_test_app();
         app.ui_locale = Locale::En;
         let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "base_url")
+            .expect("base_url row");
         let _ = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(view.editing.is_some());
 
@@ -4385,6 +5284,21 @@ base_url = "https://api.xiaomimimo.com/v1"
                 );
             }
         }
+    }
+
+    #[test]
+    fn view_stack_masks_links_behind_opaque_modals() {
+        let area = Rect::new(0, 0, 24, 8);
+        crate::tui::osc8::set_frame_links(vec![crate::tui::osc8::LinkRegion {
+            row: 3,
+            col_start: 2,
+            col_end: 18,
+            target: "https://example.invalid/under-modal".to_string(),
+        }]);
+        let mut stack = ViewStack::new();
+        stack.push(BareModal);
+        stack.render(area, &mut Buffer::empty(area));
+        assert!(crate::tui::osc8::take_frame_links().is_empty());
     }
 
     fn buffer_text(buf: &Buffer, area: Rect) -> String {
@@ -4484,8 +5398,8 @@ base_url = "https://api.xiaomimimo.com/v1"
 
         let dump = buffer_text(&buf, area);
         assert!(
-            dump.contains("New:"),
-            "the editable value line must stay visible at 40x12:\n{dump}"
+            dump.contains("Choose:") && dump.contains("Full Access"),
+            "the choice list must stay visible at 40x12:\n{dump}"
         );
     }
 }

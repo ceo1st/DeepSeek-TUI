@@ -26,14 +26,24 @@ pub use line_buffer::LineBuffer;
 /// Default cadence for moving queued provider deltas into visible transcript
 /// text. This intentionally tracks animation frames rather than upstream SSE
 /// cadence, so tiny bursty deltas coalesce into one history/cache mutation.
+///
+/// ~30 FPS (33ms). Full motion may catch up sooner when backlog crosses
+/// [`CATCH_UP_QUEUE_DEPTH`] / [`CATCH_UP_OLDEST_AGE`]; reduced motion never
+/// accelerates — it stays on this steady clock (not a slow typewriter).
 pub const DEFAULT_STREAM_COMMIT_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Queue-depth threshold that pulls the display clock forward (catch-up).
+pub const CATCH_UP_QUEUE_DEPTH: usize = chunking::ENTER_QUEUE_DEPTH_LINES;
+
+/// Oldest-chunk age that pulls the display clock forward (catch-up).
+pub const CATCH_UP_OLDEST_AGE: Duration = chunking::ENTER_OLDEST_AGE;
 
 /// Frame-clock gate for stream display commits.
 ///
 /// Provider deltas may arrive in dozens of tiny chunks inside one event-loop
 /// drain. This clock lets the TUI ingest those bytes cheaply, then mutate the
 /// visible transcript at most once per display beat unless the stream is being
-/// finalized.
+/// finalized or measured backlog demands catch-up.
 #[derive(Debug, Clone)]
 pub struct StreamDisplayClock {
     interval: Duration,
@@ -41,6 +51,9 @@ pub struct StreamDisplayClock {
     next_due_at: Option<Instant>,
     last_commit_at: Option<Instant>,
     commit_count: u64,
+    catch_up_count: u64,
+    /// When true, backlog may pull `next_due_at` forward to `now`.
+    allow_catch_up: bool,
 }
 
 impl Default for StreamDisplayClock {
@@ -57,12 +70,48 @@ impl StreamDisplayClock {
             next_due_at: None,
             last_commit_at: None,
             commit_count: 0,
+            catch_up_count: 0,
+            allow_catch_up: true,
         }
+    }
+
+    /// Enable/disable catch-up acceleration. Reduced motion keeps the steady
+    /// clock and never pulls beats forward.
+    pub fn set_allow_catch_up(&mut self, allow: bool) {
+        self.allow_catch_up = allow;
+    }
+
+    #[must_use]
+    pub fn allow_catch_up(&self) -> bool {
+        self.allow_catch_up
     }
 
     /// Note that at least one stream delta is waiting to become visible.
     pub fn note_delta(&mut self, now: Instant) {
+        self.note_delta_with_backlog(now, 1, None);
+    }
+
+    /// Note a delta together with measured queue pressure.
+    ///
+    /// Normal motion coalesces onto the steady interval unless backlog crosses
+    /// the catch-up thresholds, in which case the next beat is due immediately.
+    pub fn note_delta_with_backlog(
+        &mut self,
+        now: Instant,
+        queued: usize,
+        oldest_age: Option<Duration>,
+    ) {
         self.pending = true;
+        let catch_up = self.allow_catch_up
+            && (queued >= CATCH_UP_QUEUE_DEPTH
+                || oldest_age.is_some_and(|age| age >= CATCH_UP_OLDEST_AGE));
+
+        if catch_up {
+            self.next_due_at = Some(now);
+            self.catch_up_count = self.catch_up_count.saturating_add(1);
+            return;
+        }
+
         if self.next_due_at.is_some() {
             return;
         }
@@ -114,10 +163,15 @@ impl StreamDisplayClock {
         self.next_due_at = None;
         self.last_commit_at = None;
         self.commit_count = 0;
+        self.catch_up_count = 0;
     }
 
     pub fn commit_count(&self) -> u64 {
         self.commit_count
+    }
+
+    pub fn catch_up_count(&self) -> u64 {
+        self.catch_up_count
     }
 }
 /// Collects streaming text and commits complete lines.
@@ -817,5 +871,58 @@ mod tests {
         let first_flush = state.commit_text(0);
         assert_eq!(first_flush, expected);
         assert_eq!(state.finalize_block_text(0), "");
+    }
+
+    #[test]
+    fn normal_clock_catch_up_only_when_backlog_crosses_threshold() {
+        let interval = Duration::from_millis(33);
+        let mut clock = StreamDisplayClock::new(interval);
+        let t0 = Instant::now();
+
+        clock.note_delta(t0);
+        assert!(clock.take_due(t0));
+        // Small backlog after a commit stays on the steady interval.
+        clock.note_delta_with_backlog(
+            t0 + Duration::from_millis(1),
+            3,
+            Some(Duration::from_millis(5)),
+        );
+        assert!(!clock.take_due(t0 + Duration::from_millis(1)));
+        assert_eq!(clock.catch_up_count(), 0);
+
+        // Measured backlog crosses the catch-up threshold → due immediately.
+        clock.note_delta_with_backlog(
+            t0 + Duration::from_millis(2),
+            CATCH_UP_QUEUE_DEPTH,
+            Some(Duration::from_millis(10)),
+        );
+        assert!(clock.take_due(t0 + Duration::from_millis(2)));
+        assert!(clock.catch_up_count() >= 1);
+    }
+
+    #[test]
+    fn reduced_motion_keeps_steady_clock_without_catch_up_or_typewriter() {
+        let interval = Duration::from_millis(33);
+        let mut clock = StreamDisplayClock::new(interval);
+        clock.set_allow_catch_up(false);
+        let t0 = Instant::now();
+
+        clock.note_delta(t0);
+        assert!(clock.take_due(t0));
+        clock.note_delta_with_backlog(
+            t0 + Duration::from_millis(1),
+            CATCH_UP_QUEUE_DEPTH * 2,
+            Some(CATCH_UP_OLDEST_AGE),
+        );
+        // Reduced motion must not pull the beat forward.
+        assert!(!clock.take_due(t0 + Duration::from_millis(1)));
+        assert_eq!(clock.catch_up_count(), 0);
+        assert_eq!(
+            clock.due_in(t0 + Duration::from_millis(1)),
+            Some(Duration::from_millis(32))
+        );
+        assert!(clock.take_due(t0 + interval));
+        // Same interval as full motion — not a slower artificial typewriter.
+        assert_eq!(clock.commit_count(), 2);
     }
 }

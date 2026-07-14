@@ -4,13 +4,16 @@
 //! and retrieve results. Sub-agents run with a filtered toolset and
 //! inherit the workspace configuration from the main session.
 //!
-//! The model-facing surface is the single `agent` tool. Older lifecycle
-//! structs and manager helpers remain executable for persisted records and
-//! internal recovery while the durable runtime is reused by the new surface.
+//! The model-facing creation surface is the `agent` tool. Narrow coordination
+//! tools (`agents/list`, `agents/message`, `agents/followup`,
+//! `agents/interrupt`, `agents/wait`) wrap the same runtime without restoring
+//! the retired lifecycle theater. Older manager helpers remain executable for
+//! persisted records and internal recovery.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,7 +51,14 @@ use crate::tui::app::ReasoningEffort;
 use crate::utils::spawn_supervised;
 use crate::worker_profile::{ModelRoute, ShellPolicy, ToolScope, WorkerRuntimeProfile};
 
+pub mod coord;
 pub mod mailbox;
+
+#[allow(unused_imports)] // re-exported for hosts / tests; registration uses concrete types
+pub use coord::{
+    AgentsFollowupTool, AgentsInterruptTool, AgentsListTool, AgentsMessageTool, AgentsWaitTool,
+    register_coordination_tools,
+};
 #[allow(unused_imports)]
 pub use mailbox::{Mailbox, MailboxEnvelope, MailboxMessage, MailboxReceiver};
 
@@ -70,12 +80,12 @@ fn release_resident_leases_for(agent_id: &str) {
     }
 }
 
-/// Default maximum steps for sub-agent loops. Set to `u32::MAX` to remove the
-/// arbitrary fixed cap (#2034). Sub-agents run until they produce a final text
-/// response (no tool calls), are cancelled by the parent, or hit a configured
-/// explicit budget. Callers that want a hard bound can override `max_steps` on
-/// the `SubAgentManager`.
-const DEFAULT_MAX_STEPS: u32 = u32::MAX;
+/// Child model-turn budgets are finite by role; explicit spawn values are
+/// clamped to the hard ceiling below.
+const MAX_SUBAGENT_STEPS: u32 = 2_000;
+/// Default wall-clock budget for one child run, including model and tool work.
+const DEFAULT_CHILD_WALL_TIME: Duration = Duration::from_secs(30 * 60);
+const MAX_CHILD_WALL_TIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default wall-clock budget for a single sub-agent tool execution. The active
 /// value travels on `SubAgentRuntime::tool_timeout` so a long-but-legitimate
 /// tool (a large build, a slow shell command, a deep search) is not killed
@@ -88,14 +98,23 @@ const MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS: usize = 32;
 
 /// Format a step counter for sub-agent progress messages.
 ///
-/// When `max_steps == u32::MAX` (the default), the denominator is a sentinel
-/// meaning "unbounded" — render just `step N` instead of `step N/4294967295`.
 fn format_step_counter(steps: u32, max_steps: u32) -> String {
-    if max_steps == u32::MAX {
-        format!("step {steps}")
-    } else {
-        format!("step {steps}/{max_steps}")
-    }
+    format!("step {steps}/{max_steps}")
+}
+
+fn resolve_max_steps(role: SubAgentType, explicit: Option<u32>, configured: Option<u32>) -> u32 {
+    explicit
+        .unwrap_or_else(|| {
+            configured.unwrap_or_else(|| WorkerRuntimeProfile::default_max_steps(role))
+        })
+        .min(MAX_SUBAGENT_STEPS)
+}
+
+fn child_wall_time_exhausted_reason(limit: Duration) -> String {
+    format!(
+        "child wall-time budget exhausted (limit: {}s); raise it with wall_time_secs or split the work into smaller independent tasks",
+        limit.as_secs()
+    )
 }
 // Non-streaming sub-agents need enough response budget to carry large tool-call
 // arguments, especially write_file content. The API bills generated tokens, not
@@ -131,6 +150,8 @@ const SUBAGENT_CHECKPOINT_MESSAGE_BUDGET_BYTES: usize = 256 * 1024;
 /// keeps a bounded tail plus the true `message_count` so inspection stays
 /// useful without pinning a whole unbounded transcript in RAM.
 const SUBAGENT_TRANSCRIPT_MESSAGE_BUDGET_BYTES: usize = 1024 * 1024;
+const SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const SUBAGENT_TRANSCRIPT_ARTIFACT_DIR: &str = "subagent-transcripts";
 const SUBAGENT_STATE_SCHEMA_VERSION: u32 = 1;
 const SUBAGENT_STATE_FILE: &str = "subagents.v1.json";
 const SUBAGENT_WORKTREE_ROOT_DIR: &str = ".codewhale-worktrees";
@@ -582,6 +603,55 @@ pub struct AgentRunFollowUpDelivery {
     pub continued_from_checkpoint: bool,
 }
 
+/// Parent → child mail queued by `agents/message` / `agents/followup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedParentMessage {
+    pub text: String,
+    pub queued_at_ms: u64,
+    /// When true, delivery should also attempt a live wake (`followup`).
+    pub wake: bool,
+}
+
+/// Receipt returned by queue / followup coordination helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentMailReceipt {
+    pub agent_id: String,
+    pub status: String,
+    pub queue_depth: usize,
+    pub woke: bool,
+    pub continued_from_checkpoint: bool,
+    /// Present when the child is interrupted_continuable and still has a
+    /// checkpoint handle the parent can re-dispatch with. Live in-place
+    /// resume from `agents/followup` is not automated yet.
+    pub continuation_handle: Option<String>,
+    pub note: String,
+}
+
+/// Compact coordination projection for `agents/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCoordSummary {
+    pub agent_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    pub status: String,
+    pub steps_taken: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_spent_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_remaining_tokens: Option<u64>,
+    #[serde(default)]
+    pub recent_progress: Vec<String>,
+    #[serde(default)]
+    pub queued_mail: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub continuable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRunFollowUpTarget {
     #[serde(default = "default_agent_inspect_tool")]
@@ -953,9 +1023,8 @@ fn default_subagent_artifacts(run_id: &str) -> Vec<AgentRunArtifactRef> {
             kind: "transcript".to_string(),
             name: "transcript_handle".to_string(),
             target: format!("agent:{run_id}"),
-            description:
-                "Use the projection transcript_handle with handle_read for the child transcript."
-                    .to_string(),
+            description: "Open loads the complete private chat artifact; use the bounded transcript_handle with handle_read for slices and artifact metadata."
+                .to_string(),
         },
         AgentRunArtifactRef {
             kind: "receipt".to_string(),
@@ -986,6 +1055,7 @@ fn worker_profile_from_spec(spec: &AgentWorkerSpec) -> WorkerRuntimeProfile {
     profile.tools = worker_tool_scope(&spec.tool_profile);
     profile.model = ModelRoute::Fixed(spec.model.clone());
     profile.max_spawn_depth = spec.max_spawn_depth.saturating_sub(spec.spawn_depth);
+    profile.max_steps = spec.max_steps.min(MAX_SUBAGENT_STEPS);
     profile.background = true;
     profile
 }
@@ -1081,6 +1151,10 @@ pub(crate) struct SubAgentSpawnOptions {
     pub nickname: Option<String>,
     pub fork_context: bool,
     pub token_budget: Option<u64>,
+    /// Optional per-child model-turn override, clamped to the runtime ceiling.
+    pub max_steps: Option<u32>,
+    /// Optional per-child wall-clock override, clamped to the runtime ceiling.
+    pub wall_time: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -1223,6 +1297,8 @@ struct SpawnRequest {
     /// When unset, the child inherits the parent's budget pool or the
     /// configured root default.
     token_budget: Option<u64>,
+    max_steps: Option<u32>,
+    wall_time: Option<Duration>,
     /// Extra tool deny-list from the caller, unioned with the parent runtime's
     /// inherited deny-list. Deny always wins over allow (#4042).
     disallowed_tools: Option<Vec<String>>,
@@ -1230,6 +1306,22 @@ struct SpawnRequest {
     /// `disallowed_tools`. Set `false` to start the child with a clean slate
     /// (only the explicit `disallowed_tools` above, if any, then apply).
     inherit_disallowed_tools: bool,
+    /// Declared child write authority. Not schema decoration: `ReadOnly`
+    /// narrows the child worker profile's write permission before spawn, so a
+    /// child declared read-only cannot run Suggest-level write tools
+    /// (TUI-DOG-017 truthful-affordance gate).
+    write_authority: Option<SpawnWriteAuthority>,
+    /// Declared expected artifact. Surfaced to the child in its prompt so the
+    /// contract the spawner declared is visible to the agent doing the work.
+    expected_artifact: Option<String>,
+}
+
+/// Declared child write authority for a (deliberate) spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnWriteAuthority {
+    ReadOnly,
+    WorkspaceWrite,
+    WorktreeWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1375,11 +1467,11 @@ pub struct SubAgentCompletion {
 }
 
 /// Parent transcript snapshot available to sub-agents that opt into context
-/// forking. The system prompt and leading messages are kept byte-identical to
-/// the parent request so DeepSeek's prefix cache can reuse the warmed prefix.
+/// forking. Leading messages may be inherited as context, but every child
+/// keeps its own resolved system prompt so parent-specific model identity or
+/// role text cannot override the worker's actual route and instructions.
 #[derive(Clone, Debug)]
 pub struct SubAgentForkContext {
-    pub system: Option<SystemPrompt>,
     pub messages: Vec<Message>,
     pub structured_state_block: Option<String>,
 }
@@ -1831,6 +1923,12 @@ pub struct SubAgent {
     /// agent as in-session vs prior-session at list time.
     pub session_boot_id: String,
     pub workspace: PathBuf,
+    /// Internal completion/cancellation arbitration bit. While set, the task
+    /// has won the right to publish its terminal notifications, but the public
+    /// status deliberately remains `Running` until those notifications are
+    /// queued (#1961). Competing cancellation/interrupt paths must treat the
+    /// claim as terminal ownership and leave the task to finalize.
+    completion_claimed: bool,
     input_tx: Option<mpsc::UnboundedSender<SubAgentInput>>,
     task_handle: Option<JoinHandle<()>>,
 }
@@ -1873,6 +1971,7 @@ impl SubAgent {
             allowed_tools,
             session_boot_id,
             workspace,
+            completion_claimed: false,
             input_tx: Some(input_tx),
             task_handle: None,
         }
@@ -1918,7 +2017,7 @@ pub struct SubAgentManager {
     #[allow(dead_code)] // Stored for future workspace-scoped operations
     workspace: PathBuf,
     state_path: Option<PathBuf>,
-    max_steps: u32,
+    max_steps: Option<u32>,
     max_agents: usize,
     max_admitted_agents: usize,
     default_token_budget: Option<u64>,
@@ -1949,6 +2048,11 @@ pub struct SubAgentManager {
     /// write-locked `cleanup` on a bounded cadence, so a UI refresh storm during
     /// a sub-agent fanout no longer contends for the write lock on every request.
     last_cleanup_at: Option<Instant>,
+    /// Parent mail queued by `agents/message` without waking the child.
+    /// `agents/followup` drains into `input_tx` when a live wake is possible.
+    queued_mail: HashMap<String, VecDeque<QueuedParentMessage>>,
+    /// Test/observability: agent ids that received a live wake via followup.
+    woken_agents: HashMap<String, bool>,
 }
 
 impl SubAgentManager {
@@ -1961,7 +2065,7 @@ impl SubAgentManager {
             worker_event_seq: 0,
             workspace,
             state_path: None,
-            max_steps: DEFAULT_MAX_STEPS,
+            max_steps: None,
             max_agents,
             max_admitted_agents: max_agents,
             default_token_budget: None,
@@ -1977,6 +2081,8 @@ impl SubAgentManager {
             last_persist_at: None,
             persist_pending: false,
             last_cleanup_at: None,
+            queued_mail: HashMap::new(),
+            woken_agents: HashMap::new(),
         }
     }
 
@@ -2288,6 +2394,7 @@ impl SubAgentManager {
                 // manager treats that the same as a non-matching id —
                 // i.e. agent classified as prior-session.
                 session_boot_id: persisted.session_boot_id,
+                completion_claimed: false,
                 input_tx: None,
                 task_handle: None,
             };
@@ -2402,7 +2509,7 @@ impl SubAgentManager {
         let remaining = limit.saturating_sub(spent);
         if remaining < MIN_SUBAGENT_SPAWN_TOKEN_RESERVE {
             return Err(anyhow!(
-                "Sub-agent token budget exhausted for scope {scope_id}: {spent}/{limit} tokens spent, {remaining} remaining. Wait for the parent/Workflow to summarize results or start a new agent run with an explicit token_budget override."
+                "Sub-agent token budget exhausted for scope {scope_id}: {spent}/{limit} tokens spent, {remaining} remaining. Wait for the parent/Workflow to summarize results or start a fresh agent run."
             ));
         }
         Ok(Some(AgentUsageBudgetScope {
@@ -2625,7 +2732,7 @@ impl SubAgentManager {
                 .agents
                 .get_mut(&agent_id)
                 .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
-            if agent.status != SubAgentStatus::Running {
+            if agent.status != SubAgentStatus::Running || agent.completion_claimed {
                 return Ok(agent.snapshot());
             }
             agent.status = SubAgentStatus::Cancelled;
@@ -2646,6 +2753,344 @@ impl SubAgentManager {
         );
         self.persist_state_best_effort();
         Ok(snapshot)
+    }
+
+    /// Queue parent mail without waking the child (`agents/message`).
+    pub fn queue_parent_message(
+        &mut self,
+        agent_ref: &str,
+        text: String,
+        wake: bool,
+    ) -> Result<ParentMailReceipt> {
+        let agent_id = self.resolve_agent_ref(agent_ref)?;
+        let status = self
+            .agents
+            .get(&agent_id)
+            .map(|agent| subagent_status_name(&agent.status).to_string())
+            .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
+        let entry = QueuedParentMessage {
+            text,
+            queued_at_ms: epoch_millis_now(),
+            wake,
+        };
+        let queue = self.queued_mail.entry(agent_id.clone()).or_default();
+        queue.push_back(entry);
+        let queue_depth = queue.len();
+        Ok(ParentMailReceipt {
+            agent_id,
+            status,
+            queue_depth,
+            woke: false,
+            continued_from_checkpoint: false,
+            continuation_handle: None,
+            note: "queued without wake".to_string(),
+        })
+    }
+
+    /// Queue mail and attempt a live wake (`agents/followup`).
+    pub fn followup_child(&mut self, agent_ref: &str, text: String) -> Result<ParentMailReceipt> {
+        let mut receipt = self.queue_parent_message(agent_ref, text.clone(), true)?;
+        let agent_id = receipt.agent_id.clone();
+        let status = self
+            .agents
+            .get(&agent_id)
+            .map(|agent| agent.status.clone())
+            .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
+        let has_input_tx = self
+            .agents
+            .get(&agent_id)
+            .is_some_and(|agent| agent.input_tx.is_some());
+        let continuation_handle = self.agents.get(&agent_id).and_then(|agent| {
+            agent.checkpoint.as_ref().and_then(|cp| {
+                (cp.continuable && !cp.messages.is_empty()).then(|| cp.continuation_handle.clone())
+            })
+        });
+        let continuable = continuation_handle.is_some();
+
+        match status {
+            SubAgentStatus::Running if has_input_tx => {
+                let pending = self.queued_mail.remove(&agent_id).unwrap_or_default();
+                if let Some(agent) = self.agents.get_mut(&agent_id)
+                    && let Some(tx) = agent.input_tx.as_ref()
+                {
+                    for mail in pending {
+                        let _ = tx.send(SubAgentInput {
+                            text: mail.text,
+                            interrupt: false,
+                        });
+                    }
+                }
+                self.woken_agents.insert(agent_id.clone(), true);
+                receipt.woke = true;
+                receipt.queue_depth = 0;
+                receipt.continuation_handle = None;
+                receipt.note = "queued and delivered to running child".to_string();
+                if let Some(record) = self.worker_records.get_mut(&agent_id) {
+                    record.follow_up.latest_delivery = Some(AgentRunFollowUpDelivery {
+                        delivered: true,
+                        timestamp_ms: epoch_millis_now(),
+                        message_preview: Some(truncate_preview(&text, 120)),
+                        reason: None,
+                        interrupt: false,
+                        continued_from_checkpoint: false,
+                    });
+                }
+            }
+            SubAgentStatus::Running => {
+                receipt.woke = false;
+                receipt.note =
+                    "queued; running child has no live input channel (likely stale handle)"
+                        .to_string();
+            }
+            SubAgentStatus::Interrupted(_) => {
+                // Honest gap: checkpoints are preserved and the continuation
+                // handle is returned, but there is no in-process
+                // `run_subagent_from_checkpoint` substrate yet. Auto-resume
+                // would require re-spawning with seeded checkpoint messages
+                // (new agent loop + runtime client), not just waking input_tx.
+                receipt.woke = false;
+                receipt.continued_from_checkpoint = false;
+                receipt.continuation_handle = continuation_handle.clone();
+                receipt.note = if continuable {
+                    format!(
+                        "queued; child is interrupted_continuable — live checkpoint resume is not automated (no run_subagent_from_checkpoint substrate). Re-dispatch via agent using continuation_handle={}",
+                        continuation_handle.as_deref().unwrap_or("<missing>")
+                    )
+                } else {
+                    "queued; child is interrupted without a continuable checkpoint".to_string()
+                };
+                if let Some(record) = self.worker_records.get_mut(&agent_id) {
+                    record.follow_up.latest_delivery = Some(AgentRunFollowUpDelivery {
+                        delivered: false,
+                        timestamp_ms: epoch_millis_now(),
+                        message_preview: Some(truncate_preview(&text, 120)),
+                        reason: Some(receipt.note.clone()),
+                        interrupt: false,
+                        continued_from_checkpoint: false,
+                    });
+                }
+            }
+            other => {
+                receipt.woke = false;
+                receipt.note = format!(
+                    "queued; child status is {} — no live wake performed",
+                    subagent_status_name(&other)
+                );
+            }
+        }
+        Ok(receipt)
+    }
+
+    /// Interrupt a child, preserve checkpoint, fail closed on root/self.
+    pub fn interrupt_child(
+        &mut self,
+        agent_ref: &str,
+        caller_agent_id: Option<&str>,
+        reason: String,
+    ) -> Result<(SubAgentResult, SubAgentResult)> {
+        if agent_ref.trim().eq_ignore_ascii_case("root") {
+            return Err(anyhow!(
+                "Refusing to interrupt root. agents/interrupt fails closed on the root session."
+            ));
+        }
+        let agent_id = self.resolve_agent_ref(agent_ref)?;
+        if caller_agent_id.is_some_and(|caller| caller == agent_id) {
+            return Err(anyhow!(
+                "Refusing to interrupt self (agent_id '{agent_id}'). agents/interrupt fails closed on the calling agent."
+            ));
+        }
+
+        let prior = self.get_result_by_ref(&agent_id)?;
+        if prior.status != SubAgentStatus::Running
+            || self
+                .agents
+                .get(&agent_id)
+                .is_some_and(|agent| agent.completion_claimed)
+        {
+            return Ok((prior.clone(), prior));
+        }
+
+        // Build a continuable checkpoint from the latest stored checkpoint or a
+        // minimal placeholder so interrupt never drops recoverability silently.
+        let checkpoint = {
+            let agent = self
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
+            agent.checkpoint.clone().unwrap_or_else(|| {
+                build_subagent_checkpoint(&agent_id, &reason, &[], agent.steps_taken, true)
+            })
+        };
+
+        // Abort the live task after snapshotting prior state.
+        {
+            let agent = self
+                .agents
+                .get_mut(&agent_id)
+                .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
+            if let Some(handle) = agent.task_handle.take() {
+                handle.abort();
+            }
+            agent.input_tx = None;
+        }
+        release_resident_leases_for(&agent_id);
+
+        let snapshot = self.interrupt_with_checkpoint(&agent_id, reason, checkpoint, None)?;
+        Ok((prior, snapshot))
+    }
+
+    /// Bounded coordination summaries for `agents/list`.
+    pub fn list_coordination_summaries(
+        &self,
+        include_archived: bool,
+        recent_limit: usize,
+    ) -> Vec<AgentCoordSummary> {
+        self.list_filtered(include_archived)
+            .into_iter()
+            .filter_map(|snap| {
+                self.coordination_summary_for(&snap.agent_id, recent_limit)
+                    .ok()
+            })
+            .collect()
+    }
+
+    pub fn coordination_summary_for(
+        &self,
+        agent_ref: &str,
+        recent_limit: usize,
+    ) -> Result<AgentCoordSummary> {
+        let agent_id = self.resolve_agent_ref(agent_ref)?;
+        let snap = self.get_result_by_ref(&agent_id)?;
+        let record = self.worker_records.get(&agent_id);
+        let recent_progress = record
+            .map(|r| {
+                r.events
+                    .iter()
+                    .rev()
+                    .filter_map(|ev| ev.message.clone())
+                    .take(recent_limit)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let queued_mail = self
+            .queued_mail
+            .get(&agent_id)
+            .map(VecDeque::len)
+            .unwrap_or(0);
+        let continuable = subagent_checkpoint_is_continuable(&snap);
+        Ok(AgentCoordSummary {
+            agent_id: snap.agent_id.clone(),
+            name: snap.name.clone(),
+            parent_run_id: record.and_then(|r| r.parent_run_id.clone()),
+            status: subagent_status_name(&snap.status).to_string(),
+            steps_taken: snap.steps_taken,
+            token_budget: record.and_then(|r| r.usage.token_budget),
+            budget_spent_tokens: record.and_then(|r| r.usage.budget_spent_tokens),
+            budget_remaining_tokens: record.and_then(|r| r.usage.budget_remaining_tokens),
+            recent_progress,
+            queued_mail,
+            checkpoint_id: snap.checkpoint.as_ref().map(|c| c.checkpoint_id.clone()),
+            continuable,
+        })
+    }
+
+    #[allow(dead_code)] // coord list/wait surfaces; wired when agents/list hosts go live
+    pub fn queued_mail_depth(&self, agent_id: &str) -> Option<usize> {
+        self.queued_mail.get(agent_id).map(VecDeque::len)
+    }
+
+    #[allow(dead_code)] // followup honesty probe for coordination tools
+    pub fn child_was_woken(&self, agent_id: &str) -> bool {
+        self.woken_agents.get(agent_id).copied().unwrap_or(false)
+    }
+
+    /// Fingerprint of recent progress for activity waits.
+    pub fn activity_fingerprint(&self, agent_id: &str) -> Option<u64> {
+        let agent = self.agents.get(agent_id)?;
+        let record = self.worker_records.get(agent_id);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        subagent_status_name(&agent.status).hash(&mut hasher);
+        agent.steps_taken.hash(&mut hasher);
+        if let Some(record) = record {
+            record.events.len().hash(&mut hasher);
+            if let Some(last) = record.events.back() {
+                last.seq.hash(&mut hasher);
+                last.message.hash(&mut hasher);
+            }
+        }
+        let queued = self
+            .queued_mail
+            .get(agent_id)
+            .map(VecDeque::len)
+            .unwrap_or(0);
+        queued.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    /// Test helper: seed a running child with a live input channel.
+    #[cfg(test)]
+    pub fn insert_test_running_agent(&mut self, name: &str, workspace: &Path) -> String {
+        let agent_id = format!("agent_{name}");
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut agent = SubAgent::new(
+            agent_id.clone(),
+            SubAgentType::General,
+            "test".to_string(),
+            SubAgentAssignment::new("test".to_string(), None),
+            "test-model".to_string(),
+            None,
+            None,
+            input_tx,
+            workspace.to_path_buf(),
+            self.current_session_boot_id.clone(),
+        );
+        agent.session_name = name.to_string();
+        agent.status = SubAgentStatus::Running;
+        self.agents.insert(agent_id.clone(), agent);
+        let spec = AgentWorkerSpec {
+            worker_id: agent_id.clone(),
+            run_id: agent_id.clone(),
+            parent_run_id: Some("parent_session".to_string()),
+            session_name: Some(name.to_string()),
+            objective: "test".to_string(),
+            role: None,
+            agent_type: SubAgentType::General,
+            model: "test-model".to_string(),
+            workspace: workspace.to_path_buf(),
+            git_branch: None,
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            tool_profile: AgentWorkerToolProfile::Inherited,
+            runtime_profile: WorkerRuntimeProfile::default(),
+            max_steps: WorkerRuntimeProfile::default().max_steps,
+            spawn_depth: 1,
+            max_spawn_depth: 3,
+        };
+        self.register_worker(spec);
+        agent_id
+    }
+
+    /// Test helper: seed an interrupted_continuable child with a checkpoint.
+    #[cfg(test)]
+    pub fn insert_test_interrupted_continuable_agent(
+        &mut self,
+        name: &str,
+        workspace: &Path,
+        messages: Vec<crate::models::Message>,
+    ) -> (String, String) {
+        let agent_id = self.insert_test_running_agent(name, workspace);
+        let checkpoint = build_subagent_checkpoint(&agent_id, "test_interrupt", &messages, 1, true);
+        let handle = checkpoint.continuation_handle.clone();
+        if let Some(agent) = self.agents.get_mut(&agent_id) {
+            agent.status = SubAgentStatus::Interrupted("test interrupt".to_string());
+            agent.checkpoint = Some(checkpoint);
+            agent.input_tx = None;
+            agent.task_handle = None;
+        }
+        (agent_id, handle)
     }
 
     /// Count running agents.
@@ -2850,7 +3295,6 @@ impl SubAgentManager {
         agent.fork_context = options.fork_context;
         let agent_id = agent.id.clone();
         let started_at = agent.started_at;
-        let max_steps = self.max_steps;
         let tool_profile = match tools.clone() {
             Some(tools) => AgentWorkerToolProfile::Explicit(tools),
             None => AgentWorkerToolProfile::Inherited,
@@ -2863,6 +3307,12 @@ impl SubAgentManager {
             options.model_route.clone(),
         );
         runtime.worker_profile = runtime_profile.clone();
+        let max_steps = resolve_max_steps(agent_type.clone(), options.max_steps, self.max_steps);
+        runtime.worker_profile.max_steps = max_steps;
+        let wall_time = options
+            .wall_time
+            .unwrap_or(DEFAULT_CHILD_WALL_TIME)
+            .min(MAX_CHILD_WALL_TIME);
         let worker_spec = AgentWorkerSpec {
             worker_id: agent_id.clone(),
             run_id: agent_id.clone(),
@@ -2918,6 +3368,7 @@ impl SubAgentManager {
             started_at,
             max_steps,
             token_budget: options.token_budget,
+            wall_time,
             input_rx,
             launch_gate,
         };
@@ -3057,11 +3508,20 @@ impl SubAgentManager {
     pub fn cleanup(&mut self, max_age: Duration) -> usize {
         let before = self.agents.len();
         let before_workers = self.worker_records.len();
+        let mut transcript_candidates: Vec<String> = self
+            .agents
+            .keys()
+            .chain(self.worker_records.keys())
+            .cloned()
+            .collect();
+        transcript_candidates.sort();
+        transcript_candidates.dedup();
         let mut auto_cancelled = 0;
         let timeout = self.running_heartbeat_timeout;
         let mut worker_cancellations = Vec::new();
         for agent in self.agents.values_mut() {
             if agent.status == SubAgentStatus::Running
+                && !agent.completion_claimed
                 && agent.task_handle.is_some()
                 && agent.last_activity_at.elapsed() >= timeout
             {
@@ -3118,6 +3578,23 @@ impl SubAgentManager {
             let anchor_ms = record.completed_at_ms.unwrap_or(record.updated_at_ms);
             now_ms.saturating_sub(anchor_ms) < max_age_ms
         });
+        // The transcript artifact follows the same retention lifecycle as the
+        // worker ledger. Keep it while either the agent or worker record is
+        // inspectable; once both age out, remove the one deterministic file so
+        // long-lived workspaces do not accumulate silent transcript copies.
+        for agent_id in transcript_candidates {
+            if self.agents.contains_key(&agent_id) || self.worker_records.contains_key(&agent_id) {
+                continue;
+            }
+            if let Err(err) = remove_subagent_transcript_artifact(&self.workspace, &agent_id) {
+                tracing::warn!(
+                    target: "subagent",
+                    ?err,
+                    agent_id,
+                    "failed to remove expired sub-agent transcript artifact"
+                );
+            }
+        }
         if self.agents.len() != before
             || auto_cancelled > 0
             || self.worker_records.len() != before_workers
@@ -3138,40 +3615,68 @@ impl SubAgentManager {
             .is_none_or(|last| last.elapsed() >= min_interval)
     }
 
-    fn update_from_result(&mut self, agent_id: &str, result: SubAgentResult) {
-        let mut changed = false;
-        if let Some(agent) = self.agents.get_mut(agent_id) {
-            agent.status = result.status.clone();
-            agent.assignment = result.assignment.clone();
-            agent.result = result.result.clone();
-            agent.steps_taken = result.steps_taken;
-            agent.checkpoint = result.checkpoint.clone();
-            agent.needs_input = result.needs_input.clone();
-            if result.status != SubAgentStatus::Running {
-                agent.input_tx = None;
-            }
-            agent.task_handle = None;
-            changed = true;
+    /// Claim terminal delivery if this task is still the running owner.
+    ///
+    /// The claim excludes cancellation while deliberately leaving the public
+    /// status `Running`. `run_subagent_task` can therefore queue completion to
+    /// the parent before the running-child gate closes (#1961), without
+    /// holding this manager lock across any external send.
+    fn claim_terminal_delivery(&mut self, agent_id: &str) -> bool {
+        let Some(agent) = self.agents.get_mut(agent_id) else {
+            return false;
+        };
+        if agent.status != SubAgentStatus::Running || agent.completion_claimed {
+            return false;
         }
-        self.complete_worker_from_result(agent_id, &result);
-        if changed {
-            self.persist_state_best_effort();
-        }
+        agent.completion_claimed = true;
+        true
     }
 
-    fn update_failed(&mut self, agent_id: &str, error: String) {
-        let mut changed = false;
-        if let Some(agent) = self.agents.get_mut(agent_id) {
-            agent.status = SubAgentStatus::Failed(error.clone());
-            release_resident_leases_for(agent_id);
+    /// Commit a claimed natural task result.
+    ///
+    /// Returns `true` only when the prior claim still owns the terminal
+    /// transition. External notification is deliberately queued between
+    /// [`Self::claim_terminal_delivery`] and this commit.
+    fn update_from_result(&mut self, agent_id: &str, result: SubAgentResult) -> bool {
+        let Some(agent) = self.agents.get_mut(agent_id) else {
+            return false;
+        };
+        if agent.status != SubAgentStatus::Running || !agent.completion_claimed {
+            return false;
+        }
+        agent.status = result.status.clone();
+        agent.assignment = result.assignment.clone();
+        agent.result = result.result.clone();
+        agent.steps_taken = result.steps_taken;
+        agent.checkpoint = result.checkpoint.clone();
+        agent.needs_input = result.needs_input.clone();
+        if result.status != SubAgentStatus::Running {
             agent.input_tx = None;
-            agent.task_handle = None;
-            changed = true;
         }
+        agent.completion_claimed = false;
+        agent.task_handle = None;
+        self.complete_worker_from_result(agent_id, &result);
+        self.persist_state_best_effort();
+        true
+    }
+
+    /// Commit a claimed task failure.
+    /// See [`Self::update_from_result`] for the external-delivery contract.
+    fn update_failed(&mut self, agent_id: &str, error: String) -> bool {
+        let Some(agent) = self.agents.get_mut(agent_id) else {
+            return false;
+        };
+        if agent.status != SubAgentStatus::Running || !agent.completion_claimed {
+            return false;
+        }
+        agent.status = SubAgentStatus::Failed(error.clone());
+        agent.completion_claimed = false;
+        release_resident_leases_for(agent_id);
+        agent.input_tx = None;
+        agent.task_handle = None;
         self.fail_worker(agent_id, error);
-        if changed {
-            self.persist_state_best_effort();
-        }
+        self.persist_state_best_effort();
+        true
     }
 
     fn update_checkpoint(&mut self, agent_id: &str, checkpoint: SubAgentCheckpoint) -> bool {
@@ -3426,6 +3931,183 @@ async fn subagent_session_projection(
     }
 }
 
+/// Append-only, per-run backing store for the worker's complete structured
+/// message stream. The in-memory `full_transcript` handle deliberately keeps a
+/// bounded tail; this artifact is the durable source used by the TUI's Open
+/// action when the conversation is larger than that tail.
+struct SubAgentTranscriptArtifactWriter {
+    workspace: PathBuf,
+    path: PathBuf,
+    relative_path: PathBuf,
+    persisted_messages: usize,
+}
+
+impl SubAgentTranscriptArtifactWriter {
+    async fn for_runtime(runtime: &SubAgentRuntime, agent_id: &str) -> Result<Self> {
+        let workspace = runtime.manager.read().await.workspace.clone();
+        Self::create(&workspace, agent_id)
+    }
+
+    fn create(workspace: &Path, agent_id: &str) -> Result<Self> {
+        let workspace = normalize_subagent_workspace(workspace);
+        let relative_path = subagent_transcript_artifact_relative_path(agent_id);
+        let path = checked_subagent_transcript_artifact_path(&workspace, agent_id)?;
+        let header = json!({
+            "kind": "subagent_transcript_header",
+            "schema_version": SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION,
+            "agent_id": agent_id,
+        });
+        create_private_subagent_transcript(&workspace, &path, &json_line(&header)?)?;
+        Ok(Self {
+            workspace,
+            path,
+            relative_path,
+            persisted_messages: 0,
+        })
+    }
+
+    fn sync_messages(&mut self, messages: &[Message], durable: bool) -> Result<()> {
+        if messages.len() < self.persisted_messages {
+            return Err(anyhow!(
+                "sub-agent transcript history shrank from {} to {} messages",
+                self.persisted_messages,
+                messages.len()
+            ));
+        }
+
+        let mut encoded = Vec::new();
+        for (index, message) in messages.iter().enumerate().skip(self.persisted_messages) {
+            encoded.extend(json_line(&json!({
+                "kind": "message",
+                "index": index,
+                "message": message,
+            }))?);
+        }
+
+        if !encoded.is_empty() || durable {
+            append_private_subagent_transcript(&self.workspace, &self.path, &encoded, durable)?;
+        }
+        self.persisted_messages = messages.len();
+        Ok(())
+    }
+
+    fn metadata(&self, complete: bool) -> Value {
+        json!({
+            "kind": "subagent_transcript_jsonl",
+            "schema_version": SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION,
+            "relative_path": self.relative_path,
+            "persisted_messages": self.persisted_messages,
+            "complete": complete,
+            "contains_session_content": true,
+        })
+    }
+}
+
+fn json_line(value: &Value) -> Result<Vec<u8>> {
+    let mut encoded = serde_json::to_vec(value)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn subagent_transcript_artifact_relative_path(agent_id: &str) -> PathBuf {
+    let digest = crate::hashing::sha256_hex(agent_id.as_bytes());
+    Path::new(".codewhale")
+        .join("state")
+        .join(SUBAGENT_TRANSCRIPT_ARTIFACT_DIR)
+        .join(format!("{digest}.jsonl"))
+}
+
+fn checked_subagent_transcript_artifact_path(workspace: &Path, agent_id: &str) -> Result<PathBuf> {
+    checked_subagent_state_path(
+        workspace,
+        &subagent_transcript_artifact_relative_path(agent_id),
+    )
+}
+
+/// Read the complete structured worker chat for the TUI Open action. The path
+/// is derived from `agent_id` rather than accepted from handle JSON, so a
+/// corrupted or model-supplied payload cannot redirect the reader outside the
+/// manager workspace.
+pub(crate) fn load_subagent_transcript_artifact(
+    workspace: &Path,
+    agent_id: &str,
+) -> Result<Vec<Message>> {
+    let workspace = normalize_subagent_workspace(workspace);
+    let path = checked_subagent_transcript_artifact_path(&workspace, agent_id)?;
+    let raw = read_subagent_state_file(&workspace, &path)?;
+    let mut lines = raw.lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("sub-agent transcript artifact is empty"))?;
+    let header: Value = serde_json::from_str(header_line)?;
+    if header.get("kind").and_then(Value::as_str) != Some("subagent_transcript_header")
+        || header.get("schema_version").and_then(Value::as_u64)
+            != Some(u64::from(SUBAGENT_TRANSCRIPT_ARTIFACT_SCHEMA_VERSION))
+        || header.get("agent_id").and_then(Value::as_str) != Some(agent_id)
+    {
+        return Err(anyhow!(
+            "sub-agent transcript artifact header does not match agent {agent_id}"
+        ));
+    }
+
+    let mut messages = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line)?;
+        if record.get("kind").and_then(Value::as_str) != Some("message") {
+            return Err(anyhow!("unknown sub-agent transcript artifact record"));
+        }
+        let index = record
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow!("sub-agent transcript message is missing its index"))?;
+        if index != messages.len() {
+            return Err(anyhow!(
+                "sub-agent transcript message index {index} does not follow {}",
+                messages.len()
+            ));
+        }
+        let message = serde_json::from_value::<Message>(
+            record
+                .get("message")
+                .cloned()
+                .ok_or_else(|| anyhow!("sub-agent transcript record is missing its message"))?,
+        )?;
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
+fn remove_subagent_transcript_artifact(workspace: &Path, agent_id: &str) -> Result<bool> {
+    let workspace = normalize_subagent_workspace(workspace);
+    let path = checked_subagent_transcript_artifact_path(&workspace, agent_id)?;
+    reject_workspace_relative_symlinks(&workspace, &path)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(anyhow!(
+            "sub-agent transcript artifact is not a regular file: {}",
+            path.display()
+        ));
+    }
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn write_subagent_transcript_artifact_for_test(
+    workspace: &Path,
+    agent_id: &str,
+    messages: &[Message],
+) -> Result<PathBuf> {
+    let mut writer = SubAgentTranscriptArtifactWriter::create(workspace, agent_id)?;
+    writer.sync_messages(messages, true)?;
+    Ok(writer.path)
+}
+
 fn default_state_path(workspace: &Path) -> Result<PathBuf> {
     let workspace = normalize_subagent_workspace(workspace);
     // Canonical post-rebrand state path. On first run the file won't exist yet;
@@ -3558,10 +4240,91 @@ fn open_subagent_state_file(path: &Path) -> Result<fs::File> {
     fs::File::open(path).map_err(Into::into)
 }
 
+fn prepare_subagent_transcript_parent(workspace: &Path, path: &Path) -> Result<()> {
+    reject_workspace_relative_symlinks(workspace, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("sub-agent transcript artifact must have a parent directory"))?;
+    fs::create_dir_all(parent)?;
+    // Re-check after creation so a pre-existing component cannot redirect the
+    // private transcript outside the workspace.
+    reject_workspace_relative_symlinks(workspace, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_private_subagent_transcript(workspace: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    prepare_subagent_transcript_parent(workspace, path)?;
+    let mut file = open_private_subagent_transcript(path, false)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn append_private_subagent_transcript(
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+    durable: bool,
+) -> Result<()> {
+    reject_workspace_relative_symlinks(workspace, path)?;
+    let mut file = open_private_subagent_transcript(path, true)?;
+    if !bytes.is_empty() {
+        file.write_all(bytes)?;
+    }
+    if durable {
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_subagent_transcript(path: &Path, append: bool) -> Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .write(true)
+        .append(append)
+        .create(!append)
+        .truncate(!append)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600);
+    let file = options.open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_subagent_transcript(path: &Path, append: bool) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .append(append)
+        .create(!append)
+        .truncate(!append)
+        .open(path)
+        .map_err(Into::into)
+}
+
 fn epoch_millis_now() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         Err(_) => 0,
+    }
+}
+
+/// Compact preview for follow-up delivery receipts (sibling coord surface).
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
     }
 }
 
@@ -3717,12 +4480,11 @@ impl ToolSpec for AgentTool {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Start, inspect, peek at, or cancel focused child agent tasks through one surface. Use start only for independent work that benefits from a clean context. ",
-            "For several independent targets, call agent separately for each target; CodeWhale runs or queues them under runtime capacity and provider rate-limit backpressure. ",
-            "The child runs in the background and reports back automatically when finished; keep tiny reads/searches local. ",
-            "Pass profile to spawn a saved Fleet roster member (e.g. reviewer, scout, builder) with its role posture, model routing, and instructions. ",
-            "Use action=status or action=peek with agent_id to inspect progress, and action=cancel with agent_id to stop a running child. Returns session projections with transcript_handle for UI/debug inspection. ",
-            "Never poll with repeated peek/status calls or sleep while children run: results arrive automatically as completion sentinels. If you must block until a child finishes (fan-in before synthesis), make one action=wait call — it blocks until a child settles (all children when agent_id is omitted; timeout_secs caps the block, default 300)."
+            "Start a focused child agent task. Prefer deliberate delegation: declare type (or profile), ",
+            "workspace_policy, expected_artifact, and write_authority (deliberate=true makes them required). ",
+            "For coordination after spawn, use agents/list, agents/message, agents/followup, agents/interrupt, and agents/wait — ",
+            "do not poll. Pass profile to spawn a saved Fleet roster member. ",
+            "Legacy action=status|peek|wait|cancel remain for compatibility; prefer the narrow agents/* tools."
         )
     }
 
@@ -3768,7 +4530,7 @@ impl ToolSpec for AgentTool {
                 "model_strength": {
                     "type": "string",
                     "enum": ["same", "faster"],
-                    "description": "Optional child model strength. Children inherit the active model by default, including type=explore. Choose faster explicitly for read-only lookup/search, status, or other low-risk tasks that can run on a smaller/faster same-family sibling; CodeWhale maps known families such as DeepSeek V4 Pro to Flash and GLM-5.2 to GLM-5-Turbo. No hidden auto-downgrade happens."
+                    "description": "Optional child model strength. Children inherit the active model by default. Choose faster explicitly for read-only lookup/search, status, or other low-risk tasks that can use the configured fast sibling. The run receipt is authoritative for the resolved route; no hidden auto-downgrade happens."
                 },
                 "model": {
                     "type": "string",
@@ -3809,10 +4571,35 @@ impl ToolSpec for AgentTool {
                     "maximum": 3,
                     "description": "Optional remaining nested-agent depth budget for this child. Defaults to the configured runtime budget."
                 },
-                "token_budget": {
+                "max_steps": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 2000,
+                    "description": "Optional child model-turn budget. Defaults by role (60 for explore/review/plan/verifier, 120 for implementer/general/custom) and is clamped to 2000."
+                },
+                "wall_time_secs": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional aggregate token budget for this child and descendants. When unset, the child inherits the parent budget pool or the configured root default."
+                    "maximum": 86400,
+                    "description": "Optional child wall-clock budget in seconds. Default 1800; clamped to 86400."
+                },
+                "workspace_policy": {
+                    "type": "string",
+                    "enum": ["shared", "worktree"],
+                    "description": "Workspace isolation policy — enforced. worktree creates a fresh git worktree for the child; shared runs in the parent checkout and conflicts with worktree options."
+                },
+                "expected_artifact": {
+                    "type": "string",
+                    "description": "What the child should return (summary, patch path, test report, review findings, …). Appended to the child's prompt so the contract is visible to it."
+                },
+                "write_authority": {
+                    "type": "string",
+                    "enum": ["read_only", "workspace_write", "worktree_write"],
+                    "description": "Write authority for the child — enforced. read_only removes write permission from the child's runtime profile (and its descendants); worktree_write requires worktree isolation."
+                },
+                "deliberate": {
+                    "type": "boolean",
+                    "description": "When true, require type (or profile), workspace_policy, expected_artifact, and write_authority."
                 }
             },
             "required": []
@@ -4361,6 +5148,13 @@ async fn spawn_subagent_from_input(
             }
         }
     }
+    // Enforce declared write authority (TUI-DOG-017): `read_only` narrows the
+    // child's runtime profile so Suggest-level write tools are actually gated,
+    // not just described. `derive_child` intersects permissions, so the
+    // narrowing also binds every grandchild.
+    if spawn_request.write_authority == Some(SpawnWriteAuthority::ReadOnly) {
+        child_runtime.worker_profile.permissions.write = false;
+    }
     // Resolve the model once against the CHILD's (possibly profile-pinned)
     // provider. The typed selection carries both precedence and provenance so
     // a role default cannot override a saved AgentProfile model (#4177).
@@ -4395,6 +5189,15 @@ async fn spawn_subagent_from_input(
         (prefixed, conflict)
     } else {
         (spawn_request.prompt, None)
+    };
+    // Surface the declared expected artifact to the child so the deliberate
+    // contract is visible to the agent doing the work, not just validated at
+    // the parse boundary (TUI-DOG-017).
+    let effective_prompt = match spawn_request.expected_artifact.as_deref() {
+        Some(artifact) => {
+            format!("{effective_prompt}\n\nExpected artifact (declared by the spawner): {artifact}")
+        }
+        None => effective_prompt,
     };
 
     // #4193 seam 2 (cont.): strength/inherit/faster routing and the final
@@ -4457,6 +5260,8 @@ async fn spawn_subagent_from_input(
                 nickname: None,
                 fork_context: spawn_request.fork_context,
                 token_budget: spawn_request.token_budget,
+                max_steps: spawn_request.max_steps,
+                wall_time: spawn_request.wall_time,
             },
         )
         .map_err(|e| ToolError::execution_failed(format!("Failed to spawn sub-agent: {e}")))?;
@@ -4608,13 +5413,11 @@ fn build_subagent_system_prompt(
     prompt
 }
 
-fn subagent_request_system_prompt(
-    subagent_system_prompt: &str,
-    fork_context: Option<&SubAgentForkContext>,
-) -> SystemPrompt {
-    fork_context
-        .and_then(|context| context.system.clone())
-        .unwrap_or_else(|| SystemPrompt::Text(subagent_system_prompt.to_string()))
+fn subagent_request_system_prompt(subagent_system_prompt: &str) -> SystemPrompt {
+    // Forking inherits conversation context, not the parent's identity. A
+    // child can have a different provider/model/profile, so its own resolved
+    // role prompt must stay at system precedence.
+    SystemPrompt::Text(subagent_system_prompt.to_string())
 }
 
 fn build_initial_subagent_messages(
@@ -4685,6 +5488,8 @@ struct SubAgentTask {
     /// When set, the worker stops with `BudgetExhausted` once its accumulated
     /// model tokens exceed this value. Independent of the scope budget (#3319).
     token_budget: Option<u64>,
+    /// Hard wall-clock deadline for the whole child run.
+    wall_time: Duration,
     input_rx: mpsc::UnboundedReceiver<SubAgentInput>,
     /// Interactive launch gate (#3095). `Some` only for direct (depth-1)
     /// children: the task acquires a permit before its first model step and
@@ -4716,20 +5521,25 @@ async fn run_subagent_task(task: SubAgentTask) {
         }
     }
 
-    let result = run_subagent(
-        &task.runtime,
-        task.agent_id.clone(),
-        task.agent_type,
-        task.prompt,
-        task.assignment,
-        task.allowed_tools,
-        task.fork_context,
-        task.started_at,
-        task.max_steps,
-        task.token_budget,
-        task.input_rx,
+    let deadline = task.started_at + task.wall_time;
+    let result = tokio::time::timeout_at(
+        deadline.into(),
+        run_subagent(
+            &task.runtime,
+            task.agent_id.clone(),
+            task.agent_type,
+            task.prompt,
+            task.assignment,
+            task.allowed_tools,
+            task.fork_context,
+            task.started_at,
+            task.max_steps,
+            task.token_budget,
+            task.input_rx,
+        ),
     )
-    .await;
+    .await
+    .unwrap_or_else(|_| Err(anyhow!(child_wall_time_exhausted_reason(task.wall_time))));
 
     // Emit BOTH a human-friendly summary (rendered in the parent's
     // sidebar / cell) AND a structured sentinel the model can recognize
@@ -4738,7 +5548,7 @@ async fn run_subagent_task(task: SubAgentTask) {
     // (`codewhale:subagent.done`) to avoid collision with normal user
     // text.
     let model_id = task.runtime.model.clone();
-    let (summary, sentinel) = match &result {
+    let (summary, sentinel, failure_error) = match &result {
         Ok(res) => {
             // Issue #2652: the child's free-text result is its self-report, not
             // verified evidence. Stamp it with a provenance marker: a soft
@@ -4754,7 +5564,7 @@ async fn run_subagent_task(task: SubAgentTask) {
                 }
                 _ => subagent_done_sentinel(&task.agent_id, res, truncated),
             };
-            (summary, sentinel)
+            (summary, sentinel, None)
         }
         Err(err) => {
             crate::logging::warn(format!(
@@ -4767,12 +5577,31 @@ async fn run_subagent_task(task: SubAgentTask) {
                 task.runtime.client.api_provider(),
                 &task.runtime.worker_profile.model,
             );
-            (
-                format!("Failed: {annotated}"),
-                subagent_failed_sentinel(&task.agent_id, &annotated),
-            )
+            let sentinel = subagent_failed_sentinel(&task.agent_id, &annotated);
+            (format!("Failed: {annotated}"), sentinel, Some(annotated))
         }
     };
+
+    let payload = format!("{summary}\n{sentinel}");
+    let agent_id = task.agent_id.clone();
+
+    // Claim terminal ownership under the manager lock, then release it before
+    // touching external sinks. The public status stays Running while claimed:
+    // this preserves #1961's running-child gate until parent completion is
+    // queued, while cancel/interrupt/cleanup paths cannot steal the terminal
+    // outcome between notification sends.
+    let completion_claimed = {
+        let mut manager = task.manager_handle.write().await;
+        manager.claim_terminal_delivery(&agent_id)
+    };
+    if !completion_claimed {
+        tracing::debug!(
+            target: "subagent",
+            agent_id = %agent_id,
+            "suppressing late task completion after another terminal outcome won"
+        );
+        return;
+    }
 
     if let Some(mb) = task.runtime.mailbox.as_ref() {
         let envelope = match &result {
@@ -4788,50 +5617,50 @@ async fn run_subagent_task(task: SubAgentTask) {
                     summary: summary.clone(),
                 },
             },
-            Err(err) => MailboxMessage::Failed {
+            Err(_) => MailboxMessage::Failed {
                 agent_id: task.agent_id.clone(),
-                error: annotate_child_model_error(
-                    &subagent_failure_message(err),
-                    &model_id,
-                    task.runtime.client.api_provider(),
-                    &task.runtime.worker_profile.model,
-                ),
+                error: failure_error
+                    .as_ref()
+                    .expect("failed task should carry annotated error")
+                    .clone(),
             },
         };
         let _ = mb.send(envelope);
     }
 
-    let payload = format!("{summary}\n{sentinel}");
-    let agent_id = task.agent_id.clone();
-
     // Wake the engine's parent turn loop if this is one of its direct
-    // children (issue #756). Issue #1961 also requires emit to happen
-    // before marking the manager terminal state so the parent can observe the
-    // completion while its "running children" gate is still open. If we
-    // update first, the parent can finalize before the completion arrives.
+    // children (issue #756). The manager lock is deliberately not held while
+    // sending to any external consumer.
     emit_parent_completion(&task.runtime, &agent_id, &payload);
 
-    let mut manager = task.manager_handle.write().await;
-    match &result {
-        Ok(res) => manager.update_from_result(&agent_id, res.clone()),
-        Err(err) => {
-            manager.update_failed(
-                &agent_id,
-                annotate_child_model_error(
-                    &subagent_failure_message(err),
-                    &model_id,
-                    task.runtime.client.api_provider(),
-                    &task.runtime.worker_profile.model,
-                ),
-            );
-        }
-    }
-
-    if let Some(event_tx) = task.runtime.event_tx {
+    if let Some(event_tx) = task.runtime.event_tx.as_ref() {
         let _ = event_tx.try_send(Event::AgentComplete {
             id: agent_id.clone(),
             result: payload,
         });
+    }
+
+    // All external sends above are nonblocking and occur without the manager
+    // lock. Only after they are queued do we close the public Running state.
+    let terminal_committed = {
+        let mut manager = task.manager_handle.write().await;
+        match &result {
+            Ok(res) => manager.update_from_result(&agent_id, res.clone()),
+            Err(_) => manager.update_failed(
+                &agent_id,
+                failure_error
+                    .as_ref()
+                    .expect("failed task should carry annotated error")
+                    .clone(),
+            ),
+        }
+    };
+    if !terminal_committed {
+        tracing::error!(
+            target: "subagent",
+            agent_id = %agent_id,
+            "claimed task completion could not commit terminal state"
+        );
     }
 }
 
@@ -5100,6 +5929,7 @@ async fn insert_subagent_full_transcript_handle(
     status: &SubAgentStatus,
     result: Option<&String>,
     checkpoint: Option<&SubAgentCheckpoint>,
+    transcript_artifact: Option<&mut SubAgentTranscriptArtifactWriter>,
     messages: &[Message],
     steps_taken: u32,
     duration_ms: u64,
@@ -5117,6 +5947,21 @@ async fn insert_subagent_full_transcript_handle(
         messages: Vec::new(),
         ..checkpoint.clone()
     });
+    let transcript_artifact = transcript_artifact.map(|writer| {
+        let synced = match writer.sync_messages(messages, *status != SubAgentStatus::Running) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    target: "subagent",
+                    ?err,
+                    agent_id,
+                    "failed to persist complete sub-agent transcript artifact"
+                );
+                false
+            }
+        };
+        writer.metadata(synced && writer.persisted_messages == messages.len())
+    });
     let payload = json!({
         "kind": "subagent_full_transcript",
         "agent_id": agent_id,
@@ -5131,10 +5976,51 @@ async fn insert_subagent_full_transcript_handle(
         "checkpoint": checkpoint_meta,
         "message_count": messages.len(),
         "omitted_messages": omitted_messages,
+        "messages_complete": omitted_messages == 0,
         "messages": bounded_messages,
+        "complete_transcript_artifact": transcript_artifact,
     });
     let mut store = runtime.context.runtime.handle_store.lock().await;
     store.insert_json(format!("agent:{agent_id}"), "full_transcript", payload)
+}
+
+/// Publish the inspectable worker transcript while a child is still running.
+///
+/// The sidebar's Open action is intentionally backed by the same
+/// `full_transcript` handle before and after completion. Keeping a separate
+/// live-only snapshot name meant Open could only show a compact status card
+/// until the worker stopped, which is exactly when observing it is least
+/// useful.
+#[allow(clippy::too_many_arguments)]
+async fn publish_live_subagent_transcript(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    agent_type: &SubAgentType,
+    assignment: &SubAgentAssignment,
+    result: Option<&String>,
+    checkpoint: Option<&SubAgentCheckpoint>,
+    transcript_artifact: Option<&mut SubAgentTranscriptArtifactWriter>,
+    messages: &[Message],
+    steps_taken: u32,
+    started_at: Instant,
+    fork_context: bool,
+) {
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    insert_subagent_full_transcript_handle(
+        runtime,
+        agent_id,
+        agent_type,
+        assignment,
+        &SubAgentStatus::Running,
+        result,
+        checkpoint,
+        transcript_artifact,
+        messages,
+        steps_taken,
+        duration_ms,
+        fork_context,
+    )
+    .await;
 }
 
 /// Bound a sub-agent tool result before it enters `messages` (#3882).
@@ -5503,14 +6389,36 @@ async fn run_subagent(
     let fork_context = fork_context_enabled
         .then_some(runtime.fork_context.as_ref())
         .flatten();
-    let request_system = subagent_request_system_prompt(&system_prompt, fork_context);
+    let request_system = subagent_request_system_prompt(&system_prompt);
     let mut messages =
         build_initial_subagent_messages(&prompt, &assignment, &agent_type, fork_context);
+    let mut transcript_artifact =
+        match SubAgentTranscriptArtifactWriter::for_runtime(runtime, &agent_id).await {
+            Ok(mut writer) => {
+                if let Err(err) = writer.sync_messages(&messages, false) {
+                    tracing::warn!(
+                        target: "subagent",
+                        ?err,
+                        agent_id,
+                        "failed to persist initial sub-agent transcript"
+                    );
+                }
+                Some(writer)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "subagent",
+                    ?err,
+                    agent_id,
+                    "failed to initialize complete sub-agent transcript artifact"
+                );
+                None
+            }
+        };
     let (runtime_for_tools, mut child_completion_rx) = runtime_for_nested_agent_tools(
         runtime,
         &agent_id,
         SubAgentForkContext {
-            system: Some(request_system.clone()),
             messages: messages.clone(),
             structured_state_block: None,
         },
@@ -5561,6 +6469,23 @@ async fn run_subagent(
     // genuine success; everything else must surface its stop reason instead of
     // reporting a completed child with no payload.
     let mut stopped_naturally = false;
+    // A worker is inspectable as soon as it is launched, not only after its
+    // first model round trip. This gives Open a real conversation destination
+    // while the worker is waiting on the provider.
+    publish_live_subagent_transcript(
+        runtime,
+        &agent_id,
+        &agent_type,
+        &assignment,
+        None,
+        None,
+        transcript_artifact.as_mut(),
+        &messages,
+        steps,
+        started_at,
+        fork_context_enabled,
+    )
+    .await;
 
     for _step in 0..max_steps {
         // Cooperative cancellation: bail if this session's token was cancelled
@@ -5587,6 +6512,7 @@ async fn run_subagent(
                 &status,
                 None,
                 latest_checkpoint.as_ref(),
+                transcript_artifact.as_mut(),
                 &messages,
                 steps,
                 duration_ms,
@@ -5690,6 +6616,20 @@ async fn run_subagent(
             )
             .await,
         );
+        publish_live_subagent_transcript(
+            runtime,
+            &agent_id,
+            &agent_type,
+            &assignment,
+            final_result.as_ref(),
+            latest_checkpoint.as_ref(),
+            transcript_artifact.as_mut(),
+            &messages,
+            steps,
+            started_at,
+            fork_context_enabled,
+        )
+        .await;
 
         // Race the API call against the cancellation token so a parent
         // cancel during a long thinking turn doesn't have to wait for the
@@ -5717,6 +6657,7 @@ async fn run_subagent(
                     &status,
                     None,
                     latest_checkpoint.as_ref(),
+                    transcript_artifact.as_mut(),
                     &messages,
                     steps,
                     duration_ms,
@@ -5782,6 +6723,7 @@ async fn run_subagent(
                             &status,
                             Some(&reason),
                             Some(&checkpoint),
+                            transcript_artifact.as_mut(),
                             &messages,
                             steps,
                             duration_ms,
@@ -5881,6 +6823,7 @@ async fn run_subagent(
                 &status,
                 final_result.as_ref(),
                 latest_checkpoint.as_ref(),
+                transcript_artifact.as_mut(),
                 &messages,
                 steps,
                 duration_ms,
@@ -5945,6 +6888,20 @@ async fn run_subagent(
             )
             .await,
         );
+        publish_live_subagent_transcript(
+            runtime,
+            &agent_id,
+            &agent_type,
+            &assignment,
+            final_result.as_ref(),
+            latest_checkpoint.as_ref(),
+            transcript_artifact.as_mut(),
+            &messages,
+            steps,
+            started_at,
+            fork_context_enabled,
+        )
+        .await;
 
         if response_was_truncated(&response) {
             final_result = None;
@@ -5981,6 +6938,20 @@ async fn run_subagent(
                 )
                 .await,
             );
+            publish_live_subagent_transcript(
+                runtime,
+                &agent_id,
+                &agent_type,
+                &assignment,
+                final_result.as_ref(),
+                latest_checkpoint.as_ref(),
+                transcript_artifact.as_mut(),
+                &messages,
+                steps,
+                started_at,
+                fork_context_enabled,
+            )
+            .await;
             continue;
         }
         reset_truncated_subagent_responses(&mut consecutive_truncated_responses);
@@ -6009,6 +6980,20 @@ async fn run_subagent(
                     )
                     .await,
                 );
+                publish_live_subagent_transcript(
+                    runtime,
+                    &agent_id,
+                    &agent_type,
+                    &assignment,
+                    final_result.as_ref(),
+                    latest_checkpoint.as_ref(),
+                    transcript_artifact.as_mut(),
+                    &messages,
+                    steps,
+                    started_at,
+                    fork_context_enabled,
+                )
+                .await;
                 continue;
             }
             while let Ok(input) = input_rx.try_recv() {
@@ -6121,6 +7106,20 @@ async fn run_subagent(
                 )
                 .await,
             );
+            publish_live_subagent_transcript(
+                runtime,
+                &agent_id,
+                &agent_type,
+                &assignment,
+                final_result.as_ref(),
+                latest_checkpoint.as_ref(),
+                transcript_artifact.as_mut(),
+                &messages,
+                steps,
+                started_at,
+                fork_context_enabled,
+            )
+            .await;
         }
     }
 
@@ -6140,7 +7139,8 @@ async fn run_subagent(
         }
     } else {
         SubAgentStatus::Failed(format!(
-            "child reached its step limit ({steps} steps) without returning a final summary"
+            "child step budget exhausted (limit: {max_steps} steps; used: {steps}); \
+             raise it with max_steps or split the work into smaller independent tasks"
         ))
     };
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -6159,6 +7159,7 @@ async fn run_subagent(
         &status,
         final_result.as_ref(),
         latest_checkpoint.as_ref(),
+        transcript_artifact.as_mut(),
         &messages,
         steps,
         duration_ms,
@@ -6451,6 +7452,19 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .transpose()?;
     let token_budget =
         parse_optional_positive_u64(input, &["token_budget", "tokenBudget", "max_tokens"])?;
+    let max_steps = input
+        .get("max_steps")
+        .or_else(|| input.get("maxSteps"))
+        .and_then(Value::as_u64)
+        .map(|steps| {
+            u32::try_from(steps.min(u64::from(MAX_SUBAGENT_STEPS)))
+                .expect("max_steps is clamped before conversion")
+        });
+    let wall_time = input
+        .get("wall_time_secs")
+        .or_else(|| input.get("wallTimeSecs"))
+        .and_then(Value::as_u64)
+        .map(|seconds| Duration::from_secs(seconds.clamp(1, MAX_CHILD_WALL_TIME.as_secs())));
 
     // #4042: optional caller-supplied tool deny-list (unioned with the parent's
     // inherited deny-list) and the inheritance opt-out flag (default inherits).
@@ -6460,6 +7474,92 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         &["inherit_disallowed_tools", "inheritDisallowedTools"],
     )
     .unwrap_or(true);
+
+    // Deliberate delegation contract: when `deliberate=true`, require the
+    // model to declare task type (or profile), workspace policy, expected
+    // artifact, and write authority. The declared values are
+    // parsed and ENFORCED whenever present (deliberate or not): declaring
+    // authority the runtime ignores would be a false affordance
+    // (TUI-DOG-017).
+    let deliberate = parse_optional_bool(input, &["deliberate"]).unwrap_or(false);
+    let workspace_policy_str = optional_input_str(input, &["workspace_policy", "workspacePolicy"]);
+    let expected_artifact = optional_input_str(input, &["expected_artifact", "expectedArtifact"])
+        .map(str::trim)
+        .filter(|artifact| !artifact.is_empty())
+        .map(str::to_string);
+    let write_authority_str = optional_input_str(input, &["write_authority", "writeAuthority"]);
+    if deliberate {
+        let has_type = agent_type_explicit || profile.is_some();
+        let mut missing = Vec::new();
+        if !has_type {
+            missing.push("type (or profile)");
+        }
+        if workspace_policy_str.is_none() && worktree.is_none() {
+            missing.push("workspace_policy (or worktree=true)");
+        }
+        if expected_artifact.is_none() {
+            missing.push("expected_artifact");
+        }
+        if write_authority_str.is_none() {
+            missing.push("write_authority");
+        }
+        if !missing.is_empty() {
+            return Err(ToolError::invalid_input(format!(
+                "deliberate spawn requires: {}. Missing: {}.",
+                "type/profile, workspace_policy, expected_artifact, write_authority",
+                missing.join(", ")
+            )));
+        }
+    }
+    // Enforce the declared workspace policy: `worktree` materializes a real
+    // worktree request (the separate `worktree` field is the mechanism that
+    // actually creates one), and `shared` must not contradict an explicit
+    // worktree ask.
+    let worktree = match workspace_policy_str
+        .map(|policy| policy.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None => worktree,
+        Some("worktree") => worktree.or(Some(SubAgentWorktreeRequest {
+            branch: None,
+            path: None,
+            base_ref: None,
+        })),
+        Some("shared") => {
+            if worktree.is_some() {
+                return Err(ToolError::invalid_input(
+                    "workspace_policy 'shared' conflicts with worktree isolation options; \
+                     use workspace_policy 'worktree' or drop the worktree fields.",
+                ));
+            }
+            worktree
+        }
+        Some(other) => {
+            return Err(ToolError::invalid_input(format!(
+                "Invalid workspace_policy '{other}'. Use shared or worktree."
+            )));
+        }
+    };
+    let write_authority = match write_authority_str
+        .map(|auth| auth.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None => None,
+        Some("read_only") => Some(SpawnWriteAuthority::ReadOnly),
+        Some("workspace_write") => Some(SpawnWriteAuthority::WorkspaceWrite),
+        Some("worktree_write") => Some(SpawnWriteAuthority::WorktreeWrite),
+        Some(other) => {
+            return Err(ToolError::invalid_input(format!(
+                "Invalid write_authority '{other}'. Use read_only, workspace_write, or worktree_write."
+            )));
+        }
+    };
+    if write_authority == Some(SpawnWriteAuthority::WorktreeWrite) && worktree.is_none() {
+        return Err(ToolError::invalid_input(
+            "write_authority 'worktree_write' requires worktree isolation \
+             (workspace_policy 'worktree' or worktree=true).",
+        ));
+    }
 
     Ok(SpawnRequest {
         session_name,
@@ -6479,8 +7579,12 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         fork_context,
         max_depth,
         token_budget,
+        max_steps,
+        wall_time,
         disallowed_tools,
         inherit_disallowed_tools,
+        write_authority,
+        expected_artifact,
     })
 }
 
@@ -8247,7 +9351,7 @@ const EXPLORE_AGENT_INTRO: &str = concat!(
     "Orient first: confirm the workspace/project root, read relevant AGENTS.md/README guidance when the tree is unfamiliar, then search only the likely scope.\n",
     "Use list_dir/file_search, grep_files, and read_file; use RLM only for long inputs or many semantic slices, not basic path discovery.\n",
     "Honor QUESTION, SCOPE, ALREADY_KNOWN, and STOP_CONDITION. Do not repeat ALREADY_KNOWN work unless evidence contradicts it; do not broaden once QUESTION is answered.\n",
-    "DeepSeek V4 can hold broad evidence, but your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient. Return partial findings if the next step would be speculative or duplicative.\n",
+    "Your value is compressed reconnaissance: cite `path:line-range` for each finding and stop once evidence is sufficient. Return partial findings if the next step would be speculative or duplicative.\n",
     "CHANGES will almost always be \"None.\" for an explorer.\n\n"
 );
 

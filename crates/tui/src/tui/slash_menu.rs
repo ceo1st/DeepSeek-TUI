@@ -27,7 +27,21 @@ pub fn visible_slash_menu_entries(app: &App, limit: usize) -> Vec<SlashMenuEntry
         let trigger = app.input[byte_start..].chars().next().unwrap_or('/');
         return skill_mention_entries(&partial, trigger, limit, &app.cached_skills);
     }
-    let model_candidates = provider_scoped_model_completion_ids(app);
+    if !looks_like_slash_command_input(&app.input) {
+        return Vec::new();
+    }
+    // Building the cross-provider model inventory is unnecessary while the
+    // user is merely typing `/model`; command-name completion needs no model
+    // rows. Only pay that cost once an argument prefix exists.
+    let trimmed = app.input.trim_start();
+    let needs_model_candidates = trimmed
+        .strip_prefix("/model")
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    let model_candidates = if needs_model_candidates {
+        provider_scoped_model_completion_ids(app)
+    } else {
+        Vec::new()
+    };
     slash_completion_hints_with_model_candidates(
         &app.input,
         limit,

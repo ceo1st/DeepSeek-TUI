@@ -38,6 +38,139 @@ use unicode_width::UnicodeWidthStr;
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use tempfile::TempDir;
 
+#[test]
+fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
+    let mut app = create_test_app();
+    // App::new reads real terminal overlays. This test owns the authored
+    // motion cadence, so pin that input instead of inheriting a host's saved
+    // low-motion or legacy-console policy.
+    app.low_motion = false;
+    app.fancy_animations = true;
+
+    assert_eq!(
+        animation_interval_ms(&app, true, false),
+        UI_STATUS_ANIMATION_MS
+    );
+    assert_eq!(
+        animation_interval_ms(&app, false, true),
+        UI_UNDERWATER_ANIMATION_MS
+    );
+    assert_eq!(
+        animation_interval_ms(&app, true, true),
+        UI_UNDERWATER_ANIMATION_MS,
+        "the slower status spinner must not throttle ambient fish"
+    );
+}
+
+#[test]
+fn config_update_preview_suppresses_only_success_message_not_action_or_errors() {
+    let preview = prepare_config_update_result(
+        commands::CommandResult::with_message_and_action(
+            "preview confirmation",
+            AppAction::UpdateStreamChunkTimeout(42),
+        ),
+        false,
+    );
+    assert!(preview.message.is_none());
+    assert!(matches!(
+        preview.action,
+        Some(AppAction::UpdateStreamChunkTimeout(42))
+    ));
+
+    let persisted =
+        prepare_config_update_result(commands::CommandResult::message("saved confirmation"), true);
+    assert_eq!(persisted.message.as_deref(), Some("saved confirmation"));
+
+    let error =
+        prepare_config_update_result(commands::CommandResult::error("invalid value"), false);
+    assert!(error.is_error);
+    assert!(
+        error
+            .message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("invalid value"))
+    );
+}
+
+#[test]
+fn config_refresh_preserves_active_search_filter() {
+    let mut app = create_test_app();
+    let mut view = ConfigView::new_for_app(&app);
+    for ch in "model".chars() {
+        let _ = view.handle_key(KeyEvent::new(
+            crossterm::event::KeyCode::Char(ch),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    app.view_stack.push(view);
+
+    refresh_config_view_if_open(&mut app, "default_model");
+
+    let mut view = app.view_stack.pop().expect("refreshed config view");
+    let config = view
+        .as_any_mut()
+        .downcast_mut::<ConfigView>()
+        .expect("config view type");
+    assert_eq!(config.filter_query(), "model");
+}
+
+#[test]
+fn workflow_panel_plain_letters_return_to_composer() {
+    let mut app = create_test_app();
+    app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
+        "workflow_typing",
+        "typing regression",
+        0,
+    ));
+
+    for ch in ['t', 'c', 'j', 'k'] {
+        app.workflow_panel
+            .as_mut()
+            .expect("workflow panel")
+            .keyboard_focus = true;
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        assert!(
+            !handle_workflow_panel_key(&mut app, &key),
+            "plain {ch:?} must fall through to the composer"
+        );
+        assert!(
+            !app.workflow_panel
+                .as_ref()
+                .expect("workflow panel")
+                .keyboard_focus,
+            "typing releases panel focus"
+        );
+        app.insert_char(ch);
+    }
+
+    assert_eq!(app.input, "tcjk");
+}
+
+#[test]
+fn workflow_panel_uses_non_text_keys_for_controls() {
+    let mut app = create_test_app();
+    let mut panel = crate::tui::widgets::workflow_panel::WorkflowPanel::new(
+        "workflow_keys",
+        "keyboard controls",
+        0,
+    );
+    panel.keyboard_focus = true;
+    let was_expanded = panel.expanded;
+    app.workflow_panel = Some(panel);
+
+    assert!(handle_workflow_panel_key(
+        &mut app,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+    assert_ne!(
+        app.workflow_panel
+            .as_ref()
+            .expect("workflow panel")
+            .expanded,
+        was_expanded
+    );
+}
+
 struct ConfigPathEnvGuard {
     _tmp: TempDir,
     previous: Option<OsString>,
@@ -1604,6 +1737,54 @@ fn composer_mouse_wheel_up_moves_within_wrapped_draft() {
 }
 
 #[test]
+fn composer_mouse_first_visible_character_maps_to_zero_after_prompt_gutter() {
+    let mut app = create_test_app();
+    app.input = "abcdef".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.viewport.last_composer_area = Some(Rect {
+        x: 10,
+        y: 10,
+        width: 12,
+        height: 4,
+    });
+    // Border-aware inner rect. The shared composer geometry reserves x=10..12
+    // for the persistent prompt and places the first visible character at 12.
+    app.viewport.last_composer_content = Some(Rect {
+        x: 10,
+        y: 11,
+        width: 12,
+        height: 3,
+    });
+    app.viewport.last_composer_scroll_offset = 0;
+    app.viewport.last_composer_top_padding = 0;
+
+    assert!(handle_composer_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 11,
+            modifiers: KeyModifiers::NONE,
+        },
+    ));
+    assert_eq!(
+        app.cursor_position, 0,
+        "the first rendered character must not inherit the prompt's two-column inset"
+    );
+
+    assert!(handle_composer_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 13,
+            row: 11,
+            modifiers: KeyModifiers::NONE,
+        },
+    ));
+    assert_eq!(app.cursor_position, 1);
+}
+
+#[test]
 fn copy_shortcut_accepts_cmd_and_ctrl_shift_only() {
     assert!(crate::tui::key_shortcuts::is_copy_shortcut(&KeyEvent::new(
         KeyCode::Char('c'),
@@ -1792,11 +1973,15 @@ fn create_test_app() -> App {
     // Pin locale and currency for deterministic tests regardless of host locale.
     app.cost_currency = crate::pricing::CostCurrency::Usd;
     app.ui_locale = crate::localization::Locale::En;
+    // Keep transcript tests independent of a concurrently swapped persisted
+    // settings home. Tests for hidden reasoning opt out explicitly.
+    app.show_thinking = true;
     // Pin the route identity too: App::new consults the developer's real
     // saved settings (provider/model maps, auto-model, route limits), so on
     // a machine with customized settings the context-window tests computed
     // against a different model than the requested deepseek-v4-pro.
     app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     app.model = "deepseek-v4-pro".to_string();
     app.auto_model = false;
     app.last_effective_model = None;
@@ -1913,10 +2098,7 @@ fn app_system_prompt_includes_configured_instructions() {
         ..Config::default()
     };
 
-    let prompt = match build_app_system_prompt(&app, &config) {
-        SystemPrompt::Text(text) => text,
-        SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
-    };
+    let prompt = crate::prompts::system_prompt_flat_text(&build_app_system_prompt(&app, &config));
 
     assert!(prompt.contains("CONFIGURED_INSTRUCTIONS_MARKER"));
     assert!(prompt.contains(&instructions.display().to_string()));
@@ -2144,6 +2326,7 @@ fn setup_runtime_preset_apply_persists_settings_config_and_state() {
     assert!(summary.contains("preset=ask-first"));
     let settings = Settings::load().expect("load saved settings");
     assert_eq!(settings.default_mode, "plan");
+    assert_eq!(settings.permission_posture.as_deref(), Some("ask"));
     assert_eq!(app.mode, AppMode::Plan);
     assert!(!app.allow_shell);
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
@@ -2170,6 +2353,345 @@ fn setup_runtime_preset_apply_persists_settings_config_and_state() {
     assert_eq!(
         saved_state.runtime_posture_source,
         codewhale_config::RuntimePostureSource::Confirmed
+    );
+}
+
+#[test]
+fn setup_runtime_preset_rolls_back_durable_and_live_state_when_state_save_fails() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(
+        &config_path,
+        "# keep exact bytes\napproval_policy = \"auto\"\nallow_shell = true\nsandbox_mode = \"workspace-write\"\n",
+    )
+    .expect("seed config");
+    let original_settings = Settings {
+        default_mode: "agent".to_string(),
+        permission_posture: Some("auto-review".to_string()),
+        ..Settings::default()
+    };
+    original_settings.save().expect("seed settings");
+
+    let config_before = std::fs::read(&config_path).expect("read config snapshot");
+    let settings_path = Settings::path().expect("settings path");
+    let settings_before = std::fs::read(&settings_path).expect("read settings snapshot");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    app.set_agent_runtime_baseline(true, false, ApprovalMode::Auto);
+    app.set_mode(AppMode::Agent);
+    let app_before = (
+        app.mode,
+        app.allow_shell,
+        app.trust_mode,
+        app.approval_mode,
+        app.approval_policy_locked(),
+    );
+    let mut config = Config {
+        approval_policy: Some("auto".to_string()),
+        allow_shell: Some(true),
+        sandbox_mode: Some("workspace-write".to_string()),
+        ..Config::default()
+    };
+    let config_before_live = (
+        config.approval_policy.clone(),
+        config.allow_shell,
+        config.sandbox_mode.clone(),
+    );
+
+    // SetupState::save is atomic; an existing directory at the destination
+    // forces the final persist to fail after config and settings were staged.
+    let state_path = codewhale_config::SetupState::path().expect("state path");
+    std::fs::create_dir_all(&state_path).expect("state path directory");
+    let error = apply_setup_runtime_preset(
+        &mut app,
+        &mut config,
+        crate::tui::setup::SetupRuntimePreset::AskFirst,
+        codewhale_config::SetupState::default(),
+    )
+    .expect_err("state persistence must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to persist setup runtime posture state"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(config_path).unwrap(), config_before);
+    assert_eq!(std::fs::read(settings_path).unwrap(), settings_before);
+    assert_eq!(
+        (
+            app.mode,
+            app.allow_shell,
+            app.trust_mode,
+            app.approval_mode,
+            app.approval_policy_locked(),
+        ),
+        app_before
+    );
+    assert_eq!(
+        (
+            config.approval_policy,
+            config.allow_shell,
+            config.sandbox_mode,
+        ),
+        config_before_live
+    );
+}
+
+#[test]
+fn setup_high_trust_persists_full_access_without_legacy_yolo_mode() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(
+        &config_path,
+        "# keep me\napproval_policy = \"on-request\"\nallow_shell = false\n",
+    )
+    .expect("seed config");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    let mut config = Config {
+        approval_policy: Some("on-request".to_string()),
+        ..Config::default()
+    };
+    let preset = crate::tui::setup::SetupRuntimePreset::HighTrustLocal;
+
+    apply_setup_runtime_preset(
+        &mut app,
+        &mut config,
+        preset,
+        codewhale_config::SetupState::default(),
+    )
+    .expect("apply high trust");
+
+    let settings = Settings::load().expect("load saved settings");
+    assert_eq!(settings.default_mode, "agent");
+    assert_eq!(settings.permission_posture.as_deref(), Some("full-access"));
+    assert_eq!(config.approval_policy, None);
+    assert_eq!(app.mode, AppMode::Agent);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+    assert!(app.allow_shell);
+    assert!(app.trust_mode);
+
+    app.set_mode(AppMode::Plan);
+    assert!(!app.allow_shell);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    app.set_mode(AppMode::Agent);
+    assert!(app.allow_shell, "High Trust shell must survive Plan → Act");
+    assert!(app.trust_mode, "High Trust trust must survive Plan → Act");
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+
+    let body = std::fs::read_to_string(&config_path).expect("read saved config");
+    assert!(body.contains("# keep me"), "comment lost: {body}");
+    assert!(
+        !body.contains("approval_policy"),
+        "top-level policy would override the saved Full Access posture: {body}"
+    );
+}
+
+#[test]
+fn setup_high_trust_cannot_override_project_approval_policy() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(&config_path, "approval_policy = \"on-request\"\n").expect("root config");
+    let workspace = config_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    std::fs::write(
+        project_dir.join("config.toml"),
+        "approval_policy = \"never\"\n",
+    )
+    .expect("project config");
+
+    let mut app = create_test_app();
+    app.workspace = workspace;
+    app.config_path = Some(config_path.clone());
+    let mut config = Config {
+        approval_policy: Some("never".to_string()),
+        ..Config::default()
+    };
+
+    let error = apply_setup_runtime_preset(
+        &mut app,
+        &mut config,
+        crate::tui::setup::SetupRuntimePreset::HighTrustLocal,
+        codewhale_config::SetupState::default(),
+    )
+    .expect_err("project policy must control the live session");
+
+    assert!(
+        error.to_string().contains("project runtime configuration"),
+        "{error:#}"
+    );
+    assert_eq!(config.approval_policy.as_deref(), Some("never"));
+    assert!(
+        std::fs::read_to_string(config_path)
+            .expect("root config remains")
+            .contains("approval_policy = \"on-request\"")
+    );
+}
+
+#[test]
+fn project_runtime_provenance_only_blocks_values_startup_would_accept() {
+    let _home = SettingsHomeGuard::new();
+    let settings = Settings {
+        permission_posture: Some("ask".to_string()),
+        ..Settings::default()
+    };
+    settings.save().expect("save settings");
+
+    let workspace = Settings::path()
+        .expect("settings path")
+        .parent()
+        .expect("Codewhale home")
+        .parent()
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    let project_path = project_dir.join("config.toml");
+    std::fs::write(
+        &project_path,
+        "approval_policy = \"auto\"\nsandbox_mode = \"danger-full-access\"\nallow_shell = true\n",
+    )
+    .expect("project config");
+
+    let config = Config {
+        sandbox_mode: Some("read-only".to_string()),
+        ..Config::default()
+    };
+    assert_eq!(
+        config.approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::Unset,
+        "project Auto would loosen saved Ask and must not claim provenance"
+    );
+    assert_eq!(
+        config.allow_shell_control(None, None, &workspace),
+        crate::config::ShellAccessControl::Unset,
+        "project allow_shell=true is ignored by startup"
+    );
+    assert_eq!(
+        config.runtime_preset_blocker(None, None, &workspace),
+        None,
+        "ignored project escalations must not create a phantom preset blocker"
+    );
+
+    std::fs::write(
+        &project_path,
+        "approval_policy = \"never\"\nsandbox_mode = \"read-only\"\nallow_shell = false\n",
+    )
+    .expect("tightening project config");
+    assert_eq!(
+        config.approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::ProjectConfig
+    );
+    assert_eq!(
+        config.allow_shell_control(None, None, &workspace),
+        crate::config::ShellAccessControl::ProjectConfig
+    );
+    assert_eq!(
+        config.runtime_preset_blocker(None, None, &workspace),
+        Some("project runtime configuration")
+    );
+}
+
+#[test]
+fn saved_full_access_baseline_allows_project_approval_tightening() {
+    let _home = SettingsHomeGuard::new();
+    let settings = Settings {
+        permission_posture: Some("full-access".to_string()),
+        ..Settings::default()
+    };
+    settings.save().expect("save settings");
+
+    let workspace = Settings::path()
+        .expect("settings path")
+        .parent()
+        .expect("Codewhale home")
+        .parent()
+        .expect("temporary home")
+        .join("project");
+    let project_dir = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    std::fs::create_dir_all(&project_dir).expect("project config dir");
+    std::fs::write(
+        project_dir.join("config.toml"),
+        "approval_policy = \"on-request\"\n",
+    )
+    .expect("project config");
+
+    assert_eq!(
+        Config::default().approval_policy_control(None, None, &workspace),
+        crate::config::ApprovalPolicyControl::ProjectConfig,
+        "Ask is a tightening from saved Full Access and owns the effective policy"
+    );
+}
+
+#[test]
+fn setup_presets_cannot_override_managed_runtime_requirements() {
+    let _home = SettingsHomeGuard::new();
+    let config_path = crate::config_persistence::config_toml_path(None).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("config parent exists");
+    std::fs::write(&config_path, "# managed posture stays intact\n").expect("root config");
+    let requirements_path = config_path
+        .parent()
+        .expect("config parent")
+        .join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        "allowed_approval_policies = [\"never\"]\nallowed_sandbox_modes = [\"read-only\"]\n",
+    )
+    .expect("requirements");
+
+    let mut app = create_test_app();
+    app.config_path = Some(config_path.clone());
+    app.allow_shell = false;
+    app.approval_mode = ApprovalMode::Never;
+    let mut config = Config {
+        approval_policy: Some("never".to_string()),
+        sandbox_mode: Some("read-only".to_string()),
+        allow_shell: Some(false),
+        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
+        ..Config::default()
+    };
+
+    for preset in [
+        crate::tui::setup::SetupRuntimePreset::AskFirst,
+        crate::tui::setup::SetupRuntimePreset::NormalAgent,
+        crate::tui::setup::SetupRuntimePreset::HighTrustLocal,
+    ] {
+        let error = apply_setup_runtime_preset(
+            &mut app,
+            &mut config,
+            preset,
+            codewhale_config::SetupState::default(),
+        )
+        .expect_err("managed requirements must win");
+        assert!(
+            error.to_string().contains("managed runtime requirements"),
+            "{error:#}"
+        );
+    }
+
+    assert_eq!(config.approval_policy.as_deref(), Some("never"));
+    assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
+    assert_eq!(config.allow_shell, Some(false));
+    assert_eq!(app.approval_mode, ApprovalMode::Never);
+    assert!(!app.allow_shell);
+    assert_eq!(
+        std::fs::read_to_string(config_path).expect("root config"),
+        "# managed posture stays intact\n"
     );
 }
 
@@ -3283,7 +3805,8 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
         .expect("provider/model result");
     assert!(provider_model_result.contains("provider=deepseek"));
     assert!(provider_model_result.contains("model=deepseek-v4-flash"));
-    assert!(provider_model_result.contains("auth=present/local"));
+    assert!(provider_model_result.contains("auth=key saved · not checked"));
+    assert!(provider_model_result.contains("health=attemptable"));
     assert!(!provider_model_result.contains("deepseek-key"));
 }
 
@@ -4889,27 +5412,9 @@ fn sidebar_auto_idle_false_for_explicit_focus() {
 }
 
 #[test]
-fn jobs_panel_ignores_model_reasoning_but_shows_for_real_jobs() {
+fn jobs_panel_ignores_completed_history_but_shows_for_real_jobs() {
     let mut app = create_test_app();
     app.sidebar_focus = SidebarFocus::Auto;
-
-    // Per-turn model reasoning must NOT bring the jobs/tasks panel up — an
-    // ordinary reasoning turn stays idle (full-width transcript).
-    app.task_panel = vec![crate::tui::app::TaskPanelEntry {
-        id: "reasoning".to_string(),
-        status: "running".to_string(),
-        prompt_summary: "thinking".to_string(),
-        duration_ms: None,
-        kind: crate::tui::app::TaskPanelEntryKind::ModelReasoning,
-        stale: false,
-        elapsed_since_output_ms: None,
-        owner_agent_id: None,
-        owner_agent_name: None,
-    }];
-    assert!(
-        crate::tui::sidebar::sidebar_auto_idle(&mut app),
-        "model reasoning alone must not surface the jobs panel"
-    );
 
     // Completed background history must not reopen the auto Tasks panel.
     app.task_panel.push(crate::tui::app::TaskPanelEntry {
@@ -5866,6 +6371,10 @@ async fn bang_shell_input_dispatches_shell_op_instead_of_model_message() {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
     app.trust_mode = false;
+    // Pin the posture: App::new consults the developer's real saved
+    // settings, so a machine dogfooding with Bypass/Full Access would flip
+    // the auto_approve assertion below (hermeticity, not behavior).
+    app.approval_mode = ApprovalMode::Suggest;
 
     let mut engine = mock_engine_handle();
 
@@ -6943,7 +7452,7 @@ fn visible_slash_model_completions_are_provider_scoped() {
         "openrouter".to_string(),
         crate::config::DEFAULT_OPENROUTER_MODEL.to_string(),
     );
-    app.input = "/model".to_string();
+    app.input = "/model deep".to_string();
     app.cursor_position = app.input.chars().count();
 
     let entries = visible_slash_menu_entries(&app, 128);
@@ -7922,6 +8431,16 @@ fn api_key_paste_shortcut_is_not_plain_text_input() {
 }
 
 #[test]
+fn international_layout_glyphs_remain_plain_text_input() {
+    for ch in ['\u{00e7}', '\u{00bf}'] {
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        assert!(crate::tui::key_shortcuts::is_text_input_key(&key));
+        assert!(!crate::tui::shell_key_routing::is_help_shortcut(&key));
+        assert!(!crate::tui::shell_key_routing::is_context_inspector_shortcut(&key));
+    }
+}
+
+#[test]
 fn jump_to_adjacent_tool_cell_finds_next_and_previous() {
     let mut app = create_test_app();
     app.history = vec![
@@ -8385,27 +8904,6 @@ fn active_rlm_task_entries_surface_foreground_rlm_work() {
     assert_eq!(entries[0].prompt_summary, "RLM: file_path: Cargo.lock");
     assert_eq!(entries[0].kind, TaskPanelEntryKind::Background);
     assert!(entries[0].duration_ms.unwrap_or_default() >= 3000);
-}
-
-#[test]
-fn active_reasoning_task_entries_surface_reasoning_only_turns() {
-    let mut app = create_test_app();
-    app.turn_started_at = Some(Instant::now() - Duration::from_secs(2));
-    let mut active = ActiveCell::new();
-    active.push_thinking(HistoryCell::Thinking {
-        content: "reasoning text".to_string(),
-        streaming: true,
-        duration_secs: None,
-    });
-    app.active_cell = Some(active);
-
-    let entries = active_reasoning_task_entries(&app);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].id, "reasoning-1");
-    assert_eq!(entries[0].status, "running");
-    assert_eq!(entries[0].prompt_summary, "model reasoning");
-    assert_eq!(entries[0].kind, TaskPanelEntryKind::ModelReasoning);
-    assert!(entries[0].duration_ms.unwrap_or_default() >= 2000);
 }
 
 #[test]
@@ -9121,6 +9619,8 @@ fn picker_rename_of_inactive_session_does_not_touch_active_metadata() {
 fn codex_tool_child_usage_does_not_inherit_public_api_pricing() {
     let mut app = create_test_app();
     app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+    app.billing_presentation =
+        crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
     let result = Ok(crate::tools::spec::ToolResult::success("ok").with_metadata(
         serde_json::json!({
             "child_model": "gpt-5.5",
@@ -9667,7 +10167,8 @@ async fn model_picker_persists_model_and_reasoning_effort() {
         .expect("provider/model result");
     assert!(provider_model_result.contains("provider=deepseek"));
     assert!(provider_model_result.contains("model=deepseek-v4-pro"));
-    assert!(provider_model_result.contains("auth=present/local"));
+    assert!(provider_model_result.contains("auth=key saved · not checked"));
+    assert!(provider_model_result.contains("health=attemptable"));
     assert!(!provider_model_result.contains("test-key"));
 }
 
@@ -11499,7 +12000,8 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
         .expect("provider/model result");
     assert!(provider_model_result.contains("provider=deepseek"));
     assert!(provider_model_result.contains("model=deepseek-v4-pro"));
-    assert!(provider_model_result.contains("auth=present/local"));
+    assert!(provider_model_result.contains("auth=key saved · not checked"));
+    assert!(provider_model_result.contains("health=attemptable"));
     assert!(!provider_model_result.contains("moonshot"));
     assert!(!provider_model_result.contains("kimi-k2.6"));
     assert!(!provider_model_result.contains("deepseek-key"));

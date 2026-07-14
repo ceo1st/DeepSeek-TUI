@@ -1162,7 +1162,7 @@ fn split_system_layers(content: &str) -> Vec<(String, PromptLayerStability, &str
         ("User memory", "## User Memory"),
         ("Current session goal", "## Current Session Goal"),
         ("Skills", "## Skills"),
-        ("Context management", "## Context Management"),
+        ("Core execution", "## Core Execution"),
         ("Compact template", "## Compact"),
         ("Previous session relay", "## Previous Session Relay"),
     ];
@@ -1213,7 +1213,7 @@ fn is_static_base_layer(name: &str) -> bool {
             | "Skills"
             | "Project context"
             | "Project context pack"
-            | "Context management"
+            | "Core execution"
             | "Compact template"
     )
 }

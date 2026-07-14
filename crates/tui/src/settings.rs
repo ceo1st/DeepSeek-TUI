@@ -234,6 +234,9 @@ pub struct Settings {
     /// Background treatment: `ombre` paints the terminal-native water column;
     /// `flat` preserves all state marks on the theme's plain surface.
     pub ocean_treatment: String,
+    /// Ocean Tasks / To-do / Workers rail placement: top, left, or right.
+    /// The lower edge remains owned by the composer and phase footer.
+    pub work_surface_placement: String,
     /// Runtime-only 30 FPS cap for terminals that flicker at high redraw
     /// rates. Separate from accessibility motion and text delivery.
     #[serde(skip)]
@@ -279,7 +282,12 @@ pub struct Settings {
     pub composer_vim_mode: String,
     /// Transcript spacing rhythm: compact, comfortable, spacious
     pub transcript_spacing: String,
-    /// Default mode: "agent", "plan", "yolo"
+    /// Show the pre-session launch menu. When false, Codewhale enters a new
+    /// session directly; resume remains available in-session.
+    #[serde(default)]
+    pub launch_screen: bool,
+    /// Default mode: "agent" or "plan". Legacy permission
+    /// shorthands are accepted for migration but never advertised as modes.
     pub default_mode: String,
     /// Sidebar width as percentage of terminal width
     pub sidebar_width_percent: u16,
@@ -368,6 +376,12 @@ pub struct Settings {
     /// One-time YOLO deprecation toast has been shown. Suppresses the repeat
     /// toast after the first sighting per install (persisted across sessions).
     pub yolo_deprecation_shown: bool,
+    /// True only for the current load when `default_mode = "yolo"` was read
+    /// from an older settings file. App startup uses this provenance to migrate
+    /// the old bundled Full Access choice without weakening project or managed
+    /// approval policy. It is never written back to disk.
+    #[serde(skip)]
+    pub(crate) legacy_yolo_default: bool,
 }
 
 impl Default for Settings {
@@ -385,13 +399,16 @@ impl Default for Settings {
             low_motion: false,
             fancy_animations: true,
             ocean_treatment: "ombre".to_string(),
+            work_surface_placement: "top".to_string(),
             constrained_frame_rate: false,
             bracketed_paste: true,
             paste_burst_detection: true,
             mention_menu_limit: 128,
             mention_walk_depth: 10,
             mention_menu_behavior: "fuzzy".to_string(),
-            show_thinking: true,
+            // Reasoning is useful when explicitly requested, but it should
+            // never displace the actual conversation in the default TUI.
+            show_thinking: false,
             show_tool_details: false,
             locale: "auto".to_string(),
             theme: "system".to_string(),
@@ -399,7 +416,8 @@ impl Default for Settings {
             composer_density: "comfortable".to_string(),
             composer_border: true,
             composer_vim_mode: "normal".to_string(),
-            transcript_spacing: "compact".to_string(),
+            transcript_spacing: "comfortable".to_string(),
+            launch_screen: false,
             default_mode: "agent".to_string(),
             sidebar_width_percent: 28,
             sidebar_focus: "auto".to_string(),
@@ -418,6 +436,7 @@ impl Default for Settings {
             workspace_follow_symlinks: false,
             feature_intro_shown: false,
             yolo_deprecation_shown: false,
+            legacy_yolo_default: false,
         }
     }
 }
@@ -442,6 +461,14 @@ fn normalize_ocean_treatment(value: &str) -> &'static str {
         "flat"
     } else {
         "ombre"
+    }
+}
+
+fn normalize_work_surface_placement(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" => "left",
+        "right" => "right",
+        _ => "top",
     }
 }
 
@@ -481,6 +508,14 @@ impl Settings {
     /// "saved" never silently reports a tmux, SSH, or accessibility override.
     pub(crate) fn load_persisted() -> Result<Self> {
         let (primary, legacy_home, legacy_config_dir) = settings_path_candidates();
+        Self::load_persisted_from_candidates(primary, legacy_home, legacy_config_dir)
+    }
+
+    fn load_persisted_from_candidates(
+        primary: Option<PathBuf>,
+        legacy_home: Option<PathBuf>,
+        legacy_config_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let write_path = primary
             .as_ref()
             .cloned()
@@ -507,7 +542,17 @@ impl Settings {
                     Self::default()
                 }
             };
-            s.default_mode = normalize_mode(&s.default_mode).to_string();
+            // "yolo" used to bundle two independent choices: Agent mode and
+            // unrestricted approvals.  Keep that behavior on upgrade, but
+            // store/show the two choices explicitly so Settings does not claim
+            // the app starts in a fictional mode.
+            let legacy_yolo_default = s.default_mode.trim().eq_ignore_ascii_case("yolo");
+            s.legacy_yolo_default = legacy_yolo_default;
+            s.default_mode = if legacy_yolo_default {
+                "agent".to_string()
+            } else {
+                normalize_mode(&s.default_mode).to_string()
+            };
             s.composer_density = normalize_composer_density(&s.composer_density).to_string();
             s.transcript_spacing = normalize_transcript_spacing(&s.transcript_spacing).to_string();
             s.tool_collapse_mode = normalize_tool_collapse_mode(&s.tool_collapse_mode).to_string();
@@ -522,6 +567,8 @@ impl Settings {
             }
             s.status_indicator = normalize_status_indicator(&s.status_indicator).to_string();
             s.ocean_treatment = normalize_ocean_treatment(&s.ocean_treatment).to_string();
+            s.work_surface_placement =
+                normalize_work_surface_placement(&s.work_surface_placement).to_string();
             s.synchronized_output =
                 normalize_synchronized_output(&s.synchronized_output).to_string();
             s.locale = normalize_configured_locale(&s.locale)
@@ -538,10 +585,21 @@ impl Settings {
                 .permission_posture
                 .as_deref()
                 .and_then(normalize_permission_posture);
+            if legacy_yolo_default && s.permission_posture.is_none() {
+                s.permission_posture = Some("full-access".to_string());
+            }
             s
         };
         migrate_settings_file_to_primary_if_needed(&write_path, &read_path);
         Ok(settings)
+    }
+
+    /// Whether this load normalized a legacy `default_mode = "yolo"` value.
+    ///
+    /// This is migration provenance, not a user-facing mode. New writes accept
+    /// only Agent or Plan and serialize the independent permission posture.
+    pub(crate) fn legacy_yolo_default_detected(&self) -> bool {
+        self.legacy_yolo_default
     }
 
     /// Whether the user explicitly persisted an `auto_compact` preference.
@@ -615,13 +673,13 @@ impl Settings {
             self.fancy_animations = false;
         }
 
-        // tmux/screen activity monitors treat purely animated redraws as
-        // activity. Keep multiplexer sessions calm by pinning animations.
+        // Multiplexers need a bounded redraw rate, not a different product.
+        // Preserve authored motion and let the frame limiter protect tmux /
+        // screen; NO_ANIMATIONS remains the explicit hard-off contract.
         let in_terminal_multiplexer = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty())
             || std::env::var_os("STY").is_some_and(|v| !v.is_empty());
         if in_terminal_multiplexer {
-            self.low_motion = true;
-            self.fancy_animations = false;
+            self.constrained_frame_rate = true;
         }
 
         // Plain Windows PowerShell / cmd.exe under legacy ConHost exposes none
@@ -727,6 +785,15 @@ impl Settings {
                 }
                 self.ocean_treatment = normalized;
             }
+            "work_surface_placement" | "work_surface" | "work_rail" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "top" | "left" | "right") {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid work surface placement '{value}'. Expected: top, left, or right."
+                    );
+                }
+                self.work_surface_placement = normalized;
+            }
             "bracketed_paste" | "paste" => {
                 self.bracketed_paste = parse_bool(value)?;
             }
@@ -806,6 +873,9 @@ impl Settings {
                 }
                 self.transcript_spacing = normalized.to_string();
             }
+            "launch_screen" | "launch" => {
+                self.launch_screen = parse_bool(value)?;
+            }
             "status_indicator" | "indicator" => {
                 let normalized = normalize_status_indicator(value);
                 if !["cw", "whale", "dots", "off"].contains(&normalized) {
@@ -831,13 +901,16 @@ impl Settings {
                 self.workspace_follow_symlinks = parse_bool(value)?;
             }
             "default_mode" | "mode" => {
-                let normalized = normalize_mode(value);
-                if !["agent", "plan", "yolo"].contains(&normalized) {
-                    anyhow::bail!(
-                        "Failed to update setting: invalid mode '{value}'. Expected: agent, plan, yolo."
-                    );
-                }
-                self.default_mode = normalized.to_string();
+                // Loading remains deliberately liberal so old `operate` and
+                // `yolo` files migrate safely. New writes are strict: these
+                // are session actions/permission aliases, not startup modes.
+                self.default_mode = match value.trim().to_ascii_lowercase().as_str() {
+                    "agent" | "normal" => "agent".to_string(),
+                    "plan" => "plan".to_string(),
+                    _ => anyhow::bail!(
+                        "Failed to update setting: invalid mode '{value}'. Expected: agent or plan."
+                    ),
+                };
             }
             "sidebar_width" | "sidebar" => {
                 let width: u16 = value
@@ -972,6 +1045,10 @@ impl Settings {
         lines.push(format!("  low_motion:         {}", self.low_motion));
         lines.push(format!("  fancy_animations:   {}", self.fancy_animations));
         lines.push(format!("  ocean_treatment:    {}", self.ocean_treatment));
+        lines.push(format!(
+            "  work_surface:       {}",
+            self.work_surface_placement
+        ));
         lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
         lines.push(format!(
             "  paste_burst_detect: {}",
@@ -1009,6 +1086,7 @@ impl Settings {
             self.workspace_follow_symlinks
         ));
         lines.push(format!("  default_mode:       {}", self.default_mode));
+        lines.push(format!("  launch_screen:      {}", self.launch_screen));
         lines.push(format!(
             "  sidebar_width:      {}%",
             self.sidebar_width_percent
@@ -1069,6 +1147,10 @@ impl Settings {
                 "Transcript background treatment: ombre/flat (independent of motion)",
             ),
             (
+                "work_surface_placement",
+                "Ocean Tasks/To-do/Workers rail placement: top/left/right",
+            ),
+            (
                 "bracketed_paste",
                 "Terminal bracketed-paste mode: on/off (rare to disable)",
             ),
@@ -1120,6 +1202,10 @@ impl Settings {
                 "Transcript spacing: compact, comfortable, spacious",
             ),
             (
+                "launch_screen",
+                "Show the pre-session launch menu on startup: on/off",
+            ),
+            (
                 "status_indicator",
                 "Header status indicator next to effort chip: cw, whale, dots, off",
             ),
@@ -1135,7 +1221,7 @@ impl Settings {
                 "workspace_follow_symlinks",
                 "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
             ),
-            ("default_mode", "Default mode: agent, plan, yolo"),
+            ("default_mode", "Default mode: agent or plan"),
             ("sidebar_width", "Sidebar width percentage: 10-50"),
             (
                 "sidebar_focus",
@@ -1422,7 +1508,12 @@ fn normalize_mode(value: &str) -> &str {
         "normal" => "agent",
         "agent" => "agent",
         "plan" => "plan",
-        "yolo" => "yolo",
+        // Operate is a session action, not a startup personality. Old saved
+        // values fall back to the safe general-purpose Agent startup mode.
+        "operate" | "operation" | "ops" => "agent",
+        // Kept as a migration input in `load_persisted`; new settings never
+        // advertise it as a mode because permission posture is separate.
+        "yolo" => "agent",
         _ => value,
     }
 }
@@ -1605,6 +1696,28 @@ mod tests {
         assert!(err.to_string().contains("ombre or flat"));
     }
 
+    #[test]
+    fn work_surface_placement_persists_only_top_left_or_right() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.work_surface_placement, "top");
+
+        for placement in ["left", "right", "top"] {
+            settings
+                .set("work_surface_placement", placement)
+                .expect("valid placement");
+            assert_eq!(settings.work_surface_placement, placement);
+            let body = toml::to_string(&settings).expect("serialize settings");
+            let restored: Settings = toml::from_str(&body).expect("restore settings");
+            assert_eq!(restored.work_surface_placement, placement);
+        }
+
+        let err = settings
+            .set("work_surface_placement", "bottom")
+            .expect_err("bottom is owned by composer/footer");
+        assert!(err.to_string().contains("top, left, or right"));
+        assert_eq!(settings.work_surface_placement, "top");
+    }
+
     /// Explicit animated baseline for env-force tests (#4095 flipped defaults to calm).
     fn animated_settings() -> Settings {
         Settings {
@@ -1622,7 +1735,7 @@ mod tests {
         let mut settings = Settings::default();
         // Density is calm by default; motion is an independent axis.
         assert!(settings.calm_mode);
-        assert!(settings.show_thinking);
+        assert!(!settings.show_thinking);
 
         let changed = settings.apply_preset("CALM").expect("calm preset applies");
         assert_eq!(
@@ -1639,25 +1752,21 @@ mod tests {
         assert!(settings.low_motion);
         assert!(!settings.fancy_animations);
         assert!(!settings.show_tool_details);
-        // Evidence preserved: the calm preset must NOT hide thinking — it only
-        // quiets motion and verbose tool detail.
-        assert!(
-            settings.show_thinking,
-            "calm preset must keep thinking visible"
-        );
+        // Calm does not override the user's reasoning preference.
+        assert!(!settings.show_thinking);
     }
 
     #[test]
-    fn default_settings_are_compact_presentation() {
+    fn default_settings_use_comfortable_transcript_spacing() {
         let settings = Settings::default();
         assert!(settings.calm_mode);
         assert!(!settings.show_tool_details);
         assert!(!settings.low_motion);
         assert!(settings.fancy_animations);
-        assert_eq!(settings.transcript_spacing, "compact");
+        assert_eq!(settings.transcript_spacing, "comfortable");
         assert_eq!(settings.tool_collapse_mode, "compact");
-        // Thinking stays visible — compact is not "hide evidence".
-        assert!(settings.show_thinking);
+        // Thinking is opt-in so the transcript stays focused on the chat.
+        assert!(!settings.show_thinking);
     }
 
     #[test]
@@ -1708,6 +1817,11 @@ mod tests {
             "underwater presentation is the default"
         );
         assert!(!settings.low_motion);
+        assert_eq!(settings.transcript_spacing, "comfortable");
+        assert!(
+            !settings.launch_screen,
+            "returning users enter a session directly"
+        );
     }
 
     #[test]
@@ -2319,6 +2433,7 @@ mod tests {
         let prev_term_program = std::env::var_os("TERM_PROGRAM");
         let prev_tilix_id = std::env::var_os("TILIX_ID");
         let prev_terminator_uuid = std::env::var_os("TERMINATOR_UUID");
+        let prev_wt_session = std::env::var_os("WT_SESSION");
 
         for (var, val) in [
             ("TILIX_ID", "d5b5b5d6-tilix-session"),
@@ -2330,6 +2445,12 @@ mod tests {
                 std::env::remove_var("TILIX_ID");
                 std::env::remove_var("TERMINATOR_UUID");
                 std::env::set_var(var, val);
+                // A native Windows test process without any modern-terminal
+                // marker is intentionally treated as legacy ConHost. This
+                // test isolates the VTE signal instead, so keep that separate
+                // platform heuristic from changing its motion assertions.
+                #[cfg(windows)]
+                std::env::set_var("WT_SESSION", "codewhale-test");
             }
             let mut settings = animated_settings();
             assert!(!settings.low_motion, "default is animated");
@@ -2361,6 +2482,10 @@ mod tests {
             match prev_terminator_uuid {
                 Some(v) => std::env::set_var("TERMINATOR_UUID", v),
                 None => std::env::remove_var("TERMINATOR_UUID"),
+            }
+            match prev_wt_session {
+                Some(v) => std::env::set_var("WT_SESSION", v),
+                None => std::env::remove_var("WT_SESSION"),
             }
         }
     }
@@ -2539,7 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_multiplexer_env_forces_low_motion_on() {
+    fn terminal_multiplexer_caps_redraws_without_disabling_motion() {
         let _g = term_program_test_guard();
         let vars = [
             "TMUX",
@@ -2550,6 +2675,7 @@ mod tests {
             "TILIX_ID",
             "TERMINATOR_UUID",
             "NO_ANIMATIONS",
+            "WT_SESSION",
         ];
         let prev: Vec<_> = vars
             .iter()
@@ -2566,18 +2692,21 @@ mod tests {
                     std::env::remove_var(name);
                 }
                 std::env::set_var(var, val);
+                #[cfg(windows)]
+                std::env::set_var("WT_SESSION", "codewhale-test");
             }
             let mut settings = animated_settings();
             assert!(!settings.low_motion, "default is animated");
             assert!(settings.fancy_animations, "default shows the water strip");
             settings.apply_env_overrides();
+            assert!(!settings.low_motion, "{var} must preserve authored motion");
             assert!(
-                settings.low_motion,
-                "{var}={val:?} must enable low_motion under terminal multiplexers (#1925)"
+                settings.fancy_animations,
+                "{var} must preserve Ocean motion"
             );
             assert!(
-                !settings.fancy_animations,
-                "{var}={val:?} must disable fancy_animations under terminal multiplexers (#1925)"
+                settings.constrained_frame_rate,
+                "{var}={val:?} must cap redraws under terminal multiplexers"
             );
         }
 
@@ -2861,6 +2990,55 @@ mod tests {
     }
 
     #[test]
+    fn startup_mode_writes_only_accept_agent_or_plan() {
+        let mut settings = Settings::default();
+
+        settings.set("default_mode", "plan").expect("plan mode");
+        assert_eq!(settings.default_mode, "plan");
+        settings
+            .set("default_mode", "normal")
+            .expect("legacy normal alias remains harmless");
+        assert_eq!(settings.default_mode, "agent");
+
+        for removed in ["operate", "ops", "yolo"] {
+            let err = settings
+                .set("default_mode", removed)
+                .expect_err("session actions must not become saved startup modes");
+            assert!(err.to_string().contains("agent or plan"), "{err}");
+        }
+    }
+
+    #[test]
+    fn legacy_startup_modes_migrate_without_losing_permission_intent() {
+        let _g = config_path_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let codewhale_home = tmp.path().join(".codewhale");
+        std::fs::create_dir_all(&codewhale_home).expect("codewhale home");
+        std::fs::write(
+            codewhale_home.join("settings.toml"),
+            "default_mode = \"yolo\"\n",
+        )
+        .expect("legacy settings");
+        let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
+        let _codewhale_home = EnvVarRestore::set("CODEWHALE_HOME", &codewhale_home);
+        let _home = EnvVarRestore::set("HOME", tmp.path());
+
+        let loaded = Settings::load_persisted().expect("load legacy settings");
+
+        assert_eq!(loaded.default_mode, "agent");
+        assert_eq!(loaded.permission_posture.as_deref(), Some("full-access"));
+
+        std::fs::write(
+            codewhale_home.join("settings.toml"),
+            "default_mode = \"operate\"\n",
+        )
+        .expect("legacy operate settings");
+        let loaded = Settings::load_persisted().expect("load legacy operate settings");
+        assert_eq!(loaded.default_mode, "agent");
+        assert_eq!(loaded.permission_posture, None);
+    }
+
+    #[test]
     fn settings_path_defaults_to_codewhale_home_for_new_writes() {
         let _g = config_path_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2903,7 +3081,7 @@ mod tests {
         let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
         let _home = EnvVarRestore::set("HOME", tmp.path());
 
-        let loaded = Settings::load().expect("load settings");
+        let loaded = Settings::load_persisted().expect("load persisted settings");
 
         assert!(loaded.low_motion, "legacy settings should still be read");
         assert!(
@@ -2923,20 +3101,27 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let primary = tmp.path().join(".codewhale").join("settings.toml");
         let _config_override = EnvVarRestore::remove("DEEPSEEK_CONFIG_PATH");
-        let _codewhale_home = EnvVarRestore::remove("CODEWHALE_HOME");
-        let _home = EnvVarRestore::set("HOME", tmp.path());
-        let _xdg = EnvVarRestore::set("XDG_CONFIG_HOME", tmp.path().join("platform-config"));
-        #[cfg(windows)]
-        let _appdata = EnvVarRestore::set("APPDATA", tmp.path().join("platform-config"));
-        let legacy_config_dir = dirs::config_dir()
-            .expect("config dir")
+        let _codewhale_home =
+            EnvVarRestore::set("CODEWHALE_HOME", primary.parent().expect("primary parent"));
+        let legacy_config_dir = tmp
+            .path()
+            .join("platform-config")
             .join("deepseek")
             .join("settings.toml");
         std::fs::create_dir_all(legacy_config_dir.parent().expect("parent"))
             .expect("legacy config dir");
         std::fs::write(&legacy_config_dir, "low_motion = true\n").expect("legacy settings");
 
-        let loaded = Settings::load().expect("load settings");
+        // Exercise the same load and migration path with explicit candidates.
+        // `dirs::config_dir()` uses the Win32 known-folder API on Windows, so
+        // APPDATA/XDG environment overrides cannot isolate that process-global
+        // location in a parallel test runner.
+        let loaded = Settings::load_persisted_from_candidates(
+            Some(primary.clone()),
+            None,
+            Some(legacy_config_dir),
+        )
+        .expect("load persisted settings");
 
         assert!(loaded.low_motion, "legacy settings should still be read");
         assert!(

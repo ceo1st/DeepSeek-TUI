@@ -161,7 +161,7 @@ Semantics:
   holds — a crafted constitution can never grant authority or weaken a gate
   above it.
 - **Not bypassable by mode.** Like the built-in safety floor, an `ask` hold
-  force-prompts in every mode, including YOLO; `block` always denies. Mode
+  force-prompts in every mode, including Full Access; `block` always denies. Mode
   cannot turn a hold off.
 - **Repo-local only.** Only the repo's `.codewhale/constitution.json`
   participates. The user-global constitution stays advisory prose and never
@@ -1104,6 +1104,11 @@ Common settings keys:
 - `paste_burst_detection` (on/off, default on): fallback rapid-key paste
   detection for terminals that do not emit bracketed-paste events. This is
   independent of terminal bracketed-paste mode.
+- `work_surface_placement` (`top`, `left`, or `right`; default `top`): places
+  Ocean's Tasks / To-do / Workers surface above the transcript or in a side
+  rail. Side choices fall back to the top layout on narrow terminals and in
+  Classic without changing the saved Ocean preference. Set it live with
+  `/config work_surface_placement right --save` (or `left` / `top`).
 - `mention_menu_limit` (integer, default `128`): maximum number of
   `@`-mention popup candidates retained before the composer renders the
   visible window. The visible rows still depend on terminal height.
@@ -1129,7 +1134,10 @@ Common settings keys:
 - `cost_currency` (`usd`, `cny`; default `usd`): currency used by the footer,
   context panel, `/cost`, `/tokens`, and long-turn notification summaries. The
   aliases `rmb` and `yuan` normalize to `cny`.
-- `default_mode` (agent, plan, yolo; legacy `normal` is accepted and normalized to `agent`)
+- `default_mode` (`agent`, `plan`, or `operate`; legacy values are accepted for migration but are not live mode vocabulary)
+- `launch_screen` (`on`/`off`; default `off`): show the pre-session New/
+  Resume/Worktree menu. With it off, Codewhale enters a new session directly;
+  resume remains available in-session.
 - `sidebar_focus` (`pinned`, `auto`, `tasks`, `agents`, `context`, `hidden`; default
   `pinned`): selects the right sidebar focus. `pinned` keeps the right sidebar
   visible when the terminal is wide enough and composes Work, Tasks, Agents,
@@ -1144,8 +1152,9 @@ Common settings keys:
   also kept locally for composer history search)
 - `default_model` (model name override)
 
-Only `agent`, `plan`, and `yolo` are visible modes in the UI. Switch between
-them with `/mode`. For compatibility, older settings files with
+Plan and Act are the everyday visible modes in the UI; Operate is an explicit
+preview entry while its Workflow control surface is still being built. Switch
+between them with `/mode`. For compatibility, older settings files with
 `default_mode = "normal"` still load as `agent`.
 
 Localization scope is tracked in [LOCALIZATION.md](LOCALIZATION.md). The v0.7.6
@@ -1217,7 +1226,7 @@ If you are upgrading from older releases:
   this keeps shell tools available with approval prompts; setting it to `false`
   hides shell tools. Headless, durable-task, and other noninteractive profiles
   keep the conservative omitted-field default and require `allow_shell = true`
-  to expose shell. Plan mode always hides shell; YOLO enables shell and
+  to expose shell. Plan mode always hides shell; Full Access enables shell and
   auto-approval.
 - `approval_policy` (string, optional): `on-request`, `untrusted`, or `never`. Runtime `approval_mode` editing in `/config` also accepts `on-request` and `untrusted` aliases.
 - `sandbox_mode` (string, optional): `read-only`, `workspace-write`, `danger-full-access`, `external-sandbox`.
@@ -1235,7 +1244,7 @@ If you are upgrading from older releases:
   approval handling, `allow` skips approval for matching invocations, and
   `ask` forces approval only in modes that can prompt. Outside the TUI
   auto-approve path, a matching `ask` rule under `approval_policy = "never"`
-  is rejected because no prompt can be shown. In YOLO / auto-approval sessions,
+  is rejected because no prompt can be shown. In Full Access / auto-approval sessions,
   `ask` rules do not downgrade the session into prompting or blocking; explicit
   `deny` rules still block according to the current execution-policy logic.
 
@@ -1484,7 +1493,7 @@ If you are upgrading from older releases:
 - `tui.mouse_capture` (bool, optional, default `true` on non-Windows terminals and on Windows Terminal/ConEmu/Cmder when the alternate screen is active; `false` on legacy Windows console and inside JetBrains JediTerm — PyCharm/IDEA/CLion/etc. — where mouse-event escapes leak into the input stream as garbled text, see #878 / #898): enable internal mouse scrolling, transcript selection, right-click context actions, and transcript scrollbar dragging. TUI-owned drag selection copies only transcript text, removes visual wrap-column line breaks from paragraphs, and keeps selection scoped to the transcript pane. Set this to `false` or run with `--no-mouse-capture` for raw terminal selection; set it to `true` or run with `--mouse-capture` to opt in anywhere it's defaulted off. On raw terminal selection, especially on legacy Windows console or when mouse capture is disabled, selection may cross the right sidebar and include visual wraps because the terminal, not the TUI, owns the selection.
 - `tui.terminal_probe_timeout_ms` (int, optional, default `500`): startup terminal-mode probe timeout in milliseconds. Values are clamped to `100..=5000`; timeout emits a warning and aborts startup instead of hanging indefinitely.
 - `tui.stream_chunk_timeout_secs` (int, optional, default `900`): per-SSE-chunk idle timeout for streamed model responses. Slow local or compatible servers can raise this with `/config stream_chunk_timeout_secs <seconds>`; `0` maps to the default and explicit values must be `1..=3600`. The legacy `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var is still honored when this key is omitted.
-- `tui.osc8_links` (bool, optional, default on for macOS/Linux, off for Windows): emit OSC 8 escape sequences around URLs in transcript output so terminals that support them (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) render them as Cmd+click hyperlinks. Terminals without OSC 8 support render the plain URL and ignore the escape. The escapes are emitted out-of-band (not inside buffer cells), so column corruption is not a concern; set `false` only for terminals that misrender the OSC 8 terminator itself. Windows legacy consoles default off; opt in with `true`.
+- `tui.osc8_links` (bool, optional, default on for macOS/Linux, off for Windows): emit OSC 8 escape sequences around URLs in transcript output so supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) can open them with the terminal's link gesture—usually Cmd-click on macOS and Ctrl-click on Linux/Windows. Terminals without OSC 8 support render the plain label and ignore the escape. The escapes are emitted out-of-band (not inside buffer cells), so column corruption is not a concern; set `false` only for terminals that misrender the OSC 8 terminator itself. Windows legacy consoles default off; opt in with `true`.
 - `hooks` (optional): lifecycle hooks configuration (see `config.example.toml`).
 - `features.*` (optional): feature flag overrides (see below).
 

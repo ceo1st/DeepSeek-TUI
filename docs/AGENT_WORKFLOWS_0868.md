@@ -1,12 +1,14 @@
 # CodeWhale v0.8.68 — Agent Workflow Playbook
 
-> **Status (2026-07-12): Historical.** v0.8.68 shipped on 2026-07-10; this
-> playbook's waves are complete. Two things in it remain live and should be
-> carried forward, not re-derived: the settled product vocabulary
-> (**Fleet = who · Workflow = what order · Lane = running instance ·
-> Runtime = where/how**) and the still-open dogfood residuals
-> (#4175, #4177, #4178, #4179 — blocked on a completed live tmux stopship run
-> with child receipts and a verifier gate).
+> **Status (2026-07-13): Historical execution playbook for an unpublished
+> release candidate.** v0.8.68 has not yet been tagged or publicly published,
+> and the waves/checkmarks below are not proof that current acceptance criteria
+> or release gates pass. Use the current
+> [v0.8.68 release-candidate ledger](releases/v0.8.68-release-candidate.md) for
+> release truth. The settled product vocabulary remains useful and should not
+> be re-derived: **Fleet = who · Workflow = what order · Lane = running
+> instance · Runtime = where/how**. The architecture/dogfood issues linked
+> below remain GitHub-tracked work until their acceptance evidence is reviewed.
 
 This document tells autonomous agents how to systematically complete the v0.8.68
 release. It pairs with:

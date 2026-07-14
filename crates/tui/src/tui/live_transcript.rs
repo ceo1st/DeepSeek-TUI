@@ -36,7 +36,7 @@ use crate::palette;
 use crate::tui::app::App;
 use crate::tui::backtrack::Direction;
 use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
-use crate::tui::transcript_cache::{CellId, TranscriptCache};
+use crate::tui::transcript_cache::{CachedTranscriptLine, CellId, TranscriptCache};
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
 };
@@ -67,6 +67,7 @@ struct CellSnapshot {
 
 struct FlattenedTranscript {
     lines: Vec<Line<'static>>,
+    line_links: Vec<Vec<crate::tui::osc8::LineLink>>,
     highlighted_range: Option<(usize, usize)>,
 }
 
@@ -194,6 +195,7 @@ impl LiveTranscriptOverlay {
     fn flatten(&self, width: u16) -> FlattenedTranscript {
         let width = width.max(1);
         let mut out: Vec<Line<'static>> = Vec::new();
+        let mut out_links: Vec<Vec<crate::tui::osc8::LineLink>> = Vec::new();
         let mut highlighted_range = None;
 
         // Pre-compute which cell index (in `self.snapshots`) is the one
@@ -220,28 +222,52 @@ impl LiveTranscriptOverlay {
 
         let mut cache = self.cache.borrow_mut();
         for (cell_idx, snap) in self.snapshots.iter().enumerate() {
-            let lines: Vec<Line<'static>> = match cache.get(snap.id, width, snap.revision) {
+            let rendered: Vec<CachedTranscriptLine> = match cache.get(snap.id, width, snap.revision)
+            {
                 Some(cached) => cached.to_vec(),
                 None => {
-                    let rendered = snap.cell.lines_with_options(width, self.options);
+                    let rendered = snap
+                        .cell
+                        .lines_with_copy_metadata(width, self.options)
+                        .into_iter()
+                        .map(|rendered| CachedTranscriptLine {
+                            line: rendered.line,
+                            links: rendered.links,
+                        })
+                        .collect::<Vec<_>>();
                     cache.insert(snap.id, width, snap.revision, rendered.clone());
                     rendered
                 }
             };
+            let mut lines = rendered
+                .iter()
+                .map(|rendered| rendered.line.clone())
+                .collect::<Vec<_>>();
+            let mut line_links = rendered
+                .into_iter()
+                .map(|rendered| rendered.links)
+                .collect::<Vec<_>>();
 
             if Some(cell_idx) == highlighted_cell_idx {
                 let start = out.len();
-                out.extend(decorate_highlight(lines));
+                lines = decorate_highlight(lines);
+                if let Some(first_links) = line_links.first_mut() {
+                    *first_links = first_links.iter().map(|link| link.shifted(2)).collect();
+                }
+                out.extend(lines);
+                out_links.extend(line_links);
                 let end = out.len();
                 if end > start {
                     highlighted_range = Some((start, end));
                 }
             } else {
                 out.extend(lines);
+                out_links.extend(line_links);
             }
         }
         FlattenedTranscript {
             lines: out,
+            line_links: out_links,
             highlighted_range,
         }
     }
@@ -552,8 +578,11 @@ impl ModalView for LiveTranscriptOverlay {
 
         // Wrap content using the per-cell cache at the body width.
         let content_width = content.width;
-        let flattened = self.flatten(content_width);
-        let lines = flattened.lines;
+        let FlattenedTranscript {
+            lines,
+            line_links,
+            highlighted_range,
+        } = self.flatten(content_width);
         self.last_total_lines.set(lines.len());
 
         let max_scroll = lines.len().saturating_sub(visible_height);
@@ -565,8 +594,7 @@ impl ModalView for LiveTranscriptOverlay {
             self.scroll.set(max_scroll);
             max_scroll
         } else if self.preview_pin_pending.replace(false) {
-            let next = flattened
-                .highlighted_range
+            let next = highlighted_range
                 .map(|(start, end)| {
                     scroll_to_show_range(self.scroll.get(), start, end, visible_height, max_scroll)
                 })
@@ -587,16 +615,21 @@ impl ModalView for LiveTranscriptOverlay {
         } else {
             lines[scroll..end].to_vec()
         };
+        let visible_line_links = if lines.is_empty() {
+            vec![Vec::new()]
+        } else {
+            line_links[scroll..end].to_vec()
+        };
 
         let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
         paragraph.render(content, buf);
 
-        // #3029: same in-band OSC 8 recovery as the main transcript — extract
-        // link regions from the rendered buffer and blank the payload cells.
-        // Append (not replace) so a same-frame main transcript's regions
-        // survive alongside the overlay's.
-        let regions = crate::tui::osc8::extract_buffer_link_regions(buf, popup_area);
-        crate::tui::osc8::append_frame_links(regions);
+        // Targets stay beside the visible lines, so the popup never writes an
+        // escape payload into the buffer. Replace the opaque popup's portion
+        // of the frame map so links in the obscured transcript cannot leak
+        // through unrelated modal text.
+        let regions = crate::tui::osc8::link_regions_for_lines(content, &visible_line_links);
+        crate::tui::osc8::overlay_frame_links(popup_area, regions);
     }
 }
 
@@ -655,6 +688,42 @@ mod tests {
         assert!(v.is_sticky());
         assert_eq!(v.scroll_offset(), 0);
         assert_eq!(v.snapshot_count(), 0);
+    }
+
+    #[test]
+    fn overlay_publishes_scrolled_url_metadata_without_escape_cells() {
+        let target = "https://example.test/a/very/long/path/that/wraps/in/the/live/view";
+        let mut view = LiveTranscriptOverlay::new();
+        let mut cells = (0..12)
+            .map(|index| user(&format!("older row {index}")))
+            .collect::<Vec<_>>();
+        cells.push(assistant(target, false));
+        install_snapshots(&mut view, cells);
+
+        let area = Rect::new(0, 0, 32, 16);
+        let mut buf = Buffer::empty(area);
+        let _ = crate::tui::osc8::take_frame_links();
+        view.render(area, &mut buf);
+        let regions = crate::tui::osc8::take_frame_links();
+
+        assert!(view.scroll_offset() > 0, "fixture must render a tail slice");
+        assert!(regions.len() > 1, "narrow overlay should wrap: {regions:?}");
+        assert!(regions.iter().all(|region| region.target == target));
+        assert!(regions.iter().all(|region| {
+            area.contains(ratatui::layout::Position {
+                x: region.col_start,
+                y: region.row,
+            }) && area.contains(ratatui::layout::Position {
+                x: region.col_end,
+                y: region.row,
+            })
+        }));
+        assert!((area.y..area.bottom()).all(|y| {
+            (area.x..area.right()).all(|x| {
+                let symbol = buf[(x, y)].symbol();
+                !symbol.contains('\x1b') && !symbol.contains("]8;;")
+            })
+        }));
     }
 
     #[test]

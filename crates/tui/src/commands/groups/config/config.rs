@@ -13,6 +13,7 @@ use crate::config::{
 use crate::config_persistence::{
     persist_provider_base_url_key, persist_root_bool_key, persist_root_string_key,
     persist_subagents_bool_key, persist_subagents_integer_key, persist_tui_integer_key,
+    persist_unset_root_key,
 };
 use crate::config_ui::{ConfigUiMode, parse_mode};
 use crate::localization::resolve_locale;
@@ -134,12 +135,11 @@ fn config_preset_command(app: &mut App, rest: &str) -> CommandResult {
     // Persist the whole bundle atomically when requested (one load/apply/save),
     // validating the preset before touching anything on disk.
     if persist {
-        match Settings::load() {
+        match Settings::load_persisted() {
             Ok(mut settings) => {
                 if let Err(e) = settings.apply_preset(name) {
                     return CommandResult::error(format!("{e}"));
                 }
-                settings.apply_env_overrides();
                 if let Err(e) = settings.save() {
                     return CommandResult::error(format!("Failed to save settings: {e}"));
                 }
@@ -223,7 +223,7 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
             }
         }
         "provider" => Some(app.api_provider.as_str().to_string()),
-        "approval_mode" | "approval" => Some(app.approval_mode.label().to_string()),
+        "approval_mode" | "approval" => Some(app.approval_mode.permission_chip_label().to_string()),
         "allow_shell" | "shell" | "exec_shell" => Some(app.allow_shell.to_string()),
         "base_url" => {
             let config = match Config::load(app.config_path.clone(), app.config_profile.as_deref())
@@ -301,6 +301,9 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
         "max_history" | "history" => Some(app.max_input_history.to_string()),
         "sidebar_width" | "sidebar" => Some(app.sidebar_width_percent.to_string()),
         "sidebar_focus" | "focus" => Some(app.sidebar_focus.as_setting().to_string()),
+        "work_surface_placement" | "work_surface" | "work_rail" => {
+            Some(app.work_surface.placement.as_setting().to_string())
+        }
         "tool_collapse" | "tool_collapse_mode" | "collapse" => {
             Some(app.tool_collapse_mode.as_setting().to_string())
         }
@@ -761,7 +764,7 @@ fn config_editability_audit(app: &App) -> CommandResult {
             effective_permissions.to_string(),
             "runtime",
             "Shift+Tab",
-            "Shows the effective Act/Operate posture; Plan remains Read Only.",
+            "Shows the effective Act permission posture; Plan remains Read Only.",
         ),
         (
             "permission_posture",
@@ -1446,12 +1449,87 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 },
             );
         }
-        "approval_mode" | "approval" => {
+        "approval_mode" | "approval_policy" | "approval" => {
+            let use_tui_default = matches!(
+                value
+                    .trim()
+                    .to_ascii_lowercase()
+                    .replace([' ', '_'], "-")
+                    .as_str(),
+                "default" | "tui-default" | "use-tui-default"
+            );
+            if use_tui_default {
+                if !persist {
+                    return CommandResult::error(
+                        "Removing the config approval override requires --save.",
+                    );
+                }
+                let control = match load_command_config(app) {
+                    Ok(config) => config.approval_policy_control(
+                        app.config_path.as_deref(),
+                        app.config_profile.as_deref(),
+                        &app.workspace,
+                    ),
+                    Err(err) => return CommandResult::error(err),
+                };
+                if !matches!(
+                    control,
+                    crate::config::ApprovalPolicyControl::RootConfig
+                        | crate::config::ApprovalPolicyControl::Unset
+                ) {
+                    return CommandResult::error(format!(
+                        "Approval posture is controlled by {}; change that source first.",
+                        control.label()
+                    ));
+                }
+                return match persist_unset_root_key(app.config_path.as_deref(), "approval_policy") {
+                    Ok(path) => {
+                        let saved_mode = Settings::load_persisted()
+                            .ok()
+                            .and_then(|settings| settings.permission_posture)
+                            .as_deref()
+                            .and_then(ApprovalMode::from_config_value)
+                            .unwrap_or(ApprovalMode::Suggest);
+                        app.set_agent_approval_posture(saved_mode);
+                        app.clear_saved_approval_policy_lock();
+                        CommandResult::with_message_and_action(
+                            format!(
+                                "approval_policy removed from {}; new sessions use the TUI {} default",
+                                path.display(),
+                                saved_mode.permission_chip_label()
+                            ),
+                            AppAction::ApprovalPolicyPersisted { policy: None },
+                        )
+                    }
+                    Err(err) => CommandResult::error(format!("Failed to save: {err}")),
+                };
+            }
+            let control = match load_command_config(app) {
+                Ok(config) => config.approval_policy_control(
+                    app.config_path.as_deref(),
+                    app.config_profile.as_deref(),
+                    &app.workspace,
+                ),
+                Err(err) => return CommandResult::error(err),
+            };
+            let control_allows_change = if persist {
+                control.editable_root()
+            } else {
+                matches!(control, crate::config::ApprovalPolicyControl::Unset)
+            };
+            if !control_allows_change {
+                return CommandResult::error(format!(
+                    "Approval posture is controlled by {}; {}.",
+                    control.label(),
+                    if matches!(control, crate::config::ApprovalPolicyControl::RootConfig) {
+                        "save a new config value or choose Use TUI permission default"
+                    } else {
+                        "change that source first"
+                    }
+                ));
+            }
             let mode = ApprovalMode::from_config_value(value);
             return match mode {
-                Some(_) if app.approval_policy_requirements_managed() => CommandResult::error(
-                    "Approval posture is controlled by managed requirements; edit the controlling policy source.",
-                ),
                 Some(ApprovalMode::Bypass) if persist => CommandResult::error(
                     "Full Access is not a valid top-level approval_policy. Use Shift+Tab to save the TUI-only posture.",
                 ),
@@ -1469,11 +1547,13 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                                 CommandResult::with_message_and_action(
                                     format!(
                                         "approval_mode = {} (saved to {} as approval_policy = \"{}\")",
-                                        m.label(),
+                                        m.permission_chip_label(),
                                         path.display(),
                                         saved
                                     ),
-                                    AppAction::ModeChanged(app.mode),
+                                    AppAction::ApprovalPolicyPersisted {
+                                        policy: Some(saved.to_string()),
+                                    },
                                 )
                             }
                             Err(err) => CommandResult::error(format!("Failed to save: {err}")),
@@ -1483,23 +1563,36 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                         CommandResult::with_message_and_action(
                             format!(
                                 "approval_mode = {} (session only, add --save to persist)",
-                                m.label()
+                                m.permission_chip_label()
                             ),
                             AppAction::ModeChanged(app.mode),
                         )
                     }
                 }
                 None => CommandResult::error(
-                    "Invalid approval_mode. Use: auto, suggest/on-request/untrusted, bypass/full-access, never/deny",
+                    "Invalid approval_mode. Use: auto-review/auto, ask/suggest/on-request, full-access, never/deny",
                 ),
             };
         }
         "allow_shell" | "shell" | "exec_shell" => {
+            let control = match load_command_config(app) {
+                Ok(config) => config.allow_shell_control(
+                    app.config_path.as_deref(),
+                    app.config_profile.as_deref(),
+                    &app.workspace,
+                ),
+                Err(err) => return CommandResult::error(err),
+            };
+            if !control.editable_root() {
+                return CommandResult::error(format!(
+                    "Shell access is controlled by {}; change that source first.",
+                    control.label()
+                ));
+            }
             let enabled = match parse_config_bool(value) {
                 Ok(enabled) => enabled,
                 Err(err) => return CommandResult::error(err),
             };
-            app.allow_shell = enabled;
             let suffix = if persist {
                 match persist_root_bool_key(app.config_path.as_deref(), "allow_shell", enabled) {
                     Ok(path) => format!(" (saved to {})", path.display()),
@@ -1508,8 +1601,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             } else {
                 " (session only, add --save to persist)".to_string()
             };
+            app.set_agent_shell_access(enabled);
             let mode_hint = if enabled {
-                " Act mode will expose shell on the next turn with approval gating. Bypass permissions (Shift+Tab) also enables shell and auto-approves."
+                " Act mode will expose shell on the next turn with approval gating. Full Access (Shift+Tab) also enables shell and auto-approves."
             } else {
                 " Shell tools will be hidden on the next turn. Re-enable with `/config allow_shell true`."
             };
@@ -1650,7 +1744,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
         _ => {}
     }
 
-    let mut settings = match Settings::load() {
+    let mut settings = match Settings::load_persisted() {
         Ok(s) => s,
         Err(e) if !persist => {
             app.status_message = Some(format!(
@@ -1664,7 +1758,11 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
     if let Err(e) = settings.set(&key, value) {
         return CommandResult::error(format!("{e}"));
     }
-    settings.apply_env_overrides();
+    // Runtime/environment constraints are an effective projection, not saved
+    // preferences. Keep the persisted copy pristine so NO_ANIMATIONS or a
+    // terminal quirk cannot become permanent during an unrelated edit.
+    let mut effective_settings = settings.clone();
+    effective_settings.apply_env_overrides();
 
     let mut action = None;
     match key.as_str() {
@@ -1678,16 +1776,24 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.mark_history_updated();
         }
         "low_motion" | "motion" => {
-            app.low_motion = settings.low_motion;
+            app.low_motion = effective_settings.low_motion;
             app.needs_redraw = true;
         }
         "fancy_animations" | "fancy" | "animations" => {
-            app.fancy_animations = settings.fancy_animations;
+            app.fancy_animations = effective_settings.fancy_animations;
             app.needs_redraw = true;
         }
         "ocean_treatment" | "treatment" | "background_treatment" => {
             app.ocean_treatment =
                 crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
+            app.needs_redraw = true;
+        }
+        "work_surface_placement" | "work_surface" | "work_rail" => {
+            app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::parse(
+                &settings.work_surface_placement,
+            );
+            app.work_surface.focused = false;
+            app.work_surface.last_area = None;
             app.needs_redraw = true;
         }
         "bracketed_paste" | "paste" => {
@@ -1699,7 +1805,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.needs_redraw = true;
         }
         "synchronized_output" | "sync_output" | "sync" => {
-            app.synchronized_output_enabled = settings.synchronized_output_enabled();
+            app.synchronized_output_enabled = effective_settings.synchronized_output_enabled();
             app.needs_redraw = true;
         }
         "show_thinking" | "thinking" => {
@@ -1800,9 +1906,13 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.expanded_tool_runs.clear();
             app.mark_history_updated();
         }
-        "default_mode" | "mode" => {
+        // `default_mode` is a restart default, not a live mode switch. The
+        // `/mode` command owns synchronized session transitions.
+        "default_mode" => {}
+        "mode" => {
             let mode = AppMode::from_setting(&settings.default_mode);
             app.set_mode(mode);
+            action = Some(AppAction::ModeChanged(mode));
         }
         "max_history" | "history" => {
             app.max_input_history = settings.max_input_history;
@@ -2159,6 +2269,11 @@ mod tests {
         userprofile: Option<OsString>,
         codewhale_config_path: Option<OsString>,
         deepseek_config_path: Option<OsString>,
+        deepseek_allow_shell: Option<OsString>,
+        deepseek_approval_policy: Option<OsString>,
+        no_animations: Option<OsString>,
+        term_program: Option<OsString>,
+        ptyxis_version: Option<OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -2172,6 +2287,11 @@ mod tests {
             let userprofile_prev = env::var_os("USERPROFILE");
             let codewhale_config_prev = env::var_os("CODEWHALE_CONFIG_PATH");
             let deepseek_config_prev = env::var_os("DEEPSEEK_CONFIG_PATH");
+            let deepseek_allow_shell_prev = env::var_os("DEEPSEEK_ALLOW_SHELL");
+            let deepseek_approval_policy_prev = env::var_os("DEEPSEEK_APPROVAL_POLICY");
+            let no_animations_prev = env::var_os("NO_ANIMATIONS");
+            let term_program_prev = env::var_os("TERM_PROGRAM");
+            let ptyxis_version_prev = env::var_os("PTYXIS_VERSION");
 
             // Safety: test-only environment mutation guarded by process-wide mutex.
             unsafe {
@@ -2179,6 +2299,11 @@ mod tests {
                 env::set_var("USERPROFILE", &home_str);
                 env::remove_var("CODEWHALE_CONFIG_PATH");
                 env::set_var("DEEPSEEK_CONFIG_PATH", &config_str);
+                env::remove_var("DEEPSEEK_ALLOW_SHELL");
+                env::remove_var("DEEPSEEK_APPROVAL_POLICY");
+                env::remove_var("NO_ANIMATIONS");
+                env::remove_var("TERM_PROGRAM");
+                env::remove_var("PTYXIS_VERSION");
             }
 
             Self {
@@ -2186,6 +2311,11 @@ mod tests {
                 userprofile: userprofile_prev,
                 codewhale_config_path: codewhale_config_prev,
                 deepseek_config_path: deepseek_config_prev,
+                deepseek_allow_shell: deepseek_allow_shell_prev,
+                deepseek_approval_policy: deepseek_approval_policy_prev,
+                no_animations: no_animations_prev,
+                term_program: term_program_prev,
+                ptyxis_version: ptyxis_version_prev,
                 _lock: lock,
             }
         }
@@ -2238,6 +2368,49 @@ mod tests {
                 // Safety: test-only environment mutation guarded by a global mutex.
                 unsafe {
                     env::remove_var("DEEPSEEK_CONFIG_PATH");
+                }
+            }
+
+            for (key, value) in [
+                ("DEEPSEEK_ALLOW_SHELL", self.deepseek_allow_shell.take()),
+                (
+                    "DEEPSEEK_APPROVAL_POLICY",
+                    self.deepseek_approval_policy.take(),
+                ),
+            ] {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    if let Some(value) = value {
+                        env::set_var(key, value);
+                    } else {
+                        env::remove_var(key);
+                    }
+                }
+            }
+
+            if let Some(value) = self.no_animations.take() {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::set_var("NO_ANIMATIONS", value);
+                }
+            } else {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::remove_var("NO_ANIMATIONS");
+                }
+            }
+
+            for (key, value) in [
+                ("TERM_PROGRAM", self.term_program.take()),
+                ("PTYXIS_VERSION", self.ptyxis_version.take()),
+            ] {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    if let Some(value) = value {
+                        env::set_var(key, value);
+                    } else {
+                        env::remove_var(key);
+                    }
                 }
             }
         }
@@ -2504,6 +2677,30 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
             "expected usage hint, got: {message}"
         );
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn work_surface_config_applies_live_and_rejects_bottom() {
+        let mut app = create_test_app();
+
+        let result = set_config_value(&mut app, "work_surface_placement", "left", false);
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_eq!(
+            app.work_surface.placement,
+            crate::tui::work_surface::WorkSurfacePlacement::Left
+        );
+        let shown = show_single_setting(&app, "work_surface_placement");
+        assert_eq!(
+            shown.message.as_deref(),
+            Some("work_surface_placement = left")
+        );
+
+        let result = set_config_value(&mut app, "work_surface_placement", "bottom", false);
+        assert!(result.is_error);
+        assert_eq!(
+            app.work_surface.placement,
+            crate::tui::work_surface::WorkSurfacePlacement::Left
+        );
     }
 
     #[test]
@@ -2904,9 +3101,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         assert!(msg.contains("Act mode"));
         assert!(msg.contains("approval gating"));
         assert!(msg.contains("next turn"));
-        assert!(
-            msg.contains("Bypass permissions (Shift+Tab) also enables shell and auto-approves")
-        );
+        assert!(msg.contains("Full Access (Shift+Tab) also enables shell and auto-approves"));
     }
 
     #[test]
@@ -2929,7 +3124,7 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         assert_eq!(
             msg,
             format!(
-                "allow_shell = true (saved to {}). Act mode will expose shell on the next turn with approval gating. Bypass permissions (Shift+Tab) also enables shell and auto-approves.",
+                "allow_shell = true (saved to {}). Act mode will expose shell on the next turn with approval gating. Full Access (Shift+Tab) also enables shell and auto-approves.",
                 config_path.display()
             )
         );
@@ -2944,6 +3139,138 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         assert!(!app.allow_shell);
         let msg = result.message.unwrap();
         assert!(msg.contains("Failed to parse boolean 'maybe'"));
+    }
+
+    #[test]
+    fn config_command_cannot_bypass_project_shell_constraint() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-project-shell-control-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let root_config = temp_root.join(".deepseek").join("config.toml");
+        fs::write(&root_config, "# user root\n").unwrap();
+        let workspace = temp_root.join("workspace");
+        fs::create_dir_all(workspace.join(codewhale_config::CODEWHALE_APP_DIR)).unwrap();
+        fs::write(
+            workspace
+                .join(codewhale_config::CODEWHALE_APP_DIR)
+                .join("config.toml"),
+            "allow_shell = false\n",
+        )
+        .unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(root_config.clone());
+        app.workspace = workspace;
+        app.set_agent_shell_access(false);
+
+        let result = config_command(&mut app, Some("allow_shell true --save"));
+
+        assert!(result.is_error, "{:?}", result.message);
+        assert!(!app.allow_shell);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("project configuration"))
+        );
+        assert!(
+            !fs::read_to_string(root_config)
+                .unwrap()
+                .contains("allow_shell")
+        );
+    }
+
+    #[test]
+    fn config_command_cannot_bypass_environment_shell_constraint() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-env-shell-control-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let config_path = temp_root.join(".deepseek").join("config.toml");
+        fs::write(&config_path, "# root\n").unwrap();
+        // Safety: EnvGuard holds the process-wide environment lock and restores
+        // this variable on drop.
+        unsafe { env::set_var("DEEPSEEK_ALLOW_SHELL", "false") };
+        let config = Config::load(Some(config_path.clone()), None).unwrap();
+        let mut app = create_test_app_with_config(&config);
+        app.config_path = Some(config_path);
+        app.set_agent_shell_access(false);
+
+        let result = config_command(&mut app, Some("allow_shell true"));
+
+        assert!(result.is_error, "{:?}", result.message);
+        assert!(!app.allow_shell);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("DEEPSEEK_ALLOW_SHELL"))
+        );
+    }
+
+    #[test]
+    fn config_command_cannot_bypass_project_or_environment_approval() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-external-approval-control-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let root_config = temp_root.join(".deepseek").join("config.toml");
+        fs::write(&root_config, "# root\n").unwrap();
+        let workspace = temp_root.join("workspace");
+        fs::create_dir_all(workspace.join(codewhale_config::CODEWHALE_APP_DIR)).unwrap();
+        fs::write(
+            workspace
+                .join(codewhale_config::CODEWHALE_APP_DIR)
+                .join("config.toml"),
+            "approval_policy = \"never\"\n",
+        )
+        .unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(root_config.clone());
+        app.workspace = workspace;
+        app.set_agent_approval_posture(ApprovalMode::Never);
+
+        let project_result = config_command(&mut app, Some("approval_mode full-access"));
+        assert!(project_result.is_error, "{:?}", project_result.message);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+
+        // Move outside the project and make the environment the controlling
+        // source for the second half of the regression.
+        app.workspace = temp_root.join("clean-workspace");
+        fs::create_dir_all(&app.workspace).unwrap();
+        // Safety: EnvGuard holds the process-wide environment lock and restores
+        // this variable on drop.
+        unsafe { env::set_var("DEEPSEEK_APPROVAL_POLICY", "never") };
+        let env_result = config_command(&mut app, Some("approval_mode auto"));
+        assert!(env_result.is_error, "{:?}", env_result.message);
+        assert_eq!(app.approval_mode, ApprovalMode::Never);
+        assert!(
+            env_result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("DEEPSEEK_APPROVAL_POLICY"))
+        );
+    }
+
+    #[test]
+    fn config_command_shell_choice_survives_plan_round_trip() {
+        let mut app = create_test_app();
+        app.set_agent_approval_posture(ApprovalMode::Bypass);
+
+        let result = config_command(&mut app, Some("allow_shell true"));
+
+        assert!(!result.is_error, "{:?}", result.message);
+        app.set_mode(AppMode::Plan);
+        assert!(!app.allow_shell);
+        app.set_mode(AppMode::Agent);
+        assert!(app.allow_shell);
+        assert_eq!(app.approval_mode, ApprovalMode::Bypass);
     }
 
     #[test]
@@ -3058,6 +3385,10 @@ heartbeat_timeout_secs = 1
             std::process::id()
         ));
         fs::create_dir_all(&temp_root).unwrap();
+        // Hermetic: the audit reads Settings::load(); without this guard the
+        // developer's real saved permission_posture leaks in and the
+        // "(unset)" assertion below becomes machine-dependent.
+        let _guard = EnvGuard::new(&temp_root);
         let config_path = temp_root.join("custom-config.toml");
         fs::write(
             &config_path,
@@ -3398,8 +3729,97 @@ max_concurrent = 4
     }
 
     #[test]
-    fn config_approval_mode_valid_values() {
+    fn unrelated_save_does_not_persist_no_animations_runtime_overlay() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-no-animations-save-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).expect("settings dir");
+        let _guard = EnvGuard::new(&temp_root);
+        fs::write(
+            temp_root.join(".deepseek").join("settings.toml"),
+            "low_motion = false\nfancy_animations = true\ntheme = \"system\"\n",
+        )
+        .expect("seed settings");
+        // Safety: test-only environment mutation is serialized by EnvGuard.
+        unsafe {
+            env::set_var("NO_ANIMATIONS", "1");
+        }
+
         let mut app = create_test_app();
+        assert!(app.low_motion, "runtime overlay should reduce motion");
+        assert!(
+            !app.fancy_animations,
+            "runtime overlay should disable ocean animations"
+        );
+
+        let result = set_config_value(&mut app, "theme", "grayscale", true);
+        assert!(!result.is_error, "{:?}", result.message);
+        let saved = Settings::load_persisted().expect("persisted settings");
+        assert_eq!(saved.theme, "grayscale");
+        assert!(
+            !saved.low_motion,
+            "NO_ANIMATIONS must not become a saved preference"
+        );
+        assert!(
+            saved.fancy_animations,
+            "NO_ANIMATIONS must not overwrite the saved animation preference"
+        );
+        assert!(app.low_motion);
+        assert!(!app.fancy_animations);
+    }
+
+    #[test]
+    fn preset_save_does_not_persist_runtime_environment_overlays() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-preset-env-overlay-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).expect("settings dir");
+        let _guard = EnvGuard::new(&temp_root);
+        fs::write(
+            temp_root.join(".deepseek").join("settings.toml"),
+            "low_motion = false\nfancy_animations = true\nsynchronized_output = \"auto\"\n",
+        )
+        .expect("seed settings");
+        // NO_ANIMATIONS exercises the reported path. Ptyxis supplies an
+        // unrelated effective-only field, making an accidental
+        // apply_env_overrides()+save observable even though the calm preset
+        // intentionally selects reduced motion itself.
+        unsafe {
+            env::set_var("NO_ANIMATIONS", "1");
+            env::set_var("PTYXIS_VERSION", "50.0");
+        }
+
+        let mut app = create_test_app();
+        let result = config_command(&mut app, Some("preset calm --save"));
+        assert!(!result.is_error, "{:?}", result.message);
+
+        let saved = Settings::load_persisted().expect("persisted settings");
+        assert!(saved.low_motion, "calm preset should save reduced motion");
+        assert!(
+            !saved.fancy_animations,
+            "calm preset should save static ocean chrome"
+        );
+        assert_eq!(
+            saved.synchronized_output, "auto",
+            "Ptyxis runtime override must not leak into a preset save"
+        );
+    }
+
+    #[test]
+    fn config_approval_mode_valid_values() {
+        let dir = tempfile::tempdir().expect("isolated config dir");
+        let mut app = create_test_app();
+        app.config_path = Some(dir.path().join("config.toml"));
         // Test auto
         let result = config_command(&mut app, Some("approval_mode auto"));
         assert!(result.message.is_some());
@@ -3437,7 +3857,7 @@ max_concurrent = 4
         assert_eq!(
             msg,
             format!(
-                "approval_mode = SUGGEST (saved to {} as approval_policy = \"on-request\")",
+                "approval_mode = Ask (saved to {} as approval_policy = \"on-request\")",
                 config_path.display()
             )
         );
@@ -3452,15 +3872,55 @@ max_concurrent = 4
         assert!(!restarted.approval_policy_requirements_managed());
         let changed = config_command(&mut restarted, Some("approval_mode auto --save"));
         assert!(!changed.is_error, "{:?}", changed.message);
-        assert!(matches!(changed.action, Some(AppAction::ModeChanged(_))));
+        assert_eq!(
+            changed.action,
+            Some(AppAction::ApprovalPolicyPersisted {
+                policy: Some("auto".to_string())
+            })
+        );
         assert_eq!(restarted.approval_mode, ApprovalMode::Auto);
         let reloaded = Config::load(Some(config_path), None).unwrap();
         assert_eq!(reloaded.approval_policy.as_deref(), Some("auto"));
     }
 
     #[test]
+    fn config_approval_policy_can_return_to_saved_tui_permission_default() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-approval-policy-tui-default-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let config_path = temp_root.join("custom-config.toml");
+        fs::write(&config_path, "# keep\napproval_policy = \"auto\"\n").unwrap();
+        fs::write(
+            temp_root.join(".deepseek").join("settings.toml"),
+            "permission_posture = \"full-access\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load(Some(config_path.clone()), None).unwrap();
+        let mut app = create_test_app_with_config(&loaded);
+        app.config_path = Some(config_path.clone());
+
+        let result = set_config_value(&mut app, "approval_policy", "use-tui-default", true);
+
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+        assert!(!app.approval_policy_locked());
+        assert_eq!(
+            result.action,
+            Some(AppAction::ApprovalPolicyPersisted { policy: None })
+        );
+        let saved = fs::read_to_string(config_path).unwrap();
+        assert!(saved.contains("# keep"));
+        assert!(!saved.contains("approval_policy"));
+    }
+
+    #[test]
     fn config_approval_mode_invalid_value() {
+        let dir = tempfile::tempdir().expect("isolated config dir");
         let mut app = create_test_app();
+        app.config_path = Some(dir.path().join("config.toml"));
         let result = config_command(&mut app, Some("approval_mode invalid"));
         assert!(result.message.is_some());
         let msg = result.message.unwrap();

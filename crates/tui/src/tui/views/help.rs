@@ -245,7 +245,9 @@ fn build_entries(locale: Locale) -> Vec<HelpEntry> {
     }
 
     for binding in KEYBINDINGS {
-        let label = binding.chord.to_string();
+        // macOS renders Alt chords with the Option glyph (`⌥V`), never
+        // `Alt`/`Cmd` (TUI-DOG-002 acceptance).
+        let label = crate::tui::shell_key_routing::display_chord(binding.chord).into_owned();
         let description = format!(
             "[{}] {}",
             binding.section.label(locale),

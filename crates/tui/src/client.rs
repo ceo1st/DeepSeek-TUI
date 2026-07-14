@@ -943,6 +943,12 @@ fn api_provider_skips_models_probe(api_provider: ApiProvider) -> bool {
     matches!(api_provider, ApiProvider::DeepseekAnthropic)
 }
 
+#[must_use]
+#[cfg(test)]
+pub(crate) fn provider_api_key_verification_is_observed(api_provider: ApiProvider) -> bool {
+    !api_provider_skips_models_probe(api_provider)
+}
+
 /// Verify a provider API key by hitting the `/models` endpoint
 /// (#3875). Builds a minimal HTTP client with the canonical auth
 /// headers for `provider`, issues a single GET, and returns
@@ -2948,6 +2954,9 @@ mod tests {
         let client = deepseek_anthropic_client(&server);
 
         assert!(client.health_check().await.expect("health check"));
+        assert!(!provider_api_key_verification_is_observed(
+            ApiProvider::DeepseekAnthropic
+        ));
         let requests = server.received_requests().await.expect("recorded requests");
         assert!(
             requests.is_empty(),

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::config::{ApiProvider, StatusItem, effective_home_dir, expand_path};
+use crate::config::{ApiProvider, StatusItem, expand_path};
 
 /// Parse the TOML document at `path` (an absent or empty file yields an empty
 /// document), apply `mutate`, and atomically persist the result.
@@ -129,11 +129,29 @@ pub(crate) fn unset_document_value(
     let (key, parents) = segments
         .split_last()
         .context("config value path must not be empty")?;
-    let Some(table) = table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Existing)?
-    else {
-        return Ok(false);
+    let orphaned_root_prefix = (parents.is_empty() && doc.as_table().len() == 1)
+        .then(|| leading_prefix_for_key(doc.as_table(), key))
+        .flatten();
+    let removed = {
+        let Some(table) =
+            table_like_at_path_mut(doc.as_table_mut(), parents, PathLookup::Existing)?
+        else {
+            return Ok(false);
+        };
+        remove_key_preserving_leading_decor(table, key)
     };
-    Ok(table.remove(key).is_some())
+    if removed
+        && let Some(prefix) = orphaned_root_prefix
+        && prefix.as_str().is_some_and(|prefix| !prefix.is_empty())
+    {
+        let trailing = format!(
+            "{}{}",
+            prefix.as_str().unwrap_or_default(),
+            doc.trailing().as_str().unwrap_or_default()
+        );
+        doc.set_trailing(trailing);
+    }
+    Ok(removed)
 }
 
 /// Remove every entry named `key` from `table` and, recursively, from nested
@@ -152,7 +170,7 @@ pub(crate) fn remove_document_key_recursive(table: &mut dyn toml_edit::TableLike
     }
 }
 
-fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key: &str) {
+fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key: &str) -> bool {
     let mut found = false;
     let next_key = table.iter().find_map(|(candidate, _)| {
         if found {
@@ -164,22 +182,23 @@ fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key
     });
     let leading_prefix = leading_prefix_for_key(table, key);
     if table.remove(key).is_none() {
-        return;
+        return false;
     }
     let Some(prefix) = leading_prefix else {
-        return;
+        return true;
     };
     let Some(next_key) = next_key else {
-        return;
+        return true;
     };
     if prefix.as_str() == Some("") {
-        return;
+        return true;
     }
     if let Some(mut next_key_decor) = table.key_mut(&next_key)
         && decor_prefix_is_empty(next_key_decor.leaf_decor())
     {
         next_key_decor.leaf_decor_mut().set_prefix(prefix);
     }
+    true
 }
 
 fn decor_prefix_is_empty(decor: &toml_edit::Decor) -> bool {
@@ -264,6 +283,15 @@ pub(crate) fn persist_root_string_key(
 ) -> anyhow::Result<PathBuf> {
     let path = config_toml_path(config_path)?;
     mutate_config_document(&path, |doc| set_document_value(doc, &[key], value))?;
+    Ok(path)
+}
+
+pub(crate) fn persist_unset_root_key(
+    config_path: Option<&Path>,
+    key: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| unset_document_value(doc, &[key]).map(|_| ()))?;
     Ok(path)
 }
 
@@ -504,34 +532,8 @@ pub(crate) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<Pat
     if let Some(path) = config_path {
         return Ok(expand_path(path.to_string_lossy().as_ref()));
     }
-    if let Ok(env) = std::env::var("CODEWHALE_CONFIG_PATH") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    if let Ok(env) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    let codewhale_home = codewhale_config::codewhale_home()
-        .context("failed to resolve CodeWhale home for config.toml path")?;
-    let primary = codewhale_home.join("config.toml");
-    if codewhale_config::codewhale_home_is_explicit() {
-        return Ok(primary);
-    }
-    let home =
-        effective_home_dir().context("failed to resolve home directory for config.toml path")?;
-    if primary.exists() {
-        return Ok(primary);
-    }
-    let legacy = home.join(".deepseek").join("config.toml");
-    if legacy.exists() {
-        return Ok(legacy);
-    }
-    Ok(primary)
+    crate::config::resolve_load_config_path(None)
+        .context("failed to resolve the active config.toml path")
 }
 
 #[cfg(test)]
@@ -744,6 +746,23 @@ mod tests {
         }
 
         assert_eq!(config_toml_path(None).unwrap(), preferred);
+    }
+
+    #[test]
+    fn config_toml_path_uses_existing_home_fallback_when_env_target_is_missing() {
+        let temp_root = temp_root("codewhale-config-path-missing-env-fallback");
+        let home_config = temp_root.join(".codewhale").join("config.toml");
+        fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        fs::write(&home_config, "# existing fallback\n").unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let missing_env = temp_root.join("override").join("missing.toml");
+
+        unsafe {
+            env::set_var("DEEPSEEK_CONFIG_PATH", &missing_env);
+        }
+
+        assert_eq!(config_toml_path(None).unwrap(), home_config);
+        assert!(!missing_env.exists());
     }
 
     #[test]
@@ -1234,6 +1253,19 @@ action = "mode.plan"
         assert!(!unset_document_value(&mut doc, &["model", "nested"]).unwrap());
         assert!(unset_document_value(&mut doc, &["model"]).unwrap());
         assert!(!unset_document_value(&mut doc, &["model"]).unwrap());
+    }
+
+    #[test]
+    fn unset_last_root_value_preserves_its_leading_comment() {
+        let mut doc = "# keep this explanation\napproval_policy = \"on-request\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+
+        assert!(unset_document_value(&mut doc, &["approval_policy"]).unwrap());
+
+        let saved = doc.to_string();
+        assert!(saved.contains("# keep this explanation"), "{saved:?}");
+        assert!(!saved.contains("approval_policy"), "{saved:?}");
     }
 
     #[test]

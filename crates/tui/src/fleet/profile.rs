@@ -30,6 +30,17 @@ pub struct AgentProfile {
     pub origin: ProfileOrigin,
 }
 
+/// The minimum profile information needed to prevent a save from clobbering
+/// another file.  Identity discovery intentionally accepts otherwise legacy
+/// profile keys: an old route-policy field must not block authoring an
+/// unrelated, current profile, but malformed TOML or an invalid id still fails
+/// closed because the collision check cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProfileIdentity {
+    pub id: String,
+    pub source: PathBuf,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentProfileToml {
@@ -73,6 +84,14 @@ struct AgentProfileToml {
 }
 
 #[derive(Debug, Deserialize)]
+struct AgentProfileIdentityToml {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentProfileInstructions {
     #[serde(default)]
@@ -101,8 +120,81 @@ pub fn load_workspace_agent_profiles(workspace: impl AsRef<Path>) -> Result<Vec<
     load_agent_profiles_from_dir(workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR))
 }
 
+/// Load every valid workspace profile while reporting invalid neighbors
+/// individually.  The runtime roster uses this path so one stale profile does
+/// not hide a newly-authored valid profile (or the rest of the party).
+pub fn load_workspace_agent_profiles_tolerant(
+    workspace: impl AsRef<Path>,
+) -> Result<(Vec<AgentProfile>, Vec<String>)> {
+    let dir = workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR);
+    let paths = agent_profile_paths(&dir)?;
+    let mut profiles = Vec::new();
+    let mut issues = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    let mut identified = Vec::new();
+
+    // Resolve identities first so duplicate ids fail closed as a group rather
+    // than allowing whichever filename happens to sort first to win.
+    for path in paths {
+        match load_agent_profile_identity_file(&path) {
+            Ok(identity) => {
+                let canonical_id = identity.id.to_ascii_lowercase();
+                if !seen.insert(canonical_id.clone()) {
+                    duplicates.insert(canonical_id.clone());
+                }
+                identified.push((path, identity, canonical_id));
+            }
+            Err(err) => issues.push(format!("{err:#}")),
+        }
+    }
+
+    for (path, _identity, canonical_id) in identified {
+        if duplicates.contains(&canonical_id) {
+            issues.push(format!(
+                "duplicate agent profile id {} includes {}",
+                canonical_id,
+                path.display()
+            ));
+            continue;
+        }
+        match load_agent_profile_file(&path) {
+            Ok(profile) => profiles.push(profile),
+            Err(err) => issues.push(format!("{err:#}")),
+        }
+    }
+
+    Ok((profiles, issues))
+}
+
+/// Read only the identity-bearing fields from workspace profiles for the
+/// authoring collision gate.  Unknown legacy fields are harmless here because
+/// no profile behavior is loaded or executed from this representation.
+pub fn load_workspace_agent_profile_identities(
+    workspace: impl AsRef<Path>,
+) -> Result<Vec<AgentProfileIdentity>> {
+    let dir = workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR);
+    agent_profile_paths(&dir)?
+        .into_iter()
+        .map(|path| load_agent_profile_identity_file(&path))
+        .collect()
+}
+
 pub fn load_agent_profiles_from_dir(dir: impl AsRef<Path>) -> Result<Vec<AgentProfile>> {
     let dir = dir.as_ref();
+    let mut profiles = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in agent_profile_paths(dir)? {
+        let profile = load_agent_profile_file(&path)?;
+        if !seen.insert(profile.id.to_ascii_lowercase()) {
+            bail!("duplicate agent profile id {}", profile.id);
+        }
+        profiles.push(profile);
+    }
+    Ok(profiles)
+}
+
+fn agent_profile_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -110,26 +202,35 @@ pub fn load_agent_profiles_from_dir(dir: impl AsRef<Path>) -> Result<Vec<AgentPr
         bail!("agent profile path {} is not a directory", dir.display());
     }
 
-    let mut entries = std::fs::read_dir(dir)
+    let mut paths = std::fs::read_dir(dir)
         .with_context(|| format!("reading agent profile dir {}", dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("reading agent profile entries in {}", dir.display()))?;
-    entries.sort_by_key(|entry| entry.path());
+        .with_context(|| format!("reading agent profile entries in {}", dir.display()))?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
 
-    let mut profiles = Vec::new();
-    let mut seen = BTreeSet::new();
-    for entry in entries {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("toml") {
-            continue;
-        }
-        let profile = load_agent_profile_file(&path)?;
-        if !seen.insert(profile.id.clone()) {
-            bail!("duplicate agent profile id {}", profile.id);
-        }
-        profiles.push(profile);
-    }
-    Ok(profiles)
+fn load_agent_profile_identity_file(path: &Path) -> Result<AgentProfileIdentity> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading agent profile identity {}", path.display()))?;
+    let parsed: AgentProfileIdentityToml = toml::from_str(&raw)
+        .map_err(|err| anyhow!("parsing agent profile identity {}: {err}", path.display()))?;
+    let fallback_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("profile");
+    let id = first_present([parsed.id.as_deref(), parsed.name.as_deref()])
+        .unwrap_or(fallback_id)
+        .to_string();
+    validate_agent_profile_token(path, "id/name", &id)?;
+    Ok(AgentProfileIdentity {
+        id,
+        source: path.to_path_buf(),
+    })
 }
 
 fn load_agent_profile_file(path: &Path) -> Result<AgentProfile> {
@@ -927,6 +1028,176 @@ model = "deepseek-v4-flash"
         let profiles = load_workspace_agent_profiles(tmp.path()).unwrap();
 
         assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn profile_identity_loader_accepts_legacy_route_policy_fields() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join(WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let source = write_profile(
+            &agents_dir,
+            "reviewer.toml",
+            r#"
+id = "reviewer"
+role_hint = "reviewer"
+model_class_hint = "heavy"
+models = ["glm-5.2", "deepseek-v4-pro"]
+"#,
+        );
+
+        let identities = load_workspace_agent_profile_identities(tmp.path())
+            .expect("legacy fields do not obscure identity");
+
+        assert_eq!(
+            identities,
+            vec![AgentProfileIdentity {
+                id: "reviewer".to_string(),
+                source,
+            }]
+        );
+    }
+
+    #[test]
+    fn profile_identity_loader_fails_closed_for_malformed_toml() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join(WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_profile(&agents_dir, "broken.toml", "id = [\n");
+
+        let err = load_workspace_agent_profile_identities(tmp.path())
+            .expect_err("malformed TOML cannot prove collision safety")
+            .to_string();
+
+        assert!(err.contains("broken.toml"), "unexpected error: {err}");
+        assert!(err.contains("profile identity"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tolerant_loader_keeps_valid_profile_beside_legacy_profile() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join(WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_profile(
+            &agents_dir,
+            "reviewer.toml",
+            "id = \"reviewer\"\nmodel_class_hint = \"heavy\"\n",
+        );
+        write_profile(
+            &agents_dir,
+            "scout.toml",
+            "id = \"scout\"\nrole_hint = \"scout\"\nprovider = \"deepseek\"\nmodel = \"deepseek-v4-flash\"\n",
+        );
+
+        let (profiles, issues) = load_workspace_agent_profiles_tolerant(tmp.path())
+            .expect("directory discovery succeeds");
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "scout");
+        assert_eq!(
+            profiles[0].profile.model.as_deref(),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("reviewer.toml"), "{issues:?}");
+        assert!(issues[0].contains("model_class_hint"), "{issues:?}");
+    }
+
+    #[test]
+    fn tolerant_loader_skips_every_duplicate_id_but_keeps_unique_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join(WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_profile(&agents_dir, "a.toml", "id = \"reviewer\"\n");
+        write_profile(&agents_dir, "b.toml", "name = \"reviewer\"\n");
+        write_profile(&agents_dir, "scout.toml", "id = \"scout\"\n");
+
+        let (profiles, issues) = load_workspace_agent_profiles_tolerant(tmp.path())
+            .expect("directory discovery succeeds");
+
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scout"]
+        );
+        assert_eq!(issues.len(), 2);
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.contains("duplicate agent profile id reviewer")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn profile_identity_loader_fails_closed_for_invalid_id_token() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join(WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_profile(&agents_dir, "broken.toml", "id = \"bad id\"\n");
+
+        let err = load_workspace_agent_profile_identities(tmp.path())
+            .expect_err("invalid identity tokens cannot prove collision safety")
+            .to_string();
+
+        assert!(err.contains("broken.toml"), "unexpected error: {err}");
+        assert!(err.contains("simple token"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn scout_save_succeeds_beside_untouched_legacy_reviewer() {
+        let tmp = TempDir::new().unwrap();
+        let agents_dir = tmp.path().join(WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let legacy = r#"
+id = "reviewer"
+role_hint = "reviewer"
+model_class_hint = "heavy"
+models = ["glm-5.2", "deepseek-v4-pro"]
+"#;
+        let reviewer_path = write_profile(&agents_dir, "reviewer.toml", legacy);
+        let before = std::fs::read_to_string(&reviewer_path).unwrap();
+
+        let identities = load_workspace_agent_profile_identities(tmp.path())
+            .expect("legacy neighbor must not block identity discovery");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].id, "reviewer");
+        assert!(
+            identities
+                .iter()
+                .all(|identity| !identity.id.eq_ignore_ascii_case("scout")),
+            "scout id must be free beside legacy reviewer"
+        );
+
+        let draft = FleetProfileDraft {
+            id: "scout".to_string(),
+            display_name: Some("Scout".to_string()),
+            description: Some("Workspace scout.".to_string()),
+            role_hint: "scout".to_string(),
+            model_class_hint: None,
+            model: Some("deepseek-v4-flash".to_string()),
+            provider: Some("deepseek".to_string()),
+            reasoning_effort: None,
+            instructions: None,
+        };
+        let scout_path = write_profile(&agents_dir, &draft.file_name(), &draft.render_toml());
+
+        let after = std::fs::read_to_string(&reviewer_path).unwrap();
+        assert_eq!(before, after, "legacy reviewer must remain unmodified");
+        assert!(scout_path.exists());
+
+        let (profiles, issues) = load_workspace_agent_profiles_tolerant(tmp.path())
+            .expect("directory discovery succeeds");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "scout");
+        assert_eq!(
+            profiles[0].profile.model.as_deref(),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("reviewer.toml"), "{issues:?}");
     }
 
     #[test]

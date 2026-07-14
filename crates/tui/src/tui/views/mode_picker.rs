@@ -1,6 +1,8 @@
-//! `/mode` picker for Act / Plan / Operate.
+//! `/mode` picker for the currently supported interactive modes.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -18,23 +20,34 @@ use crate::tui::views::{
     render_modal_footer, render_modal_surface,
 };
 
+// Operate remains parseable for restored sessions and explicit compatibility
+// inputs, but it is not a truthful interactive choice until Workflow dispatch
+// exists. Keep the visible roster local to this picker so compatibility does
+// not become a customer-visible affordance.
+const VISIBLE_MODES: [AppMode; 2] = [AppMode::Agent, AppMode::Plan];
+
 pub struct ModePickerView {
     cursor: usize,
     locale: Locale,
+    row_hitboxes: RefCell<Vec<Rect>>,
 }
 
 impl ModePickerView {
     #[must_use]
     pub fn new(current: AppMode, locale: Locale) -> Self {
-        let cursor = AppMode::CHOICES
+        let cursor = VISIBLE_MODES
             .iter()
             .position(|mode| *mode == current)
             .unwrap_or(0);
-        Self { cursor, locale }
+        Self {
+            cursor,
+            locale,
+            row_hitboxes: RefCell::new(Vec::new()),
+        }
     }
 
     fn selected_mode(&self) -> AppMode {
-        AppMode::CHOICES
+        VISIBLE_MODES
             .get(self.cursor)
             .copied()
             .unwrap_or(AppMode::Agent)
@@ -47,14 +60,14 @@ impl ModePickerView {
     }
 
     fn move_down(&mut self) {
-        let max = AppMode::CHOICES.len().saturating_sub(1);
+        let max = VISIBLE_MODES.len().saturating_sub(1);
         if self.cursor < max {
             self.cursor += 1;
         }
     }
 
     fn select_by_number(&mut self, number: char) -> Option<ViewAction> {
-        let idx = AppMode::CHOICES
+        let idx = VISIBLE_MODES
             .iter()
             .position(|mode| mode.number() == number)?;
         self.cursor = idx;
@@ -92,8 +105,32 @@ impl ModalView for ModePickerView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_up();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_down();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    self.cursor = index;
+                    return self.handle_key(KeyEvent::new(KeyCode::Enter, mouse.modifiers));
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let popup_height = u16::try_from(AppMode::CHOICES.len()).unwrap_or(3) + 7;
+        let popup_height = u16::try_from(VISIBLE_MODES.len()).unwrap_or(2) + 7;
         let popup_area = centered_modal_area(area, 68, popup_height, 44, 8);
 
         render_modal_surface(area, popup_area, buf);
@@ -123,9 +160,11 @@ impl ModalView for ModePickerView {
             ],
         );
 
-        let mut lines = Vec::with_capacity(AppMode::CHOICES.len());
+        self.row_hitboxes.borrow_mut().clear();
 
-        for (idx, mode) in AppMode::CHOICES.iter().copied().enumerate() {
+        let mut lines = Vec::with_capacity(VISIBLE_MODES.len());
+
+        for (idx, mode) in VISIBLE_MODES.iter().copied().enumerate() {
             let is_cursor = idx == self.cursor;
             let row_style = if is_cursor {
                 Style::default()
@@ -144,17 +183,26 @@ impl ModalView for ModePickerView {
             };
             let pointer = if is_cursor { ">" } else { " " };
             let name = mode.display_name_localized(self.locale);
+            let hint = mode.picker_hint_localized(self.locale);
             // Pad by terminal columns, not scalar count, so wide (CJK) mode
             // names keep the hint column aligned.
-            let pad = " ".repeat(7usize.saturating_sub(UnicodeWidthStr::width(&*name)));
+            let pad = " ".repeat(8usize.saturating_sub(UnicodeWidthStr::width(&*name)));
 
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{pointer} {}. {name}{pad}", mode.number()),
                     row_style,
                 ),
-                Span::styled(mode.picker_hint_localized(self.locale), hint_style),
+                Span::styled(hint, hint_style),
             ]));
+            self.row_hitboxes.borrow_mut().push(Rect::new(
+                content.x,
+                content
+                    .y
+                    .saturating_add(u16::try_from(idx).unwrap_or(u16::MAX)),
+                content.width,
+                1,
+            ));
         }
 
         Paragraph::new(lines).render(content, buf);
@@ -165,6 +213,7 @@ impl ModalView for ModePickerView {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn opens_on_current_mode() {
@@ -253,28 +302,18 @@ mod tests {
     }
 
     #[test]
-    fn operate_copy_explains_the_user_benefit_at_eighty_columns() {
+    fn operate_is_not_advertised_until_workflow_dispatch_exists() {
         let (buf, area) = render_at(80, 24);
         let text = rows(&buf, area).join("\n");
-        assert!(
-            text.contains("Coordinate a Fleet for multi-step work."),
-            "{text}"
-        );
-        assert!(!text.contains("spawn, wait, verify"), "{text}");
-        assert!(!text.contains("subagents/workflows"), "{text}");
+        assert!(!text.contains("Operate"), "{text}");
     }
 
     #[test]
     fn number_keys_select_modes() {
-        // Visible roster: 1 Act, 2 Plan, 3 Operate. No Multitask / YOLO / gap.
+        // Visible roster: 1 Act, 2 Plan. Operate remains compatibility-only.
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
-        match action {
-            ViewAction::EmitAndClose(ViewEvent::ModeSelected { mode }) => {
-                assert_eq!(mode, AppMode::Operate);
-            }
-            other => panic!("expected ModeSelected, got {other:?}"),
-        }
+        assert!(matches!(action, ViewAction::None));
 
         // Legacy YOLO shorthand (4) is not offered by the picker.
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
@@ -285,5 +324,27 @@ mod tests {
         let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
         assert!(matches!(action, ViewAction::None));
+    }
+
+    #[test]
+    fn mouse_click_renders_and_selects_mode_row() {
+        let mut view = ModePickerView::new(AppMode::Agent, Locale::En);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+            .expect("render mode picker");
+        let rect = view.row_hitboxes.borrow()[1];
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ModeSelected {
+                mode: AppMode::Plan
+            })
+        ));
     }
 }
