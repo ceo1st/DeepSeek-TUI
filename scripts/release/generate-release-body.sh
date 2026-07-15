@@ -52,7 +52,7 @@ The wrapper downloads the matched runtime binaries from this Release and places 
 \`\`\`bash
 docker run --rm -it \\
   -e DEEPSEEK_API_KEY="\$DEEPSEEK_API_KEY" \\
-  -v ~/.deepseek:/home/codewhale/.deepseek \\
+  -v codewhale-home:/home/codewhale/.codewhale \\
   ghcr.io/hmbown/codewhale:${tag}
 \`\`\`
 
@@ -74,6 +74,7 @@ Each archive below contains the \`codewhale\` dispatcher, \`codew\` shim, and \`
 |---|---|---|
 | Linux x64 | \`codewhale-linux-x64.tar.gz\` | \`install.sh\` |
 | Linux ARM64 | \`codewhale-linux-arm64.tar.gz\` | \`install.sh\` |
+| Android ARM64 (Termux) | \`codewhale-android-arm64.tar.gz\` | \`install.sh\` |
 | macOS x64 | \`codewhale-macos-x64.tar.gz\` | \`install.sh\` |
 | macOS ARM | \`codewhale-macos-arm64.tar.gz\` | \`install.sh\` |
 | Windows x64 (installer) | \`CodeWhaleSetup.exe\` | NSIS setup |

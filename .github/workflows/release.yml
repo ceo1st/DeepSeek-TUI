@@ -550,10 +550,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Smoke published container entrypoints
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}:${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE}"
+          docker run --rm --entrypoint codewhale "${IMAGE}" --version
+          docker run --rm --entrypoint codew "${IMAGE}" --version
+          docker run --rm --entrypoint codewhale-tui "${IMAGE}" --version
 
   release:
     needs: [build, bundle, windows-installer, docker, resolve]
-    if: ${{ !cancelled() && needs.build.result == 'success' && needs.bundle.result == 'success' && needs.windows-installer.result == 'success' }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.bundle.result == 'success' && needs.windows-installer.result == 'success' && needs.docker.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
