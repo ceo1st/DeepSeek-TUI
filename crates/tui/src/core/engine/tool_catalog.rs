@@ -57,6 +57,7 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     "grep_files",
     "list_dir",
     "read_file",
+    "remember",
     "run_tests",
     "run_verifiers",
     "task_create",
@@ -1036,4 +1037,61 @@ pub(super) async fn execute_code_execution_tool(
         success,
         metadata: Some(payload),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRE_REMEMBER_DEFAULT_ACTIVE_TOOL_COUNT: usize = 27;
+
+    fn api_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: format!("{name} description"),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            allowed_callers: None,
+            defer_loading: None,
+            input_examples: None,
+            strict: None,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn remember_stays_active_in_the_native_tool_catalog() {
+        let default_active_tools = DEFAULT_ACTIVE_NATIVE_TOOLS
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            DEFAULT_ACTIVE_NATIVE_TOOLS.len(),
+            PRE_REMEMBER_DEFAULT_ACTIVE_TOOL_COUNT + 1
+        );
+        assert_eq!(
+            default_active_tools.len(),
+            DEFAULT_ACTIVE_NATIVE_TOOLS.len(),
+            "default-active tool names should be unique"
+        );
+        assert!(DEFAULT_ACTIVE_NATIVE_TOOLS.contains(&"remember"));
+        assert!(default_active_tools.contains("remember"));
+
+        let always_load = HashSet::new();
+        assert!(!should_default_defer_tool("remember", &always_load));
+        assert!(should_default_defer_tool("project_map", &always_load));
+
+        let mut catalog = vec![api_tool("remember"), api_tool("project_map")];
+        apply_native_tool_deferral(&mut catalog, &always_load);
+        assert_eq!(catalog[0].defer_loading, Some(false));
+        assert_eq!(catalog[1].defer_loading, Some(true));
+
+        let mut catalog_without_remember = vec![api_tool("project_map")];
+        apply_native_tool_deferral(&mut catalog_without_remember, &always_load);
+        assert_eq!(catalog_without_remember[0].defer_loading, Some(true));
+    }
 }
