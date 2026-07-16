@@ -27,7 +27,12 @@ export function DocsSidebar({ locale }: { locale: string }) {
   return (
     <aside className="docs-sidebar min-w-0">
       <div className="lg:sticky lg:top-24">
-        <div className="docs-sidebar-heading">{isZh ? "文档目录" : "Documentation"}</div>
+        <div className="docs-sidebar-heading">
+          <Link href={`/${locale}/docs`}>
+            <span>{isZh ? "文档目录" : "Documentation"}</span>
+            <span aria-hidden="true">→</span>
+          </Link>
+        </div>
         <nav aria-label={isZh ? "文档目录" : "Documentation index"}>
           {[...byCategory.entries()].map(([category, topics]) => (
             <div key={category} className="docs-sidebar-group">

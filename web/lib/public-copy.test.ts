@@ -26,11 +26,15 @@ describe("public website copy contracts", () => {
 
   it("does not rule out the managed app or make it a requirement for local use", () => {
     const roadmap = pageSource("roadmap/page.tsx");
+    const footer = readFileSync(new URL("../components/footer.tsx", import.meta.url), "utf8");
 
     expect(roadmap).toContain("Managed app preview and optional accounts");
     expect(roadmap).toContain("Required account for the local runtime");
     expect(roadmap).not.toContain("Hosted SaaS dashboard");
     expect(roadmap).not.toContain("Required login / accounts");
+    expect(footer).toContain("App preview");
+    expect(footer).toContain("https://app.codewhale.net");
+    expect(footer).not.toMatch(/Create account|Sign up/);
   });
 
   it("describes ACP and the VS Code extension at their implemented capability level", () => {
@@ -87,6 +91,9 @@ describe("public website copy contracts", () => {
     expect(community).toContain("Hmbown/CodeWhale/pulls");
     expect(community).toContain("keeps the weekly archive of repository activity");
     expect(community).not.toContain("latest one sits near the top");
+    expect(community).not.toContain("<Ticker");
+    expect(community).not.toContain("<StatGrid");
+    expect(community).not.toContain("Today's dispatch");
   });
 
   it("keeps current-release website credits in exact changelog parity", () => {
