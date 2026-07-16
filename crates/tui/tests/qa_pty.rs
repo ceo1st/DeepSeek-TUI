@@ -502,7 +502,8 @@ fn work_surface_real_rows_own_click_wheel_resize_and_stop_confirm() -> anyhow::R
 
     // A live bang shell projects a real stoppable run row. Arm and accept the
     // rendered row-local Stop control using its actual post-resize coordinates.
-    h.send(keys::key::text("! echo CWQA_STOP_ROW; sleep 30"))?;
+    h.paste("! echo CWQA_STOP_ROW; sleep 30")?;
+    h.wait_for_text("CWQA_STOP_ROW", KEY_TIMEOUT)?;
     h.wait_for_idle(Duration::from_millis(100), Duration::from_secs(2))?;
     h.send(keys::key::enter())?;
     h.wait_for_text("run running", KEY_TIMEOUT)?;
@@ -569,9 +570,12 @@ fn approval_modal_keeps_wheel_for_review_and_denies_without_side_effect() -> any
         .spawn()?;
     enter_launch_session(&mut h)?;
 
-    h.send(keys::key::text(
-        "Request the fixture write_file call; do not change its arguments.",
-    ))?;
+    let prompt = "Request the fixture write_file call; do not change its arguments.";
+    // This is a whole prompt, not simulated human typing. Send it as the
+    // bracketed paste a real terminal would emit so the raw-key paste-burst
+    // heuristic cannot absorb the following Enter as a pasted newline.
+    h.paste(prompt)?;
+    h.wait_for_text(prompt, KEY_TIMEOUT)?;
     h.wait_for_idle(Duration::from_millis(100), Duration::from_secs(2))?;
     h.send(keys::key::enter())?;
     h.wait_for_text("Approve once", Duration::from_secs(10))?;
