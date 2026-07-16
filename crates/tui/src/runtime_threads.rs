@@ -198,7 +198,7 @@ pub enum TurnItemLifecycleStatus {
     Canceled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadRecord {
     #[serde(default = "default_runtime_schema_version")]
     pub schema_version: u32,
@@ -240,6 +240,25 @@ pub struct ThreadRecord {
     /// session file instead of reconstructing from turns (which loses process info).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+}
+
+fn thread_execution_state_matches(left: &ThreadRecord, right: &ThreadRecord) -> bool {
+    left.schema_version == right.schema_version
+        && left.id == right.id
+        && left.model == right.model
+        && left.model_provider == right.model_provider
+        && left.model_provider_id == right.model_provider_id
+        && left.workspace == right.workspace
+        && left.mode == right.mode
+        && left.allow_shell == right.allow_shell
+        && left.trust_mode == right.trust_mode
+        && left.auto_approve == right.auto_approve
+        && left.latest_turn_id == right.latest_turn_id
+        && left.latest_response_bookmark == right.latest_response_bookmark
+        && left.archived == right.archived
+        && left.system_prompt == right.system_prompt
+        && left.task_id == right.task_id
+        && left.session_id == right.session_id
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +373,13 @@ pub struct RuntimeThreadStore {
     events_dir: PathBuf,
     state_path: PathBuf,
     state: Arc<Mutex<RuntimeStoreState>>,
+    /// Serializes load-modify-save operations on thread records. The guard is
+    /// synchronous and must never cross an `.await`; JSON records are small,
+    /// and one global guard avoids per-thread lock lifecycle races.
+    thread_mutation: Arc<parking_lot::Mutex<()>>,
+    /// Serializes load-modify-save operations on turn records. Like the
+    /// thread guard, it is synchronous and never crosses an `.await`.
+    turn_mutation: Arc<parking_lot::Mutex<()>>,
 }
 
 impl RuntimeThreadStore {
@@ -387,6 +413,8 @@ impl RuntimeThreadStore {
             events_dir,
             state_path,
             state: Arc::new(Mutex::new(state)),
+            thread_mutation: Arc::new(parking_lot::Mutex::new(())),
+            turn_mutation: Arc::new(parking_lot::Mutex::new(())),
         })
     }
 
@@ -427,6 +455,10 @@ impl RuntimeThreadStore {
 
     fn remove_turn(&self, turn_id: &str) -> Result<()> {
         remove_file_if_exists(&self.turn_path(turn_id)?)
+    }
+
+    fn remove_thread(&self, thread_id: &str) -> Result<()> {
+        remove_file_if_exists(&self.thread_path(thread_id)?)
     }
 
     fn remove_item(&self, item_id: &str) -> Result<()> {
@@ -646,7 +678,6 @@ impl RuntimeThreadStore {
         let seq = state.next_seq;
         state.next_seq = state.next_seq.saturating_add(1);
         write_json_atomic(&self.state_path, &*state)?;
-        drop(state);
 
         let record = RuntimeEventRecord {
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -670,6 +701,9 @@ impl RuntimeThreadStore {
             .with_context(|| format!("Failed to flush {}", path.display()))?;
         file.sync_all()
             .with_context(|| format!("Failed to fsync {}", path.display()))?;
+        // Keep the global sequence lock through the append so no later event
+        // can reach disk or broadcast before this sequence number.
+        drop(state);
         Ok(record)
     }
 
@@ -922,6 +956,21 @@ struct ActiveTurnState {
     trust_mode: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ClaimedTurnKind {
+    Message,
+    Compaction,
+}
+
+impl ClaimedTurnKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Message => "turn",
+            Self::Compaction => "compaction turn",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ActiveThreadState {
     engine: EngineHandle,
@@ -945,22 +994,32 @@ pub type SharedRuntimeThreadManager = Arc<RuntimeThreadManager>;
 ///
 /// # Lock ordering invariant
 ///
-/// Two `Mutex`es exist across this module:
+/// Runtime state uses six locks:
+/// - `RuntimeThreadManager::engine_load` — serializes cache-miss engine builds.
+///   It may cross awaits and is always acquired before `active`.
+/// - `RuntimeThreadManager::event_emit` — preserves append-to-broadcast event
+///   order and is only acquired after all record/engine guards are released.
 /// - `RuntimeThreadStore::state` — protects the monotonic event sequence counter.
+/// - `RuntimeThreadStore::thread_mutation` — synchronizes short, synchronous
+///   thread-record load-modify-save transactions and never crosses `.await`.
+/// - `RuntimeThreadStore::turn_mutation` — does the same for turn records.
 /// - `RuntimeThreadManager::active` — protects the set of loaded engine handles.
 ///
-/// **No code path holds both locks simultaneously.** The `state` lock is only
-/// acquired inside `RuntimeThreadStore::append_event` (where it is explicitly
-/// dropped before any I/O) and `current_seq`. All `emit_event` calls (which
-/// call `append_event`) happen *after* `active` has been released. If you add
-/// new code that touches both, always acquire `state` before `active` to
-/// preserve a consistent ordering.
+/// `state` is never held with `active`, either record-mutation guard, or
+/// `engine_load`. Event publication intentionally acquires `event_emit` before
+/// `state`; both guards are released before `emit_event` returns. All
+/// `emit_event` calls happen after `active`, `thread_mutation`, and
+/// `turn_mutation` have been released. When record and engine state must change
+/// atomically, acquire `active` before the applicable record-mutation guard and
+/// release both before awaiting.
 #[derive(Clone)]
 pub struct RuntimeThreadManager {
     config: Arc<parking_lot::RwLock<Config>>,
     workspace: PathBuf,
     store: RuntimeThreadStore,
+    engine_load: Arc<Mutex<()>>,
     active: Arc<Mutex<ActiveThreads>>,
+    event_emit: Arc<Mutex<()>>,
     event_tx: broadcast::Sender<RuntimeEventRecord>,
     manager_cfg: RuntimeThreadManagerConfig,
     cancel_token: CancellationToken,
@@ -1091,6 +1150,7 @@ impl RuntimeThreadManager {
     /// every loaded thread's exact route. Active turns retain their immutable
     /// descriptor; the next `start_turn` resolves and installs the new route.
     pub async fn reload_config(&self, new_config: Config) -> Result<()> {
+        let _engine_load = self.engine_load.lock().await;
         let entries: Vec<(String, EngineHandle, ProviderIdentity, String)> = {
             let active = self.active.lock().await;
             active
@@ -1187,7 +1247,9 @@ impl RuntimeThreadManager {
             config: Arc::new(parking_lot::RwLock::new(config)),
             workspace,
             store,
+            engine_load: Arc::new(Mutex::new(())),
             active: Arc::new(Mutex::new(ActiveThreads::default())),
+            event_emit: Arc::new(Mutex::new(())),
             event_tx,
             manager_cfg,
             cancel_token: CancellationToken::new(),
@@ -1331,20 +1393,23 @@ impl RuntimeThreadManager {
     }
 
     async fn remember_thread_auto_approve(&self, thread_id: &str) {
-        let Ok(mut thread) = self.store.load_thread(thread_id) else {
-            return;
-        };
-        if thread.auto_approve {
-            return;
-        }
-        thread.auto_approve = true;
-        thread.updated_at = Utc::now();
-        if let Err(err) = self.store.save_thread(&thread) {
-            tracing::warn!(
-                "Failed to persist auto_approve flip for thread {}: {}",
-                thread_id,
-                err
-            );
+        {
+            let _thread_mutation = self.store.thread_mutation.lock();
+            let Ok(mut thread) = self.store.load_thread(thread_id) else {
+                return;
+            };
+            if thread.auto_approve {
+                return;
+            }
+            thread.auto_approve = true;
+            thread.updated_at = Utc::now();
+            if let Err(err) = self.store.save_thread(&thread) {
+                tracing::warn!(
+                    "Failed to persist auto_approve flip for thread {}: {}",
+                    thread_id,
+                    err
+                );
+            }
         }
 
         {
@@ -1370,6 +1435,7 @@ impl RuntimeThreadManager {
         event: impl Into<String>,
         payload: Value,
     ) -> Result<RuntimeEventRecord> {
+        let _emit_order = self.event_emit.lock().await;
         let record = self
             .store
             .append_event(thread_id, turn_id, item_id, event, payload)
@@ -1622,86 +1688,115 @@ impl RuntimeThreadManager {
             bail!("workspace must not be empty");
         }
 
-        let mut thread = self.get_thread(id).await?;
-        let mut changes = serde_json::Map::new();
+        let (thread, changes, evicted_engine) = {
+            // Take the active guard first so a workspace mutation can check
+            // and evict the cached engine atomically with the durable update.
+            // Using the same order as start/compact avoids lock inversion.
+            let mut active = self.active.lock().await;
+            let _thread_mutation = self.store.thread_mutation.lock();
+            let mut thread = self
+                .store
+                .load_thread(id)
+                .with_context(|| format!("Thread not found: {id}"))?;
+            let mut changes = serde_json::Map::new();
 
-        if let Some(archived) = req.archived
-            && thread.archived != archived
-        {
-            thread.archived = archived;
-            changes.insert("archived".to_string(), json!(archived));
-        }
-        if let Some(allow_shell) = req.allow_shell
-            && thread.allow_shell != allow_shell
-        {
-            thread.allow_shell = allow_shell;
-            changes.insert("allow_shell".to_string(), json!(allow_shell));
-        }
-        if let Some(trust_mode) = req.trust_mode
-            && thread.trust_mode != trust_mode
-        {
-            thread.trust_mode = trust_mode;
-            changes.insert("trust_mode".to_string(), json!(trust_mode));
-        }
-        if let Some(auto_approve) = req.auto_approve
-            && thread.auto_approve != auto_approve
-        {
-            thread.auto_approve = auto_approve;
-            changes.insert("auto_approve".to_string(), json!(auto_approve));
-        }
-        if let Some(model) = req.model
-            && thread.model != model
-        {
-            thread.model = model.clone();
-            changes.insert("model".to_string(), json!(model));
-        }
-        if let Some(mode) = req.mode
-            && thread.mode != mode
-        {
-            thread.mode = mode.clone();
-            changes.insert("mode".to_string(), json!(mode));
-        }
-        if let Some(title) = req.title {
-            // Empty string clears a previously-set title and reverts to derived.
-            let new_title = if title.trim().is_empty() {
+            if let Some(archived) = req.archived
+                && thread.archived != archived
+            {
+                thread.archived = archived;
+                changes.insert("archived".to_string(), json!(archived));
+            }
+            if let Some(allow_shell) = req.allow_shell
+                && thread.allow_shell != allow_shell
+            {
+                thread.allow_shell = allow_shell;
+                changes.insert("allow_shell".to_string(), json!(allow_shell));
+            }
+            if let Some(trust_mode) = req.trust_mode
+                && thread.trust_mode != trust_mode
+            {
+                thread.trust_mode = trust_mode;
+                changes.insert("trust_mode".to_string(), json!(trust_mode));
+            }
+            if let Some(auto_approve) = req.auto_approve
+                && thread.auto_approve != auto_approve
+            {
+                thread.auto_approve = auto_approve;
+                changes.insert("auto_approve".to_string(), json!(auto_approve));
+            }
+            if let Some(model) = req.model
+                && thread.model != model
+            {
+                thread.model = model.clone();
+                changes.insert("model".to_string(), json!(model));
+            }
+            if let Some(mode) = req.mode
+                && thread.mode != mode
+            {
+                thread.mode = mode.clone();
+                changes.insert("mode".to_string(), json!(mode));
+            }
+            if let Some(title) = req.title {
+                // Empty string clears a previously-set title and reverts to derived.
+                let new_title = if title.trim().is_empty() {
+                    None
+                } else {
+                    Some(title)
+                };
+                if thread.title != new_title {
+                    thread.title = new_title.clone();
+                    changes.insert("title".to_string(), json!(new_title));
+                }
+            }
+            if let Some(system_prompt) = req.system_prompt {
+                let new_sys = if system_prompt.trim().is_empty() {
+                    None
+                } else {
+                    Some(system_prompt)
+                };
+                if thread.system_prompt != new_sys {
+                    thread.system_prompt = new_sys.clone();
+                    changes.insert("system_prompt".to_string(), json!(new_sys));
+                }
+            }
+            if let Some(workspace) = req.workspace
+                && thread.workspace != workspace
+            {
+                changes.insert("workspace".to_string(), json!(workspace));
+                thread.workspace = workspace;
+            }
+
+            let workspace_changed = changes.contains_key("workspace");
+            if workspace_changed
+                && active
+                    .engines
+                    .get(id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .is_some()
+            {
+                bail!("workspace cannot be changed while the thread has an active turn");
+            }
+
+            let evicted_engine = if changes.is_empty() {
                 None
             } else {
-                Some(title)
+                thread.updated_at = Utc::now();
+                self.store.save_thread(&thread)?;
+                if workspace_changed {
+                    active.lru.retain(|thread_id| thread_id != id);
+                    active.engines.remove(id).map(|state| state.engine)
+                } else {
+                    None
+                }
             };
-            if thread.title != new_title {
-                thread.title = new_title.clone();
-                changes.insert("title".to_string(), json!(new_title));
-            }
-        }
-        if let Some(system_prompt) = req.system_prompt {
-            let new_sys = if system_prompt.trim().is_empty() {
-                None
-            } else {
-                Some(system_prompt)
-            };
-            if thread.system_prompt != new_sys {
-                thread.system_prompt = new_sys.clone();
-                changes.insert("system_prompt".to_string(), json!(new_sys));
-            }
-        }
-        if let Some(workspace) = req.workspace
-            && thread.workspace != workspace
-        {
-            changes.insert("workspace".to_string(), json!(workspace));
-            thread.workspace = workspace;
+            (thread, changes, evicted_engine)
+        };
+
+        if let Some(engine) = evicted_engine {
+            let _ = engine.send(Op::Shutdown).await;
         }
 
         if !changes.is_empty() {
-            let workspace_changed = changes.contains_key("workspace");
-            if workspace_changed {
-                self.ensure_thread_has_no_active_turn(&thread.id).await?;
-            }
-
-            thread.updated_at = Utc::now();
-            self.store.save_thread(&thread)?;
-            if workspace_changed {
-                self.evict_cached_engine(&thread.id).await;
-            }
             self.emit_event(
                 &thread.id,
                 None,
@@ -1722,13 +1817,20 @@ impl RuntimeThreadManager {
     /// the full message history (including thinking/tool blocks) from the
     /// session file instead of reconstructing from turns.
     pub async fn set_thread_session_id(&self, thread_id: &str, session_id: &str) -> Result<()> {
-        let mut thread = self.get_thread(thread_id).await?;
-        if thread.session_id.as_deref() == Some(session_id) {
-            return Ok(());
-        }
-        thread.session_id = Some(session_id.to_string());
-        thread.updated_at = Utc::now();
-        self.store.save_thread(&thread)?;
+        let thread = {
+            let _thread_mutation = self.store.thread_mutation.lock();
+            let mut thread = self
+                .store
+                .load_thread(thread_id)
+                .with_context(|| format!("Thread not found: {thread_id}"))?;
+            if thread.session_id.as_deref() == Some(session_id) {
+                return Ok(());
+            }
+            thread.session_id = Some(session_id.to_string());
+            thread.updated_at = Utc::now();
+            self.store.save_thread(&thread)?;
+            thread
+        };
         self.emit_event(
             thread_id,
             None,
@@ -1738,30 +1840,6 @@ impl RuntimeThreadManager {
         )
         .await?;
         Ok(())
-    }
-
-    async fn ensure_thread_has_no_active_turn(&self, thread_id: &str) -> Result<()> {
-        let active = self.active.lock().await;
-        if active
-            .engines
-            .get(thread_id)
-            .and_then(|state| state.active_turn.as_ref())
-            .is_some()
-        {
-            bail!("workspace cannot be changed while the thread has an active turn");
-        }
-        Ok(())
-    }
-
-    async fn evict_cached_engine(&self, thread_id: &str) {
-        let engine = {
-            let mut active = self.active.lock().await;
-            active.lru.retain(|id| id != thread_id);
-            active.engines.remove(thread_id).map(|state| state.engine)
-        };
-        if let Some(engine) = engine {
-            let _ = engine.send(Op::Shutdown).await;
-        }
     }
 
     pub async fn get_thread_detail(&self, id: &str) -> Result<ThreadDetail> {
@@ -1816,29 +1894,29 @@ impl RuntimeThreadManager {
         forked.updated_at = now;
         forked.latest_turn_id = None;
         forked.archived = false;
-        self.store.save_thread(&forked)?;
 
         let source_turns = self.store.list_turns_for_thread(&source.id)?;
+        let mut cloned_records = Vec::with_capacity(source_turns.len());
         for source_turn in source_turns {
             let mut cloned_turn = source_turn.clone();
             cloned_turn.id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
             cloned_turn.thread_id = forked.id.clone();
             cloned_turn.item_ids.clear();
-            self.store.save_turn(&cloned_turn)?;
 
             let items = self.store.list_items_for_turn(&source_turn.id)?;
+            let mut cloned_items = Vec::with_capacity(items.len());
             for item in items {
                 let mut cloned_item = item.clone();
                 cloned_item.id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
                 cloned_item.turn_id = cloned_turn.id.clone();
-                self.store.save_item(&cloned_item)?;
                 cloned_turn.item_ids.push(cloned_item.id.clone());
+                cloned_items.push(cloned_item);
             }
-            self.store.save_turn(&cloned_turn)?;
             forked.latest_turn_id = Some(cloned_turn.id.clone());
             forked.updated_at = now;
-            self.store.save_thread(&forked)?;
+            cloned_records.push((cloned_turn, cloned_items));
         }
+        self.publish_fork(&forked, &cloned_records)?;
 
         self.emit_event(
             &forked.id,
@@ -1934,28 +2012,28 @@ impl RuntimeThreadManager {
         forked.updated_at = now;
         forked.latest_turn_id = None;
         forked.archived = false;
-        self.store.save_thread(&forked)?;
 
+        let mut cloned_records = Vec::with_capacity(target_turn_idx);
         for source_turn in source_turns.iter().take(target_turn_idx) {
             let mut cloned_turn = source_turn.clone();
             cloned_turn.id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
             cloned_turn.thread_id = forked.id.clone();
             cloned_turn.item_ids.clear();
-            self.store.save_turn(&cloned_turn)?;
 
             let items = self.store.list_items_for_turn(&source_turn.id)?;
+            let mut cloned_items = Vec::with_capacity(items.len());
             for item in items {
                 let mut cloned_item = item.clone();
                 cloned_item.id = format!("item_{}", &Uuid::new_v4().to_string()[..8]);
                 cloned_item.turn_id = cloned_turn.id.clone();
-                self.store.save_item(&cloned_item)?;
                 cloned_turn.item_ids.push(cloned_item.id.clone());
+                cloned_items.push(cloned_item);
             }
-            self.store.save_turn(&cloned_turn)?;
             forked.latest_turn_id = Some(cloned_turn.id.clone());
             forked.updated_at = now;
-            self.store.save_thread(&forked)?;
+            cloned_records.push((cloned_turn, cloned_items));
         }
+        self.publish_fork(&forked, &cloned_records)?;
 
         self.emit_event(
             &forked.id,
@@ -1973,6 +2051,54 @@ impl RuntimeThreadManager {
         Ok((forked, original_user_text))
     }
 
+    /// Persist cloned records before publishing their thread. Until the final
+    /// atomic thread write succeeds, list/get/start callers cannot observe a
+    /// partial fork. Any failed write removes all unpublished clone artifacts.
+    fn publish_fork(
+        &self,
+        thread: &ThreadRecord,
+        records: &[(TurnRecord, Vec<TurnItemRecord>)],
+    ) -> Result<()> {
+        let mut saved_turn_ids = Vec::new();
+        let mut saved_item_ids = Vec::new();
+        let persistence = (|| -> Result<()> {
+            for (turn, items) in records {
+                for item in items {
+                    self.store.save_item(item)?;
+                    saved_item_ids.push(item.id.clone());
+                }
+                self.store.save_turn(turn)?;
+                saved_turn_ids.push(turn.id.clone());
+            }
+            self.store.save_thread(thread)
+        })();
+
+        if let Err(persistence_error) = persistence {
+            let mut cleanup_errors = Vec::new();
+            if let Err(error) = self.store.remove_thread(&thread.id) {
+                cleanup_errors.push(format!("remove thread: {error}"));
+            }
+            for turn_id in saved_turn_ids.iter().rev() {
+                if let Err(error) = self.store.remove_turn(turn_id) {
+                    cleanup_errors.push(format!("remove turn {turn_id}: {error}"));
+                }
+            }
+            for item_id in saved_item_ids.iter().rev() {
+                if let Err(error) = self.store.remove_item(item_id) {
+                    cleanup_errors.push(format!("remove item {item_id}: {error}"));
+                }
+            }
+            if cleanup_errors.is_empty() {
+                return Err(persistence_error);
+            }
+            bail!(
+                "Failed to persist fork: {persistence_error}; cleanup also failed: {}",
+                cleanup_errors.join("; ")
+            );
+        }
+        Ok(())
+    }
+
     /// Seed a thread with messages from a saved session so subsequent turns
     /// continue with the prior conversation context.
     ///
@@ -1985,7 +2111,13 @@ impl RuntimeThreadManager {
         thread_id: &str,
         messages: &[Message],
     ) -> Result<()> {
-        let mut thread = self.get_thread(thread_id).await?;
+        // Session seeding writes turns/items and then advances the existing
+        // thread pointer as one synchronous record transaction.
+        let thread_mutation = self.store.thread_mutation.lock();
+        let mut thread = self
+            .store
+            .load_thread(thread_id)
+            .with_context(|| format!("Thread not found: {thread_id}"))?;
         let now = Utc::now();
 
         // Group messages into turns. A turn starts with a user message and
@@ -2276,6 +2408,7 @@ impl RuntimeThreadManager {
         }
 
         self.store.save_thread(&thread)?;
+        drop(thread_mutation);
         self.emit_event(
             thread_id,
             None,
@@ -2287,16 +2420,8 @@ impl RuntimeThreadManager {
         Ok(())
     }
 
-    fn rollback_unstarted_turn_records(
-        &self,
-        previous_thread: &ThreadRecord,
-        turn_id: &str,
-        item_id: Option<&str>,
-    ) -> Result<()> {
+    fn cleanup_unaccepted_turn_records(&self, turn_id: &str, item_id: Option<&str>) -> Result<()> {
         let mut errors = Vec::new();
-        if let Err(err) = self.store.save_thread(previous_thread) {
-            errors.push(format!("restore thread: {err}"));
-        }
         if let Some(item_id) = item_id
             && let Err(err) = self.store.remove_item(item_id)
         {
@@ -2312,41 +2437,310 @@ impl RuntimeThreadManager {
         }
     }
 
-    async fn restore_unstarted_turn_claim(
+    async fn emit_claimed_turn_started(
         &self,
-        thread_id: &str,
-        turn_id: &str,
-        previous_route: &(ProviderIdentity, String),
+        turn: &TurnRecord,
+        user_item: Option<&TurnItemRecord>,
+        kind: ClaimedTurnKind,
     ) {
-        let mut active = self.active.lock().await;
-        if let Some(state) = active.engines.get_mut(thread_id)
-            && state
-                .active_turn
-                .as_ref()
-                .is_some_and(|active_turn| active_turn.turn_id == turn_id)
+        let start_payload = match kind {
+            ClaimedTurnKind::Message => json!({ "turn": turn.clone() }),
+            ClaimedTurnKind::Compaction => {
+                json!({ "turn": turn.clone(), "manual_compaction": true })
+            }
+        };
+        if let Err(err) = self
+            .emit_event(
+                &turn.thread_id,
+                Some(&turn.id),
+                None,
+                "turn.started",
+                start_payload,
+            )
+            .await
         {
-            state.active_turn = None;
-            state.route_identity.clone_from(&previous_route.0);
-            state.route_model.clone_from(&previous_route.1);
+            tracing::warn!(
+                "Failed to persist {}.started after engine acceptance: {err}",
+                kind.label()
+            );
+        }
+
+        if let Some(user_item) = user_item {
+            if let Err(err) = self
+                .emit_event(
+                    &turn.thread_id,
+                    Some(&turn.id),
+                    Some(&user_item.id),
+                    "item.started",
+                    json!({ "item": user_item.clone() }),
+                )
+                .await
+            {
+                tracing::warn!("Failed to persist item.started after engine acceptance: {err}");
+            }
+            if let Err(err) = self
+                .emit_event(
+                    &turn.thread_id,
+                    Some(&turn.id),
+                    Some(&user_item.id),
+                    "item.completed",
+                    json!({ "item": user_item.clone() }),
+                )
+                .await
+            {
+                tracing::warn!("Failed to persist item.completed after engine acceptance: {err}");
+            }
         }
     }
 
-    /// Restore durable state while the failed turn still owns the active
-    /// claim, then release that claim. Clearing the claim first would let a
-    /// concurrent start persist a winner that this older rollback could
-    /// overwrite with `previous_thread`.
-    async fn rollback_unstarted_turn(
+    async fn settle_claimed_turn_failure(&self, thread_id: &str, turn_id: &str, reason: &str) {
+        // Block steer attempts while terminal receipts are being settled; the
+        // active claim remains present so a replacement turn cannot start.
+        {
+            let mut active = self.active.lock().await;
+            if let Some(turn) = active
+                .engines
+                .get_mut(thread_id)
+                .and_then(|state| state.active_turn.as_mut())
+                && turn.turn_id == turn_id
+            {
+                turn.interrupt_requested = true;
+            }
+        }
+        let now = Utc::now();
+        let mut terminal_items = Vec::new();
+        match self.store.list_items_for_turn(turn_id) {
+            Ok(items) => {
+                for mut item in items {
+                    if matches!(
+                        item.status,
+                        TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::InProgress
+                    ) {
+                        item.status = TurnItemLifecycleStatus::Failed;
+                        item.ended_at = Some(now);
+                        match self.store.save_item(&item) {
+                            Ok(()) => terminal_items.push(item),
+                            Err(err) => tracing::error!(
+                                item_id = %item.id,
+                                "Failed to terminalize item after monitor failure: {err}"
+                            ),
+                        }
+                    }
+                }
+            }
+            Err(err) => tracing::error!(
+                "Failed to list turn items after monitor failure for {turn_id}: {err}"
+            ),
+        }
+        let terminal_turn = {
+            let _turn_mutation = self.store.turn_mutation.lock();
+            match self.store.load_turn(turn_id) {
+                Ok(mut turn) if turn.status == RuntimeTurnStatus::InProgress => {
+                    turn.status = RuntimeTurnStatus::Failed;
+                    turn.ended_at = Some(now);
+                    turn.duration_ms = turn.started_at.map(|start| duration_ms(start, now));
+                    turn.error = Some(reason.to_string());
+                    match self.store.save_turn(&turn) {
+                        Ok(()) => Some(turn),
+                        Err(err) => {
+                            tracing::error!("Failed to persist terminal monitor failure: {err}");
+                            None
+                        }
+                    }
+                }
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::error!("Failed to load turn after monitor failure: {err}");
+                    None
+                }
+            }
+        };
+
+        for item in terminal_items {
+            if let Err(err) = self
+                .emit_event(
+                    thread_id,
+                    Some(turn_id),
+                    Some(&item.id),
+                    "item.failed",
+                    json!({ "item": item, "error": reason }),
+                )
+                .await
+            {
+                tracing::error!("Failed to emit terminal item failure: {err}");
+            }
+        }
+
+        if let Some(turn) = terminal_turn
+            && let Err(err) = self
+                .emit_event(
+                    thread_id,
+                    Some(turn_id),
+                    None,
+                    "turn.completed",
+                    json!({ "turn": turn }),
+                )
+                .await
+        {
+            tracing::error!("Failed to emit terminal monitor failure: {err}");
+        }
+
+        // Keep the failed claim in place until its terminal receipts are
+        // ordered. Then poison and evict this engine so the next turn gets a
+        // distinct event receiver and cannot consume stale terminal events.
+        let evicted_engine = {
+            let mut active = self.active.lock().await;
+            let owns_failed_turn = active
+                .engines
+                .get(thread_id)
+                .and_then(|state| state.active_turn.as_ref())
+                .is_some_and(|turn| turn.turn_id == turn_id);
+            if owns_failed_turn {
+                active.lru.retain(|id| id != thread_id);
+                active.engines.remove(thread_id).map(|state| state.engine)
+            } else {
+                None
+            }
+        };
+        if let Some(engine) = evicted_engine {
+            engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+            let _ = engine.try_send(Op::Shutdown);
+        }
+    }
+
+    async fn monitor_claimed_turn(
         &self,
-        previous_thread: &ThreadRecord,
-        turn_id: &str,
-        item_id: Option<&str>,
-        previous_route: &(ProviderIdentity, String),
-    ) -> Result<()> {
-        let durable_result =
-            self.rollback_unstarted_turn_records(previous_thread, turn_id, item_id);
-        self.restore_unstarted_turn_claim(&previous_thread.id, turn_id, previous_route)
+        thread_id: String,
+        turn_id: String,
+        engine: EngineHandle,
+        kind: ClaimedTurnKind,
+    ) {
+        if self.cancel_token.is_cancelled() {
+            engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+            self.settle_claimed_turn_failure(
+                &thread_id,
+                &turn_id,
+                "Runtime shutdown requested before turn monitoring started",
+            )
             .await;
-        durable_result
+            return;
+        }
+
+        use futures_util::FutureExt;
+        let result = std::panic::AssertUnwindSafe(self.monitor_turn(
+            thread_id.clone(),
+            turn_id.clone(),
+            engine.clone(),
+        ))
+        .catch_unwind()
+        .await;
+        let failure = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => format!("Failed to monitor {}: {error}", kind.label()),
+            Err(payload) => format!(
+                "{} monitor panicked: {}",
+                kind.label(),
+                panic_payload_message(&*payload)
+            ),
+        };
+        tracing::error!("{failure}");
+        engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+        self.settle_claimed_turn_failure(&thread_id, &turn_id, &failure)
+            .await;
+    }
+
+    fn spawn_claimed_turn_monitor(
+        &self,
+        turn: TurnRecord,
+        user_item: Option<TurnItemRecord>,
+        engine: EngineHandle,
+        kind: ClaimedTurnKind,
+    ) -> oneshot::Receiver<std::result::Result<TurnRecord, String>> {
+        let (acceptance_tx, acceptance_rx) = oneshot::channel();
+        let manager = Arc::new(self.clone());
+        tokio::spawn(async move {
+            use futures_util::FutureExt;
+            let start_events = std::panic::AssertUnwindSafe(manager.emit_claimed_turn_started(
+                &turn,
+                user_item.as_ref(),
+                kind,
+            ))
+            .catch_unwind()
+            .await;
+            if let Err(payload) = start_events {
+                let failure = format!(
+                    "{} start-event recording panicked after engine acceptance: {}",
+                    kind.label(),
+                    panic_payload_message(&*payload)
+                );
+                tracing::error!("{failure}");
+                let _ = acceptance_tx.send(Ok(turn.clone()));
+                engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+                manager
+                    .settle_claimed_turn_failure(&turn.thread_id, &turn.id, &failure)
+                    .await;
+                return;
+            }
+
+            let _ = acceptance_tx.send(Ok(turn.clone()));
+            manager
+                .monitor_claimed_turn(turn.thread_id.clone(), turn.id.clone(), engine, kind)
+                .await;
+        });
+        acceptance_rx
+    }
+
+    fn spawn_steer_receipts(
+        &self,
+        turn: TurnRecord,
+        item: TurnItemRecord,
+        prompt: String,
+    ) -> oneshot::Receiver<TurnRecord> {
+        let (receipt_tx, receipt_rx) = oneshot::channel();
+        let manager = Arc::new(self.clone());
+        tokio::spawn(async move {
+            use futures_util::FutureExt;
+            let receipts = std::panic::AssertUnwindSafe(async {
+                if let Err(err) = manager
+                    .emit_event(
+                        &turn.thread_id,
+                        Some(&turn.id),
+                        Some(&item.id),
+                        "turn.steered",
+                        json!({
+                            "thread_id": turn.thread_id.clone(),
+                            "turn_id": turn.id.clone(),
+                            "input": prompt,
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to persist turn.steered after engine acceptance: {err}");
+                }
+                if let Err(err) = manager
+                    .emit_event(
+                        &turn.thread_id,
+                        Some(&turn.id),
+                        Some(&item.id),
+                        "item.completed",
+                        json!({ "item": item }),
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to persist steer item.completed: {err}");
+                }
+            })
+            .catch_unwind()
+            .await;
+            if let Err(payload) = receipts {
+                tracing::error!(
+                    "Steer receipt task panicked after engine acceptance: {}",
+                    panic_payload_message(&*payload)
+                );
+            }
+            let _ = receipt_tx.send(turn);
+        });
+        receipt_rx
     }
 
     pub async fn start_turn(&self, thread_id: &str, req: StartTurnRequest) -> Result<TurnRecord> {
@@ -2355,8 +2749,7 @@ impl RuntimeThreadManager {
             bail!("prompt is required");
         }
 
-        let mut thread = self.get_thread(thread_id).await?;
-        let thread_before_turn = thread.clone();
+        let thread = self.get_thread(thread_id).await?;
         let engine = self.ensure_engine_loaded(&thread).await?;
 
         let client_preflight_required = {
@@ -2477,9 +2870,52 @@ impl RuntimeThreadManager {
             started_at: Some(now),
             ended_at: Some(now),
         };
-
         turn.item_ids.push(user_item_id.clone());
-        let previous_active_route = {
+
+        let allow_shell = req.allow_shell.unwrap_or(thread.allow_shell);
+        let trust_mode = req.trust_mode.unwrap_or(thread.trust_mode);
+        let auto_approve = req.auto_approve.unwrap_or(thread.auto_approve);
+        let op = Op::SendMessage {
+            content: prompt,
+            mode,
+            route: Box::new(route),
+            compaction: Box::new(compaction),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort,
+            reasoning_effort_auto: auto_model,
+            auto_model,
+            allow_shell,
+            trust_mode,
+            auto_approve,
+            translation_enabled: false,
+            show_thinking,
+            allowed_tools: None,
+            dynamic_tools: req.dynamic_tools,
+            hook_executor: None,
+            approval_mode: if auto_approve {
+                crate::tui::approval::ApprovalMode::Bypass
+            } else {
+                crate::tui::approval::ApprovalMode::Suggest
+            },
+            verbosity,
+            provenance: crate::core::ops::UserInputProvenance::ExternalUser,
+        };
+
+        // Reserve mailbox capacity before claiming or persisting anything.
+        // If the caller is cancelled while capacity is unavailable, no
+        // durable or in-memory turn state has changed.
+        let permit = engine
+            .tx_op
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow!("Failed to start turn: engine operation channel closed"))?;
+
+        let acceptance_rx = {
+            // Lock order is active -> thread_mutation. Neither guard crosses
+            // an await, and spawning the owned lifecycle task is synchronous.
             let mut active = self.active.lock().await;
             let Some(state) = active.engines.get_mut(thread_id) else {
                 bail!("Thread engine not loaded");
@@ -2487,170 +2923,61 @@ impl RuntimeThreadManager {
             if state.active_turn.is_some() {
                 bail!("Thread already has an active turn");
             }
-            let previous = (state.route_identity.clone(), state.route_model.clone());
+            let _thread_mutation = self.store.thread_mutation.lock();
+            let mut current_thread = self.store.load_thread(thread_id)?;
+            if !thread_execution_state_matches(&thread, &current_thread) {
+                bail!("Thread execution settings changed while preparing the turn; retry");
+            }
+            let previous_active_route = (state.route_identity.clone(), state.route_model.clone());
             state.active_turn = Some(ActiveTurnState {
                 turn_id: turn_id.clone(),
                 interrupt_requested: false,
-                auto_approve: req.auto_approve.unwrap_or(thread.auto_approve),
-                trust_mode: req.trust_mode.unwrap_or(thread.trust_mode),
+                auto_approve,
+                trust_mode,
             });
             state.route_identity = provider_identity;
             state.route_model.clone_from(&model);
-            previous
+
+            let persistence_result = (|| -> Result<()> {
+                self.store.save_item(&user_item)?;
+                self.store.save_turn(&turn)?;
+                current_thread.latest_turn_id = Some(turn_id.clone());
+                current_thread.updated_at = now;
+                self.store.save_thread(&current_thread)
+            })();
+            if let Err(persistence_error) = persistence_result {
+                let cleanup_error = self
+                    .cleanup_unaccepted_turn_records(&turn_id, Some(&user_item_id))
+                    .err();
+                state.active_turn = None;
+                state.route_identity = previous_active_route.0;
+                state.route_model = previous_active_route.1;
+                return match cleanup_error {
+                    None => Err(anyhow!("Failed to persist turn: {persistence_error}")),
+                    Some(cleanup_error) => Err(anyhow!(
+                        "Failed to persist turn: {persistence_error}; cleanup also failed: {cleanup_error}"
+                    )),
+                };
+            }
+
+            // Sending through an owned permit cannot await or fail. From this
+            // point the engine owns the operation and the spawned task owns
+            // lifecycle events, monitoring, and terminal cleanup even if the
+            // HTTP/client future is dropped.
+            let _sender = permit.send(op);
+            touch_lru(&mut active.lru, thread_id);
+            self.spawn_claimed_turn_monitor(
+                turn.clone(),
+                Some(user_item),
+                engine.clone(),
+                ClaimedTurnKind::Message,
+            )
         };
 
-        let persistence_result = (|| -> Result<()> {
-            self.store.save_item(&user_item)?;
-            self.store.save_turn(&turn)?;
-            thread.latest_turn_id = Some(turn_id.clone());
-            thread.updated_at = now;
-            self.store.save_thread(&thread)
-        })();
-        if let Err(persistence_error) = persistence_result {
-            let rollback = self
-                .rollback_unstarted_turn(
-                    &thread_before_turn,
-                    &turn_id,
-                    Some(&user_item_id),
-                    &previous_active_route,
-                )
-                .await;
-            return match rollback {
-                Ok(()) => Err(persistence_error),
-                Err(rollback_error) => Err(anyhow!(
-                    "Failed to persist turn: {persistence_error}; rollback also failed: {rollback_error}"
-                )),
-            };
-        }
-        let allow_shell = req.allow_shell.unwrap_or(thread.allow_shell);
-        let trust_mode = req.trust_mode.unwrap_or(thread.trust_mode);
-        let auto_approve = req.auto_approve.unwrap_or(thread.auto_approve);
-
-        if let Err(send_error) = engine
-            .send(Op::SendMessage {
-                content: prompt,
-                mode,
-                route: Box::new(route),
-                compaction: Box::new(compaction),
-                goal_objective: None,
-                goal_token_budget: None,
-                goal_status: crate::tools::goal::GoalStatus::Active,
-                reasoning_effort,
-                reasoning_effort_auto: auto_model,
-                auto_model,
-                allow_shell,
-                trust_mode,
-                auto_approve,
-                translation_enabled: false,
-                show_thinking,
-                allowed_tools: None,
-                dynamic_tools: req.dynamic_tools,
-                hook_executor: None,
-                approval_mode: if auto_approve {
-                    crate::tui::approval::ApprovalMode::Bypass
-                } else {
-                    crate::tui::approval::ApprovalMode::Suggest
-                },
-                verbosity,
-                provenance: crate::core::ops::UserInputProvenance::ExternalUser,
-            })
+        acceptance_rx
             .await
-        {
-            let rollback = self
-                .rollback_unstarted_turn(
-                    &thread_before_turn,
-                    &turn_id,
-                    Some(&user_item_id),
-                    &previous_active_route,
-                )
-                .await;
-            return match rollback {
-                Ok(()) => Err(anyhow!("Failed to start turn: {send_error}")),
-                Err(rollback_error) => Err(anyhow!(
-                    "Failed to start turn: {send_error}; rollback also failed: {rollback_error}"
-                )),
-            };
-        }
-
-        {
-            let mut active = self.active.lock().await;
-            touch_lru(&mut active.lru, thread_id);
-        }
-
-        if let Err(err) = self
-            .emit_event(
-                thread_id,
-                Some(&turn_id),
-                None,
-                "turn.started",
-                json!({ "turn": turn.clone() }),
-            )
-            .await
-        {
-            tracing::warn!("Failed to persist turn.started after engine acceptance: {err}");
-        }
-        if let Err(err) = self
-            .emit_event(
-                thread_id,
-                Some(&turn_id),
-                Some(&user_item_id),
-                "item.started",
-                json!({ "item": user_item.clone() }),
-            )
-            .await
-        {
-            tracing::warn!("Failed to persist item.started after engine acceptance: {err}");
-        }
-        if let Err(err) = self
-            .emit_event(
-                thread_id,
-                Some(&turn_id),
-                Some(&user_item_id),
-                "item.completed",
-                json!({ "item": user_item }),
-            )
-            .await
-        {
-            tracing::warn!("Failed to persist item.completed after engine acceptance: {err}");
-        }
-
-        let manager = Arc::new(self.clone());
-        let thread_id_owned = thread_id.to_string();
-        let turn_id_owned = turn_id.clone();
-        let engine_clone = engine.clone();
-        let cancel_token = self.cancel_token.clone();
-        tokio::spawn(async move {
-            if cancel_token.is_cancelled() {
-                tracing::debug!("Skipping turn monitor: shutdown requested");
-                return;
-            }
-            use futures_util::FutureExt;
-            let result = std::panic::AssertUnwindSafe(manager.monitor_turn(
-                thread_id_owned,
-                turn_id_owned,
-                engine_clone,
-            ))
-            .catch_unwind()
-            .await;
-            match result {
-                Ok(res) => {
-                    if let Err(err) = res {
-                        tracing::error!("Failed to monitor turn: {err}");
-                    }
-                }
-                Err(panic_err) => {
-                    if let Some(msg) = panic_err.downcast_ref::<&str>() {
-                        tracing::error!("Turn monitor panicked: {}", msg);
-                    } else if let Some(msg) = panic_err.downcast_ref::<String>() {
-                        tracing::error!("Turn monitor panicked: {}", msg);
-                    } else {
-                        tracing::error!("Turn monitor panicked with unknown error");
-                    }
-                }
-            }
-        });
-
-        Ok(turn)
+            .map_err(|_| anyhow!("Turn lifecycle task ended before acknowledgement"))?
+            .map_err(anyhow::Error::msg)
     }
 
     pub async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<TurnRecord> {
@@ -2705,22 +3032,21 @@ impl RuntimeThreadManager {
                 if active_turn.turn_id != turn_id {
                     bail!("Turn {turn_id} is not active on thread {thread_id}");
                 }
+                if active_turn.interrupt_requested {
+                    bail!("Turn {turn_id} is stopping and cannot be steered");
+                }
                 active_thread.engine.clone()
             };
             touch_lru(&mut active.lru, thread_id);
             engine
         };
 
-        engine
-            .steer(prompt.clone())
+        let permit = engine
+            .reserve_steer()
             .await
-            .map_err(|e| anyhow!("Failed to steer turn: {e}"))?;
+            .map_err(|error| anyhow!("Failed to steer turn: {error}"))?;
 
         let now = Utc::now();
-        let mut turn = self.store.load_turn(turn_id)?;
-        turn.steer_count = turn.steer_count.saturating_add(1);
-        self.store.save_turn(&turn)?;
-
         let item = TurnItemRecord {
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
             id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
@@ -2734,32 +3060,58 @@ impl RuntimeThreadManager {
             started_at: Some(now),
             ended_at: Some(now),
         };
-        turn.item_ids.push(item.id.clone());
-        self.store.save_item(&item)?;
-        self.store.save_turn(&turn)?;
-
-        self.emit_event(
-            thread_id,
-            Some(turn_id),
-            Some(&item.id),
-            "turn.steered",
-            json!({
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "input": prompt,
-            }),
-        )
-        .await?;
-        self.emit_event(
-            thread_id,
-            Some(turn_id),
-            Some(&item.id),
-            "item.completed",
-            json!({ "item": item }),
-        )
-        .await?;
-
-        Ok(turn)
+        let receipt_rx = {
+            let mut active = self.active.lock().await;
+            let Some(active_thread) = active.engines.get(thread_id) else {
+                bail!("Thread is not loaded");
+            };
+            let Some(active_turn) = active_thread.active_turn.as_ref() else {
+                bail!("No active turn on thread {thread_id}");
+            };
+            if active_turn.turn_id != turn_id {
+                bail!("Turn {turn_id} is not active on thread {thread_id}");
+            }
+            if active_turn.interrupt_requested {
+                bail!("Turn {turn_id} is stopping and cannot be steered");
+            }
+            if !active_thread.engine.tx_op.same_channel(&engine.tx_op) {
+                bail!("Thread engine changed while preparing steer; retry");
+            }
+            let _turn_mutation = self.store.turn_mutation.lock();
+            let persistence = (|| -> Result<TurnRecord> {
+                let mut turn = self.store.load_turn(turn_id)?;
+                if turn.status != RuntimeTurnStatus::InProgress {
+                    bail!("Turn {turn_id} is no longer in progress and cannot be steered");
+                }
+                self.store.save_item(&item)?;
+                turn.steer_count = turn.steer_count.saturating_add(1);
+                if !turn.item_ids.iter().any(|id| id == &item.id) {
+                    turn.item_ids.push(item.id.clone());
+                }
+                self.store.save_turn(&turn)?;
+                Ok(turn)
+            })();
+            let turn = match persistence {
+                Ok(turn) => turn,
+                Err(error) => {
+                    let cleanup = self.store.remove_item(&item.id);
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(anyhow!(
+                            "Failed to persist steer: {error}; cleanup also failed: {cleanup_error}"
+                        )),
+                    };
+                }
+            };
+            // The reserved send has no await/failure point. From here the
+            // engine and durable record agree even if the API caller drops.
+            let _sender = permit.send(prompt.clone());
+            touch_lru(&mut active.lru, thread_id);
+            self.spawn_steer_receipts(turn, item, prompt)
+        };
+        receipt_rx
+            .await
+            .map_err(|_| anyhow!("Steer receipt task ended before acknowledgement"))
     }
 
     pub async fn compact_thread(
@@ -2767,8 +3119,7 @@ impl RuntimeThreadManager {
         thread_id: &str,
         req: CompactThreadRequest,
     ) -> Result<TurnRecord> {
-        let mut thread = self.get_thread(thread_id).await?;
-        let thread_before_turn = thread.clone();
+        let thread = self.get_thread(thread_id).await?;
         let engine = self.ensure_engine_loaded(&thread).await?;
 
         let client_preflight_required = {
@@ -2828,7 +3179,15 @@ impl RuntimeThreadManager {
             item_ids: Vec::new(),
             steer_count: 0,
         };
-        let previous_active_route = {
+        let op = Op::CompactContext {
+            route: Box::new(route),
+            compaction: Box::new(compaction),
+        };
+        let permit = engine.tx_op.clone().reserve_owned().await.map_err(|_| {
+            anyhow!("Failed to trigger compaction: engine operation channel closed")
+        })?;
+
+        let acceptance_rx = {
             let mut active = self.active.lock().await;
             let Some(state) = active.engines.get_mut(thread_id) else {
                 bail!("Thread engine not loaded");
@@ -2836,121 +3195,54 @@ impl RuntimeThreadManager {
             if state.active_turn.is_some() {
                 bail!("Thread already has an active turn");
             }
-            let previous = (state.route_identity.clone(), state.route_model.clone());
+            let _thread_mutation = self.store.thread_mutation.lock();
+            let mut current_thread = self.store.load_thread(thread_id)?;
+            if !thread_execution_state_matches(&thread, &current_thread) {
+                bail!("Thread execution settings changed while preparing compaction; retry");
+            }
+            let previous_active_route = (state.route_identity.clone(), state.route_model.clone());
             state.active_turn = Some(ActiveTurnState {
                 turn_id: turn_id.clone(),
                 interrupt_requested: false,
-                auto_approve: thread.auto_approve,
-                trust_mode: thread.trust_mode,
+                auto_approve: current_thread.auto_approve,
+                trust_mode: current_thread.trust_mode,
             });
             state.route_identity = route_identity;
             state.route_model = route_model;
-            previous
+
+            let persistence_result = (|| -> Result<()> {
+                self.store.save_turn(&turn)?;
+                current_thread.latest_turn_id = Some(turn_id.clone());
+                current_thread.updated_at = now;
+                self.store.save_thread(&current_thread)
+            })();
+            if let Err(persistence_error) = persistence_result {
+                let cleanup_error = self.cleanup_unaccepted_turn_records(&turn_id, None).err();
+                state.active_turn = None;
+                state.route_identity = previous_active_route.0;
+                state.route_model = previous_active_route.1;
+                return match cleanup_error {
+                    None => Err(anyhow!("Failed to persist compaction: {persistence_error}")),
+                    Some(cleanup_error) => Err(anyhow!(
+                        "Failed to persist compaction: {persistence_error}; cleanup also failed: {cleanup_error}"
+                    )),
+                };
+            }
+
+            let _sender = permit.send(op);
+            touch_lru(&mut active.lru, thread_id);
+            self.spawn_claimed_turn_monitor(
+                turn.clone(),
+                None,
+                engine.clone(),
+                ClaimedTurnKind::Compaction,
+            )
         };
 
-        let persistence_result = (|| -> Result<()> {
-            self.store.save_turn(&turn)?;
-            thread.latest_turn_id = Some(turn_id.clone());
-            thread.updated_at = now;
-            self.store.save_thread(&thread)
-        })();
-        if let Err(persistence_error) = persistence_result {
-            let rollback = self
-                .rollback_unstarted_turn(
-                    &thread_before_turn,
-                    &turn_id,
-                    None,
-                    &previous_active_route,
-                )
-                .await;
-            return match rollback {
-                Ok(()) => Err(persistence_error),
-                Err(rollback_error) => Err(anyhow!(
-                    "Failed to persist compaction: {persistence_error}; rollback also failed: {rollback_error}"
-                )),
-            };
-        }
-
-        if let Err(send_error) = engine
-            .send(Op::CompactContext {
-                route: Box::new(route),
-                compaction: Box::new(compaction),
-            })
+        acceptance_rx
             .await
-        {
-            let rollback = self
-                .rollback_unstarted_turn(
-                    &thread_before_turn,
-                    &turn_id,
-                    None,
-                    &previous_active_route,
-                )
-                .await;
-            return match rollback {
-                Ok(()) => Err(anyhow!("Failed to trigger compaction: {send_error}")),
-                Err(rollback_error) => Err(anyhow!(
-                    "Failed to trigger compaction: {send_error}; rollback also failed: {rollback_error}"
-                )),
-            };
-        }
-
-        {
-            let mut active = self.active.lock().await;
-            touch_lru(&mut active.lru, thread_id);
-        }
-
-        if let Err(err) = self
-            .emit_event(
-                thread_id,
-                Some(&turn_id),
-                None,
-                "turn.started",
-                json!({ "turn": turn.clone(), "manual_compaction": true }),
-            )
-            .await
-        {
-            tracing::warn!(
-                "Failed to persist compaction turn.started after engine acceptance: {err}"
-            );
-        }
-
-        let manager = Arc::new(self.clone());
-        let thread_id_owned = thread_id.to_string();
-        let turn_id_owned = turn_id.clone();
-        let engine_clone = engine.clone();
-        let cancel_token = self.cancel_token.clone();
-        tokio::spawn(async move {
-            if cancel_token.is_cancelled() {
-                tracing::debug!("Skipping compaction monitor: shutdown requested");
-                return;
-            }
-            use futures_util::FutureExt;
-            let result = std::panic::AssertUnwindSafe(manager.monitor_turn(
-                thread_id_owned,
-                turn_id_owned,
-                engine_clone,
-            ))
-            .catch_unwind()
-            .await;
-            match result {
-                Ok(res) => {
-                    if let Err(err) = res {
-                        tracing::error!("Failed to monitor compaction turn: {err}");
-                    }
-                }
-                Err(panic_err) => {
-                    if let Some(msg) = panic_err.downcast_ref::<&str>() {
-                        tracing::error!("Compaction monitor panicked: {}", msg);
-                    } else if let Some(msg) = panic_err.downcast_ref::<String>() {
-                        tracing::error!("Compaction monitor panicked: {}", msg);
-                    } else {
-                        tracing::error!("Compaction monitor panicked with unknown error");
-                    }
-                }
-            }
-        });
-
-        Ok(turn)
+            .map_err(|_| anyhow!("Compaction lifecycle task ended before acknowledgement"))?
+            .map_err(anyhow::Error::msg)
     }
 
     pub fn events_since(
@@ -2961,225 +3253,279 @@ impl RuntimeThreadManager {
         self.store.events_since(thread_id, since_seq)
     }
 
-    async fn ensure_engine_loaded(&self, thread: &ThreadRecord) -> Result<EngineHandle> {
+    async fn ensure_engine_loaded(&self, thread_hint: &ThreadRecord) -> Result<EngineHandle> {
         {
             let mut active = self.active.lock().await;
             if let Some(engine) = active
                 .engines
-                .get(thread.id.as_str())
+                .get(thread_hint.id.as_str())
                 .map(|state| state.engine.clone())
             {
-                touch_lru(&mut active.lru, &thread.id);
+                touch_lru(&mut active.lru, &thread_hint.id);
                 return Ok(engine);
             }
         }
 
-        // Snapshot and prepare the concrete provider route once so the engine,
-        // route limits, compaction budget, and restored session all agree.
-        let base_config = self.read_config().clone();
-        let route = self.resolved_route_for_thread(&base_config, thread)?;
-        let provider = route.identity.provider;
-        let route_identity = route.identity;
-        let route_model = route.model;
-        let route_limits = known_route_limits(route.candidate.limits);
-        let cfg = route.config;
+        // Only one cache-miss build may run at a time. Recheck after taking
+        // the build lock because another caller may already have won.
+        let _engine_load = self.engine_load.lock().await;
+        loop {
+            {
+                let mut active = self.active.lock().await;
+                if let Some(engine) = active
+                    .engines
+                    .get(thread_hint.id.as_str())
+                    .map(|state| state.engine.clone())
+                {
+                    touch_lru(&mut active.lru, &thread_hint.id);
+                    return Ok(engine);
+                }
+            }
+            let thread = {
+                let _thread_mutation = self.store.thread_mutation.lock();
+                self.store
+                    .load_thread(&thread_hint.id)
+                    .with_context(|| format!("Thread not found: {}", thread_hint.id))?
+            };
 
-        // Resolve the provider-route-aware auto-compaction default unless the
-        // user persisted an explicit preference.
-        let settings = crate::settings::Settings::load().unwrap_or_default();
-        let compaction = runtime_compaction_config(
-            provider,
-            &route_model,
-            route_limits,
-            settings.auto_compact,
-            crate::settings::Settings::auto_compact_explicitly_configured(),
-            settings.auto_compact_threshold_percent,
-        );
-        let network_policy = cfg.network.clone().map(|toml_cfg| {
-            crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
-        });
-        let lsp_config = cfg
-            .lsp
-            .clone()
-            .map(crate::config::LspConfigToml::into_runtime);
-        let max_subagents = cfg
-            .max_subagents_for_provider(provider)
-            .clamp(1, MAX_SUBAGENTS);
-        let engine_cfg = EngineConfig {
-            model: route_model.clone(),
-            active_route_limits: route_limits,
-            workspace: thread.workspace.clone(),
-            allow_shell: thread.allow_shell,
-            trust_mode: thread.trust_mode,
-            notes_path: cfg.notes_path(),
-            mcp_config_path: cfg.mcp_config_path(),
-            skills_dir: cfg.skills_dir(),
-            skills_scan_codewhale_only: cfg.skills_config().scan_codewhale_only(),
-            instructions: cfg
-                .instructions_paths()
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            project_context_pack_enabled: cfg.project_context_pack_enabled(),
-            translation_enabled: false,
-            show_thinking: settings.show_thinking,
-            max_steps: 100,
-            max_subagents,
-            max_admitted_subagents: cfg
-                .max_admitted_subagents_for_provider(provider)
-                .max(max_subagents),
-            launch_concurrency: cfg.launch_concurrency_for_provider(provider),
-            subagents_enabled: cfg.subagents_enabled_for_provider(provider),
-            features: cfg.features(),
-            auto_review_policy: cfg.auto_review_policy(),
-            compaction,
-            todos: new_shared_todo_list(),
-            plan_state: new_shared_plan_state(),
-            goal_state: crate::tools::goal::new_shared_goal_state(),
-            max_spawn_depth: cfg.subagent_max_spawn_depth_for_provider(provider),
-            subagent_token_budget: cfg.subagent_token_budget_for_provider(provider),
-            network_policy,
-            snapshots_enabled: cfg.snapshots_config().enabled,
-            snapshots_max_workspace_bytes: cfg
-                .snapshots_config()
-                .max_workspace_gb
-                .saturating_mul(1024 * 1024 * 1024),
-            lsp_config,
-            runtime_services: crate::tools::spec::RuntimeToolServices {
-                task_manager: self.task_manager.lock().clone(),
-                automations: self.automations.lock().clone(),
-                task_data_dir: Some(self.manager_cfg.task_data_dir.clone()),
-                active_task_id: thread.task_id.clone(),
-                active_thread_id: Some(thread.id.clone()),
-                dynamic_tool_executor: Some(Arc::new(self.clone())),
-                shell_manager: None,
+            // Snapshot and prepare the concrete provider route once so the engine,
+            // route limits, compaction budget, and restored session all agree.
+            let base_config = self.read_config().clone();
+            let route = self.resolved_route_for_thread(&base_config, &thread)?;
+            let provider = route.identity.provider;
+            let route_identity = route.identity;
+            let route_model = route.model;
+            let route_limits = known_route_limits(route.candidate.limits);
+            let cfg = route.config;
+
+            // Resolve the provider-route-aware auto-compaction default unless the
+            // user persisted an explicit preference.
+            let settings = crate::settings::Settings::load().unwrap_or_default();
+            let compaction = runtime_compaction_config(
+                provider,
+                &route_model,
+                route_limits,
+                settings.auto_compact,
+                crate::settings::Settings::auto_compact_explicitly_configured(),
+                settings.auto_compact_threshold_percent,
+            );
+            let network_policy = cfg.network.clone().map(|toml_cfg| {
+                crate::network_policy::NetworkPolicyDecider::with_default_audit(
+                    toml_cfg.into_runtime(),
+                )
+            });
+            let lsp_config = cfg
+                .lsp
+                .clone()
+                .map(crate::config::LspConfigToml::into_runtime);
+            let max_subagents = cfg
+                .max_subagents_for_provider(provider)
+                .clamp(1, MAX_SUBAGENTS);
+            let engine_cfg = EngineConfig {
+                model: route_model.clone(),
+                active_route_limits: route_limits,
+                workspace: thread.workspace.clone(),
+                allow_shell: thread.allow_shell,
+                trust_mode: thread.trust_mode,
+                notes_path: cfg.notes_path(),
+                mcp_config_path: cfg.mcp_config_path(),
+                skills_dir: cfg.skills_dir(),
+                skills_scan_codewhale_only: cfg.skills_config().scan_codewhale_only(),
+                instructions: cfg
+                    .instructions_paths()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                project_context_pack_enabled: cfg.project_context_pack_enabled(),
+                translation_enabled: false,
+                show_thinking: settings.show_thinking,
+                max_steps: 100,
+                max_subagents,
+                max_admitted_subagents: cfg
+                    .max_admitted_subagents_for_provider(provider)
+                    .max(max_subagents),
+                launch_concurrency: cfg.launch_concurrency_for_provider(provider),
+                subagents_enabled: cfg.subagents_enabled_for_provider(provider),
+                features: cfg.features(),
+                auto_review_policy: cfg.auto_review_policy(),
+                compaction,
+                todos: new_shared_todo_list(),
+                plan_state: new_shared_plan_state(),
+                goal_state: crate::tools::goal::new_shared_goal_state(),
+                max_spawn_depth: cfg.subagent_max_spawn_depth_for_provider(provider),
+                subagent_token_budget: cfg.subagent_token_budget_for_provider(provider),
+                network_policy,
+                snapshots_enabled: cfg.snapshots_config().enabled,
+                snapshots_max_workspace_bytes: cfg
+                    .snapshots_config()
+                    .max_workspace_gb
+                    .saturating_mul(1024 * 1024 * 1024),
+                lsp_config,
+                runtime_services: crate::tools::spec::RuntimeToolServices {
+                    task_manager: self.task_manager.lock().clone(),
+                    automations: self.automations.lock().clone(),
+                    task_data_dir: Some(self.manager_cfg.task_data_dir.clone()),
+                    active_task_id: thread.task_id.clone(),
+                    active_thread_id: Some(thread.id.clone()),
+                    dynamic_tool_executor: Some(Arc::new(self.clone())),
+                    shell_manager: None,
+                    hook_executor: None,
+                    handle_store: crate::tools::handle::new_shared_handle_store(),
+                    rlm_sessions: crate::rlm::session::new_shared_rlm_session_store(),
+                },
+                subagent_model_overrides: cfg.subagent_model_overrides(),
+                fleet_roster: Arc::new(crate::fleet::roster::FleetRoster::load(
+                    &cfg.fleet_config(),
+                    &thread.workspace,
+                )),
+                subagent_api_timeout: std::time::Duration::from_secs(
+                    cfg.subagent_api_timeout_secs_for_provider(provider),
+                ),
+                stream_chunk_timeout: std::time::Duration::from_secs(
+                    cfg.stream_chunk_timeout_secs(),
+                ),
+                subagent_heartbeat_timeout: std::time::Duration::from_secs(
+                    cfg.subagent_heartbeat_timeout_secs_for_provider(provider),
+                ),
+                prefer_bwrap: cfg.prefer_bwrap.unwrap_or(false),
+                memory_enabled: cfg.memory_enabled(),
+                moraine_fallback: cfg.moraine_fallback(),
+                memory_path: cfg.memory_path(),
+                speech_output_dir: cfg.speech_output_dir(),
+                vision_config: cfg.vision_model_config(),
+                strict_tool_mode: cfg.strict_tool_mode.unwrap_or(false),
+                goal_objective: None,
+                goal_token_budget: None,
+                goal_status: crate::tools::goal::GoalStatus::Active,
+                allowed_tools: None,
+                disallowed_tools: None,
                 hook_executor: None,
-                handle_store: crate::tools::handle::new_shared_handle_store(),
-                rlm_sessions: crate::rlm::session::new_shared_rlm_session_store(),
-            },
-            subagent_model_overrides: cfg.subagent_model_overrides(),
-            fleet_roster: Arc::new(crate::fleet::roster::FleetRoster::load(
-                &cfg.fleet_config(),
-                &thread.workspace,
-            )),
-            subagent_api_timeout: std::time::Duration::from_secs(
-                cfg.subagent_api_timeout_secs_for_provider(provider),
-            ),
-            stream_chunk_timeout: std::time::Duration::from_secs(cfg.stream_chunk_timeout_secs()),
-            subagent_heartbeat_timeout: std::time::Duration::from_secs(
-                cfg.subagent_heartbeat_timeout_secs_for_provider(provider),
-            ),
-            prefer_bwrap: cfg.prefer_bwrap.unwrap_or(false),
-            memory_enabled: cfg.memory_enabled(),
-            moraine_fallback: cfg.moraine_fallback(),
-            memory_path: cfg.memory_path(),
-            speech_output_dir: cfg.speech_output_dir(),
-            vision_config: cfg.vision_model_config(),
-            strict_tool_mode: cfg.strict_tool_mode.unwrap_or(false),
-            goal_objective: None,
-            goal_token_budget: None,
-            goal_status: crate::tools::goal::GoalStatus::Active,
-            allowed_tools: None,
-            disallowed_tools: None,
-            hook_executor: None,
-            locale_tag: crate::localization::resolve_locale(&settings.locale)
-                .tag()
-                .to_string(),
-            workshop: cfg.workshop.clone(),
-            search_provider: cfg.search_provider(),
-            search_api_key: cfg.search.as_ref().and_then(|s| s.api_key.clone()),
-            search_base_url: cfg.search.as_ref().and_then(|s| s.base_url.clone()),
-            tools_always_load: cfg.tools_always_load(),
-            tools: cfg.tools.clone(),
-            verbosity: cfg.verbosity.clone(),
-            workspace_follow_symlinks: settings.workspace_follow_symlinks,
-            exec_policy_engine: cfg.exec_policy_engine.clone(),
-            terminal_chrome_enabled: false,
-        };
+                locale_tag: crate::localization::resolve_locale(&settings.locale)
+                    .tag()
+                    .to_string(),
+                workshop: cfg.workshop.clone(),
+                search_provider: cfg.search_provider(),
+                search_api_key: cfg.search.as_ref().and_then(|s| s.api_key.clone()),
+                search_base_url: cfg.search.as_ref().and_then(|s| s.base_url.clone()),
+                tools_always_load: cfg.tools_always_load(),
+                tools: cfg.tools.clone(),
+                verbosity: cfg.verbosity.clone(),
+                workspace_follow_symlinks: settings.workspace_follow_symlinks,
+                exec_policy_engine: cfg.exec_policy_engine.clone(),
+                terminal_chrome_enabled: false,
+            };
 
-        let engine = spawn_engine_with_authoritative_route_config(
-            engine_cfg,
-            &cfg,
-            Arc::clone(&self.config),
-        );
+            let engine = spawn_engine_with_authoritative_route_config(
+                engine_cfg,
+                &cfg,
+                Arc::clone(&self.config),
+            );
 
-        // When the thread has an associated session, load the full message history
-        // (including thinking/tool blocks) from the session file. This preserves
-        // process information that `reconstruct_messages_from_turns` would lose.
-        let session_messages = if let Some(ref sid) = thread.session_id {
-            match crate::session_manager::default_sessions_dir() {
-                Ok(sessions_dir) => {
-                    match crate::session_manager::SessionManager::new(sessions_dir) {
-                        Ok(manager) => match manager.load_session(sid) {
-                            Ok(session) => session.messages,
+            // When the thread has an associated session, load the full message history
+            // (including thinking/tool blocks) from the session file. This preserves
+            // process information that `reconstruct_messages_from_turns` would lose.
+            let session_messages = if let Some(ref sid) = thread.session_id {
+                match crate::session_manager::default_sessions_dir() {
+                    Ok(sessions_dir) => {
+                        match crate::session_manager::SessionManager::new(sessions_dir) {
+                            Ok(manager) => match manager.load_session(sid) {
+                                Ok(session) => session.messages,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to load session {} for thread {}: {e}; falling back to turn reconstruction",
+                                        sid,
+                                        thread.id
+                                    );
+                                    let turns = self.store.list_turns_for_thread(&thread.id)?;
+                                    self.reconstruct_messages_from_turns(&turns)?
+                                }
+                            },
                             Err(e) => {
                                 tracing::warn!(
-                                    "Failed to load session {} for thread {}: {e}; falling back to turn reconstruction",
-                                    sid,
-                                    thread.id
+                                    "Failed to open sessions dir: {e}; falling back to turn reconstruction"
                                 );
                                 let turns = self.store.list_turns_for_thread(&thread.id)?;
                                 self.reconstruct_messages_from_turns(&turns)?
                             }
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to open sessions dir: {e}; falling back to turn reconstruction"
-                            );
-                            let turns = self.store.list_turns_for_thread(&thread.id)?;
-                            self.reconstruct_messages_from_turns(&turns)?
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to resolve sessions dir: {e}; falling back to turn reconstruction"
+                        );
+                        let turns = self.store.list_turns_for_thread(&thread.id)?;
+                        self.reconstruct_messages_from_turns(&turns)?
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to resolve sessions dir: {e}; falling back to turn reconstruction"
-                    );
-                    let turns = self.store.list_turns_for_thread(&thread.id)?;
-                    self.reconstruct_messages_from_turns(&turns)?
-                }
+            } else {
+                let turns = self.store.list_turns_for_thread(&thread.id)?;
+                self.reconstruct_messages_from_turns(&turns)?
+            };
+            let sys_prompt = thread
+                .system_prompt
+                .as_ref()
+                .map(|s| SystemPrompt::Text(s.clone()));
+            if !session_messages.is_empty() || sys_prompt.is_some() {
+                engine
+                    .send(Op::SyncSession {
+                        session_id: thread.session_id.clone(),
+                        messages: session_messages,
+                        system_prompt: sys_prompt,
+                        system_prompt_override: thread.system_prompt.is_some(),
+                        model: route_model.clone(),
+                        workspace: thread.workspace.clone(),
+                        mode: parse_mode(&thread.mode),
+                    })
+                    .await
+                    .map_err(|e| anyhow!("Failed to sync thread session: {e}"))?;
             }
-        } else {
-            let turns = self.store.list_turns_for_thread(&thread.id)?;
-            self.reconstruct_messages_from_turns(&turns)?
-        };
-        let sys_prompt = thread
-            .system_prompt
-            .as_ref()
-            .map(|s| SystemPrompt::Text(s.clone()));
-        if !session_messages.is_empty() || sys_prompt.is_some() {
-            engine
-                .send(Op::SyncSession {
-                    session_id: thread.session_id.clone(),
-                    messages: session_messages,
-                    system_prompt: sys_prompt,
-                    system_prompt_override: thread.system_prompt.is_some(),
-                    model: route_model.clone(),
-                    workspace: thread.workspace.clone(),
-                    mode: parse_mode(&thread.mode),
-                })
-                .await
-                .map_err(|e| anyhow!("Failed to sync thread session: {e}"))?;
-        }
 
-        let mut active = self.active.lock().await;
-        let evicted = enforce_lru_capacity(&mut active, self.manager_cfg.max_active_threads);
-        active.engines.insert(
-            thread.id.clone(),
-            ActiveThreadState {
-                engine: engine.clone(),
-                active_turn: None,
-                route_identity,
-                route_model,
-                client_preflight_required: true,
-            },
-        );
-        touch_lru(&mut active.lru, &thread.id);
-        drop(active);
-        for handle in evicted {
-            let _ = handle.send(Op::Shutdown).await;
+            let mut active = self.active.lock().await;
+            if let Some(winner) = active
+                .engines
+                .get(&thread.id)
+                .map(|state| state.engine.clone())
+            {
+                touch_lru(&mut active.lru, &thread.id);
+                drop(active);
+                engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+                let _ = engine.try_send(Op::Shutdown);
+                return Ok(winner);
+            }
+
+            // Atomically compare the record used for construction with the latest
+            // durable record while holding the same active -> thread lock order as
+            // updates. A concurrent workspace/model/session/policy change makes
+            // this engine stale; discard it and rebuild from the new snapshot.
+            let thread_mutation = self.store.thread_mutation.lock();
+            let record_is_current = self.store.load_thread(&thread.id)? == thread;
+            if !record_is_current {
+                drop(thread_mutation);
+                drop(active);
+                engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
+                let _ = engine.try_send(Op::Shutdown);
+                continue;
+            }
+
+            let evicted = enforce_lru_capacity(&mut active, self.manager_cfg.max_active_threads);
+            active.engines.insert(
+                thread.id.clone(),
+                ActiveThreadState {
+                    engine: engine.clone(),
+                    active_turn: None,
+                    route_identity,
+                    route_model,
+                    client_preflight_required: true,
+                },
+            );
+            touch_lru(&mut active.lru, &thread.id);
+            drop(thread_mutation);
+            drop(active);
+            for handle in evicted {
+                let _ = handle.send(Op::Shutdown).await;
+            }
+            return Ok(engine);
         }
-        Ok(engine)
     }
 
     /// Get the engine handle for a thread, loading it if necessary.
@@ -3334,9 +3680,10 @@ impl RuntimeThreadManager {
         let mut compaction_items: HashMap<String, String> = HashMap::new();
         let mut turn_usage: Option<Usage> = None;
         let mut turn_base_url: Option<String> = None;
-        let mut turn_status = RuntimeTurnStatus::Completed;
+        let mut turn_status: Option<RuntimeTurnStatus> = None;
         let mut turn_error: Option<String> = None;
         let mut saw_engine_activity = false;
+        let mut saw_turn_started = false;
 
         loop {
             let event = {
@@ -3349,20 +3696,62 @@ impl RuntimeThreadManager {
                     .await
                     .unwrap_or(false)
                 {
-                    turn_status = RuntimeTurnStatus::Interrupted;
+                    turn_status = Some(RuntimeTurnStatus::Interrupted);
+                    break;
                 }
-                break;
+                bail!("engine event channel closed before turn {turn_id} completed");
             };
 
-            if !matches!(
+            // SyncSession and configuration operations emit control status
+            // receipts on the same channel before SendMessage is processed.
+            // They belong to engine setup, not to the next claimed turn.
+            if !saw_turn_started
+                && matches!(
+                    &event,
+                    EngineEvent::Status { .. }
+                        | EngineEvent::SessionUpdated { .. }
+                        | EngineEvent::AgentList { .. }
+                        | EngineEvent::AgentSpawned { .. }
+                        | EngineEvent::AgentProgress { .. }
+                        | EngineEvent::AgentComplete { .. }
+                )
+            {
+                continue;
+            }
+
+            // Engine configuration and session synchronization can emit
+            // Status/SessionUpdated events before a turn is claimed. Those
+            // control-plane receipts share the engine channel, but they are
+            // not model output and must not make an otherwise empty turn look
+            // successful. Count only events that carry turn-scoped work or
+            // user-visible output.
+            if matches!(
                 &event,
-                EngineEvent::TurnStarted { .. } | EngineEvent::TurnComplete { .. }
+                EngineEvent::MessageStarted { .. }
+                    | EngineEvent::MessageDelta { .. }
+                    | EngineEvent::MessageComplete { .. }
+                    | EngineEvent::ThinkingStarted { .. }
+                    | EngineEvent::ThinkingDelta { .. }
+                    | EngineEvent::ThinkingComplete { .. }
+                    | EngineEvent::ToolCallStarted { .. }
+                    | EngineEvent::ToolCallComplete { .. }
+                    | EngineEvent::CompactionStarted { .. }
+                    | EngineEvent::CompactionCompleted { .. }
+                    | EngineEvent::CompactionFailed { .. }
+                    | EngineEvent::AgentSpawned { .. }
+                    | EngineEvent::AgentProgress { .. }
+                    | EngineEvent::AgentComplete { .. }
+                    | EngineEvent::ApprovalRequired { .. }
+                    | EngineEvent::ElevationRequired { .. }
+                    | EngineEvent::UserInputRequired { .. }
+                    | EngineEvent::Error { .. }
             ) {
                 saw_engine_activity = true;
             }
 
             match event {
                 EngineEvent::TurnStarted { .. } => {
+                    saw_turn_started = true;
                     self.emit_event(
                         &thread_id,
                         Some(&turn_id),
@@ -3602,29 +3991,23 @@ impl RuntimeThreadManager {
                     if let Some(summary) =
                         summary_prompt.as_deref().filter(|s| !s.trim().is_empty())
                     {
-                        match self.get_thread(&thread_id).await {
-                            Ok(mut thread) => {
-                                let merged = merge_summary_into_prompt(
-                                    thread.system_prompt.as_deref(),
-                                    summary,
-                                );
-                                if thread.system_prompt.as_deref() != Some(merged.as_str()) {
-                                    thread.system_prompt = Some(merged);
-                                    thread.updated_at = Utc::now();
-                                    if let Err(e) = self.store.save_thread(&thread) {
-                                        tracing::warn!(
-                                            thread_id = %thread_id,
-                                            "Failed to persist compaction summary to thread record: {e}"
-                                        );
-                                    }
-                                }
+                        let persist_summary = (|| -> Result<()> {
+                            let _thread_mutation = self.store.thread_mutation.lock();
+                            let mut thread = self.store.load_thread(&thread_id)?;
+                            let merged =
+                                merge_summary_into_prompt(thread.system_prompt.as_deref(), summary);
+                            if thread.system_prompt.as_deref() != Some(merged.as_str()) {
+                                thread.system_prompt = Some(merged);
+                                thread.updated_at = Utc::now();
+                                self.store.save_thread(&thread)?;
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    thread_id = %thread_id,
-                                    "Failed to load thread for compaction summary persistence: {e}"
-                                );
-                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = persist_summary {
+                            tracing::warn!(
+                                thread_id = %thread_id,
+                                "Failed to persist compaction summary to thread record: {e}"
+                            );
                         }
                     }
                     if let Some(item_id) = compaction_items.remove(&id) {
@@ -4006,7 +4389,7 @@ impl RuntimeThreadManager {
                     .await?;
                 }
                 EngineEvent::Error { envelope, .. } => {
-                    turn_status = RuntimeTurnStatus::Failed;
+                    turn_status = Some(RuntimeTurnStatus::Failed);
                     turn_error = Some(envelope.message.clone());
                     let message = envelope.message.clone();
                     let item = TurnItemRecord {
@@ -4042,11 +4425,24 @@ impl RuntimeThreadManager {
                 } => {
                     turn_usage = Some(usage);
                     turn_base_url = base_url;
-                    turn_status = match status {
+                    let reported_status = match status {
                         TurnOutcomeStatus::Completed => RuntimeTurnStatus::Completed,
                         TurnOutcomeStatus::Interrupted => RuntimeTurnStatus::Interrupted,
                         TurnOutcomeStatus::Failed => RuntimeTurnStatus::Failed,
                     };
+                    // Some engines emit a categorized Error followed by their
+                    // generic TurnComplete(Completed) cleanup receipt. Keep
+                    // the error authoritative instead of silently converting
+                    // a failed turn back to success.
+                    turn_status = Some(
+                        if turn_status == Some(RuntimeTurnStatus::Failed)
+                            && reported_status == RuntimeTurnStatus::Completed
+                        {
+                            RuntimeTurnStatus::Failed
+                        } else {
+                            reported_status
+                        },
+                    );
                     if let Some(err) = error {
                         turn_error = Some(err);
                     }
@@ -4055,6 +4451,9 @@ impl RuntimeThreadManager {
                 _ => {}
             }
         }
+
+        let mut turn_status = turn_status
+            .expect("turn monitor exits normally only after assigning a terminal status");
 
         if self
             .is_interrupt_requested(&thread_id, &turn_id)
@@ -4143,26 +4542,33 @@ impl RuntimeThreadManager {
         }
 
         let ended_at = Utc::now();
-        let mut turn = self.store.load_turn(&turn_id)?;
-        turn.status = turn_status;
-        turn.ended_at = Some(ended_at);
-        turn.duration_ms = turn.started_at.map(|start| duration_ms(start, ended_at));
-        turn.usage = turn_usage;
-        turn.effective_billing_surface = turn
-            .effective_provider
-            .as_deref()
-            .and_then(ApiProvider::parse)
-            .and_then(|provider| {
-                crate::pricing::billing_surface_for_route(provider, turn_base_url.as_deref())
-            })
-            .map(str::to_string);
-        turn.error = turn_error;
-        self.store.save_turn(&turn)?;
+        let turn = {
+            let _turn_mutation = self.store.turn_mutation.lock();
+            let mut turn = self.store.load_turn(&turn_id)?;
+            turn.status = turn_status;
+            turn.ended_at = Some(ended_at);
+            turn.duration_ms = turn.started_at.map(|start| duration_ms(start, ended_at));
+            turn.usage = turn_usage;
+            turn.effective_billing_surface = turn
+                .effective_provider
+                .as_deref()
+                .and_then(ApiProvider::parse)
+                .and_then(|provider| {
+                    crate::pricing::billing_surface_for_route(provider, turn_base_url.as_deref())
+                })
+                .map(str::to_string);
+            turn.error = turn_error;
+            self.store.save_turn(&turn)?;
+            turn
+        };
 
-        let mut thread = self.get_thread(&thread_id).await?;
-        thread.latest_turn_id = Some(turn_id.clone());
-        thread.updated_at = Utc::now();
-        self.store.save_thread(&thread)?;
+        {
+            let _thread_mutation = self.store.thread_mutation.lock();
+            let mut thread = self.store.load_thread(&thread_id)?;
+            thread.latest_turn_id = Some(turn_id.clone());
+            thread.updated_at = Utc::now();
+            self.store.save_thread(&thread)?;
+        }
 
         self.emit_event(
             &thread_id,
@@ -4190,6 +4596,7 @@ impl RuntimeThreadManager {
     }
 
     fn attach_item_to_turn(&self, turn_id: &str, item_id: &str) -> Result<()> {
+        let _turn_mutation = self.store.turn_mutation.lock();
         let mut turn = self.store.load_turn(turn_id)?;
         if !turn.item_ids.iter().any(|id| id == item_id) {
             turn.item_ids.push(item_id.to_string());
@@ -4576,6 +4983,16 @@ fn duration_ms(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
         0
     } else {
         u64::try_from(millis).unwrap_or(u64::MAX)
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 

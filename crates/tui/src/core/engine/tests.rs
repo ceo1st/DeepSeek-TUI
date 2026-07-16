@@ -307,6 +307,7 @@ async fn goal_continuation_resolves_updated_authoritative_route_after_active_tur
     let engine_config = EngineConfig {
         max_steps: 0,
         snapshots_enabled: false,
+        terminal_chrome_enabled: false,
         goal_objective: Some("keep going".to_string()),
         ..EngineConfig::default()
     };
@@ -390,6 +391,201 @@ async fn goal_continuation_resolves_updated_authoritative_route_after_active_tur
         }
     }
     assert_eq!(starts, 2);
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn host_managed_engine_does_not_self_dispatch_goal_continuation() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom-a".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("custom-a".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let mut runtime_services = crate::tools::spec::RuntimeToolServices::default();
+    runtime_services.active_thread_id = Some("thr_host_managed".to_string());
+    let engine_config = EngineConfig {
+        max_steps: 0,
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        goal_objective: Some("keep going".to_string()),
+        runtime_services,
+        ..EngineConfig::default()
+    };
+    let (engine, handle) = Engine::new(engine_config, &config);
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::SendMessage {
+            content: "one host-owned turn".to_string(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&config, "local-model"),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: Some("keep going".to_string()),
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            translation_enabled: false,
+            show_thinking: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send host-owned goal turn");
+
+    let mut starts = 0;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("host engine event timeout")
+        .expect("host engine event");
+        match event {
+            Event::TurnStarted { .. } => starts += 1,
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(starts, 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .is_err(),
+        "a hosted engine must wait for an explicit durable turn claim"
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() {
+    use crate::tools::subagent::SubAgentCompletion;
+
+    let mut custom = HashMap::new();
+    custom.insert(
+        "custom-a".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("custom-a".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let mut runtime_services = crate::tools::spec::RuntimeToolServices::default();
+    runtime_services.active_thread_id = Some("thr_host_managed".to_string());
+    let engine_config = EngineConfig {
+        max_steps: 0,
+        snapshots_enabled: false,
+        terminal_chrome_enabled: false,
+        runtime_services,
+        ..EngineConfig::default()
+    };
+    let (engine, handle) = Engine::new(engine_config, &config);
+    let tx_subagent_completion = engine.tx_subagent_completion.clone();
+    let run_task = tokio::spawn(engine.run());
+
+    tx_subagent_completion
+        .send(SubAgentCompletion {
+            agent_id: "agent_deferred".to_string(),
+            payload: "deferred child result".to_string(),
+        })
+        .expect("queue sub-agent completion");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .is_err(),
+        "an idle child completion must not create an unclaimed hosted turn"
+    );
+
+    handle
+        .send(Op::SendMessage {
+            content: "claim the next turn".to_string(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&config, "local-model"),
+            compaction: Box::new(CompactionConfig::default()),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: crate::tui::approval::ApprovalMode::Suggest,
+            translation_enabled: false,
+            show_thinking: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
+        .await
+        .expect("send explicit host turn");
+
+    let mut starts = 0;
+    let mut drained_completion = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("host engine event timeout")
+        .expect("host engine event");
+        match event {
+            Event::TurnStarted { .. } => starts += 1,
+            Event::Status { message } => {
+                drained_completion |= message.contains("1 queued sub-agent completion");
+            }
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(starts, 1);
+    assert!(
+        drained_completion,
+        "the next explicit turn must drain the queued child completion"
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
 }
 

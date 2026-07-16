@@ -9,6 +9,7 @@
 //! so the agent loop's mailbox API is reviewable on its own.
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 
 use super::approval::{ApprovalDecision, UserInputDecision};
 use super::{CancelReason, EngineHandle, Op, UserInputResponse};
@@ -36,6 +37,13 @@ impl EngineHandle {
     pub fn try_send(&self, op: Op) -> Result<()> {
         self.tx_op.try_send(op)?;
         Ok(())
+    }
+
+    /// Reserve capacity for a runtime steer before it mutates durable state.
+    /// The owned permit lets the caller persist and dispatch synchronously,
+    /// without a cancellation point between those two operations.
+    pub(crate) async fn reserve_steer(&self) -> Result<mpsc::OwnedPermit<String>> {
+        Ok(self.tx_steer.clone().reserve_owned().await?)
     }
 
     /// Cancel the current request (user-initiated path — keeps the

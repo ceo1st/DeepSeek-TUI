@@ -446,6 +446,415 @@ async fn closed_turn_mailbox_rolls_back_durable_records_and_active_claim() -> Re
 }
 
 #[tokio::test]
+async fn cancellation_while_waiting_for_mailbox_capacity_claims_nothing() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+
+    for _ in 0..32 {
+        harness.handle.try_send(Op::ListSubAgents)?;
+    }
+    let start_sender_count = harness.handle.tx_op.strong_count();
+    let start_manager = manager.clone();
+    let start_thread_id = thread.id.clone();
+    let start_task = tokio::spawn(async move {
+        start_manager
+            .start_turn(
+                &start_thread_id,
+                StartTurnRequest {
+                    prompt: "cancel before mailbox capacity".to_string(),
+                    ..StartTurnRequest::default()
+                },
+            )
+            .await
+    });
+    wait_for_sender_strong_count(&harness.handle.tx_op, start_sender_count + 2).await?;
+    assert!(
+        !start_task.is_finished(),
+        "start should be waiting for capacity"
+    );
+    assert!(manager.store.list_turns_for_thread(&thread.id)?.is_empty());
+    assert_eq!(manager.get_thread(&thread.id).await?.latest_turn_id, None);
+    assert_eq!(manager.active_turn_flags(&thread.id, "missing").await, None);
+    start_task.abort();
+    let _ = start_task.await;
+    for _ in 0..32 {
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::ListSubAgents)
+        ));
+    }
+
+    for _ in 0..32 {
+        harness.handle.try_send(Op::ListSubAgents)?;
+    }
+    let compact_sender_count = harness.handle.tx_op.strong_count();
+    let compact_manager = manager.clone();
+    let compact_thread_id = thread.id.clone();
+    let compact_task = tokio::spawn(async move {
+        compact_manager
+            .compact_thread(&compact_thread_id, CompactThreadRequest::default())
+            .await
+    });
+    wait_for_sender_strong_count(&harness.handle.tx_op, compact_sender_count + 2).await?;
+    assert!(
+        !compact_task.is_finished(),
+        "compaction should be waiting for capacity"
+    );
+    assert!(manager.store.list_turns_for_thread(&thread.id)?.is_empty());
+    assert_eq!(manager.get_thread(&thread.id).await?.latest_turn_id, None);
+    compact_task.abort();
+    let _ = compact_task.await;
+    for _ in 0..32 {
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::ListSubAgents)
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn caller_cancellation_after_engine_acceptance_keeps_owned_turn_lifecycle() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+
+    // Block the first start-event append so the public future remains
+    // cancellable after the operation has entered the engine mailbox.
+    let event_state_guard = manager.store.state.lock().await;
+    let start_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let start_task = tokio::spawn(async move {
+        start_manager
+            .start_turn(
+                &thread_id,
+                StartTurnRequest {
+                    prompt: "the lifecycle outlives its caller".to_string(),
+                    ..StartTurnRequest::default()
+                },
+            )
+            .await
+    });
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), harness.rx_op.recv()).await?,
+        Some(Op::SendMessage { .. })
+    ));
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    assert_eq!(turns.len(), 1);
+    let turn_id = turns[0].id.clone();
+    assert_eq!(turns[0].status, RuntimeTurnStatus::InProgress);
+    assert_eq!(turns[0].item_ids.len(), 1);
+    assert_eq!(
+        manager.store.load_item(&turns[0].item_ids[0])?.turn_id,
+        turn_id
+    );
+    assert!(
+        manager
+            .active_turn_flags(&thread.id, &turn_id)
+            .await
+            .is_some()
+    );
+
+    start_task.abort();
+    let _ = start_task.await;
+    drop(event_state_guard);
+
+    harness
+        .tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::MessageDelta {
+            index: 0,
+            content: "owned monitor is live".to_string(),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::MessageComplete { index: 0 })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn_id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    assert_eq!(manager.active_turn_flags(&thread.id, &turn_id).await, None);
+
+    let lifecycle: Vec<String> = manager
+        .events_since(&thread.id, None)?
+        .iter()
+        .filter(|event| event.turn_id.as_deref() == Some(turn_id.as_str()))
+        .map(|event| event.event.clone())
+        .collect();
+    assert_eq!(
+        &lifecycle[..3],
+        &["turn.started", "item.started", "item.completed"]
+    );
+    assert_eq!(lifecycle.last().map(String::as_str), Some("turn.completed"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_updates_while_start_waits_for_capacity_survive_latest_turn_write() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    for _ in 0..32 {
+        harness.handle.try_send(Op::ListSubAgents)?;
+    }
+    let sender_count = harness.handle.tx_op.strong_count();
+
+    let start_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let start_task = tokio::spawn(async move {
+        start_manager
+            .start_turn(
+                &thread_id,
+                StartTurnRequest {
+                    prompt: "preserve concurrent metadata".to_string(),
+                    ..StartTurnRequest::default()
+                },
+            )
+            .await
+    });
+    wait_for_sender_strong_count(&harness.handle.tx_op, sender_count + 2).await?;
+    assert!(!start_task.is_finished());
+
+    manager
+        .update_thread(
+            &thread.id,
+            UpdateThreadRequest {
+                title: Some("new title while queued".to_string()),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::ListSubAgents)
+    ));
+    let turn = tokio::time::timeout(Duration::from_secs(2), start_task).await???;
+    let mut saw_send = false;
+    for _ in 0..32 {
+        if matches!(harness.rx_op.recv().await, Some(Op::SendMessage { .. })) {
+            saw_send = true;
+            break;
+        }
+    }
+    assert!(
+        saw_send,
+        "accepted send must remain behind refresh operations"
+    );
+
+    harness
+        .tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::MessageDelta {
+            index: 0,
+            content: "metadata retained".to_string(),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::MessageComplete { index: 0 })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    assert_eq!(turn.item_ids.len(), 1);
+    assert!(
+        terminal.item_ids.contains(&turn.item_ids[0]),
+        "the accepted user item must survive later assistant-item writes"
+    );
+    assert_eq!(
+        manager.store.load_turn(&turn.id)?.item_ids,
+        terminal.item_ids
+    );
+    let updated = manager.get_thread(&thread.id).await?;
+    assert_eq!(updated.title.as_deref(), Some("new title while queued"));
+    assert_eq!(updated.latest_turn_id.as_deref(), Some(turn.id.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn execution_update_while_start_waits_rejects_stale_operation() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    for _ in 0..32 {
+        harness.handle.try_send(Op::ListSubAgents)?;
+    }
+    let sender_count = harness.handle.tx_op.strong_count();
+    let start_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let start_task = tokio::spawn(async move {
+        start_manager
+            .start_turn(
+                &thread_id,
+                StartTurnRequest {
+                    prompt: "must not use stale mode".to_string(),
+                    ..StartTurnRequest::default()
+                },
+            )
+            .await
+    });
+    wait_for_sender_strong_count(&harness.handle.tx_op, sender_count + 2).await?;
+
+    manager
+        .update_thread(
+            &thread.id,
+            UpdateThreadRequest {
+                mode: Some(AppMode::Plan.as_setting().to_string()),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::ListSubAgents)
+    ));
+    let error = tokio::time::timeout(Duration::from_secs(2), start_task)
+        .await??
+        .expect_err("stale operation must fail")
+        .to_string();
+    assert!(error.contains("execution settings changed"), "{error}");
+    for _ in 0..31 {
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::ListSubAgents)
+        ));
+    }
+    assert!(harness.rx_op.try_recv().is_err());
+    assert!(manager.store.list_turns_for_thread(&thread.id)?.is_empty());
+    let updated = manager.get_thread(&thread.id).await?;
+    assert_eq!(updated.mode, AppMode::Plan.as_setting());
+    assert_eq!(updated.latest_turn_id, None);
+    assert_eq!(manager.active_turn_flags(&thread.id, "missing").await, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_lifecycle_outlives_caller_and_preserves_concurrent_thread_updates() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    for _ in 0..32 {
+        harness.handle.try_send(Op::ListSubAgents)?;
+    }
+    let sender_count = harness.handle.tx_op.strong_count();
+
+    let compact_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let compact_task = tokio::spawn(async move {
+        compact_manager
+            .compact_thread(&thread_id, CompactThreadRequest::default())
+            .await
+    });
+    wait_for_sender_strong_count(&harness.handle.tx_op, sender_count + 2).await?;
+    assert!(!compact_task.is_finished());
+    manager
+        .update_thread(
+            &thread.id,
+            UpdateThreadRequest {
+                title: Some("title before compact claim".to_string()),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+    // Once capacity is released, block the acknowledgement events so the
+    // API future can be dropped after the engine accepted the operation.
+    let event_state_guard = manager.store.state.lock().await;
+    let mut saw_compact = false;
+    for _ in 0..33 {
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(2), harness.rx_op.recv()).await?,
+            Some(Op::CompactContext { .. })
+        ) {
+            saw_compact = true;
+            break;
+        }
+    }
+    assert!(
+        saw_compact,
+        "manual compaction must enter the engine mailbox"
+    );
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    assert_eq!(turns.len(), 1);
+    let turn_id = turns[0].id.clone();
+    compact_task.abort();
+    let _ = compact_task.await;
+    drop(event_state_guard);
+
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionStarted {
+            id: "manual_owned".to_string(),
+            auto: false,
+            message: "compaction started".to_string(),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::CompactionCompleted {
+            id: "manual_owned".to_string(),
+            auto: false,
+            message: "compaction completed".to_string(),
+            messages_before: Some(4),
+            messages_after: Some(2),
+            summary_prompt: None,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn_id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    assert_eq!(manager.active_turn_flags(&thread.id, &turn_id).await, None);
+    let updated = manager.get_thread(&thread.id).await?;
+    assert_eq!(updated.title.as_deref(), Some("title before compact claim"));
+    assert_eq!(updated.latest_turn_id.as_deref(), Some(turn_id.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_turn_starts_leave_one_claim_and_one_consistent_durable_turn() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
@@ -1198,6 +1607,20 @@ async fn install_mock_engine(
     harness
 }
 
+async fn wait_for_sender_strong_count<T>(
+    sender: &tokio::sync::mpsc::Sender<T>,
+    minimum: usize,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while sender.strong_count() < minimum {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("Timed out waiting for mailbox reservation"))?;
+    Ok(())
+}
+
 async fn wait_for_terminal_turn(
     manager: &RuntimeThreadManager,
     turn_id: &str,
@@ -1898,6 +2321,120 @@ async fn completed_turn_without_engine_output_fails() -> Result<()> {
                 .and_then(Value::as_str)
                 == Some("failed")
     }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let tx_event = harness.tx_event;
+    tokio::spawn(async move {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+            let _ = tx_event
+                .send(EngineEvent::AgentComplete {
+                    id: "stale_agent".to_string(),
+                    result: "stale completion".to_string(),
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::status("Compaction settings updated"))
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::TurnStarted {
+                    turn_id: "engine_empty_after_control_status".to_string(),
+                    created_at: chrono::Utc::now(),
+                    route: None,
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+        }
+    });
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "empty after setup".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+    assert_eq!(terminal.error.as_deref(), Some(EMPTY_TURN_REASON));
+    assert!(
+        manager
+            .store
+            .list_items_for_turn(&turn.id)?
+            .iter()
+            .all(|item| {
+                item.summary != "Compaction settings updated"
+                    && !item.summary.contains("stale_agent")
+            })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_error_remains_failed_after_nominal_turn_complete() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let tx_event = harness.tx_event;
+    tokio::spawn(async move {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+            let _ = tx_event
+                .send(EngineEvent::TurnStarted {
+                    turn_id: "engine_error_then_complete".to_string(),
+                    created_at: chrono::Utc::now(),
+                    route: None,
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::error(
+                    crate::error_taxonomy::ErrorEnvelope::fatal("provider exploded"),
+                ))
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+        }
+    });
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "surface the failure".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+    assert_eq!(terminal.error.as_deref(), Some("provider exploded"));
     Ok(())
 }
 
@@ -3463,6 +4000,309 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
                 .and_then(Value::as_str)
                 == Some("add bullet list")
     }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn steer_receipts_outlive_caller_cancellation_after_engine_acceptance() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let mut rx_steer = harness.rx_steer;
+    let tx_event = harness.tx_event;
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "initial".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(rx_op.recv().await, Some(Op::SendMessage { .. })));
+
+    // Hold publication after durable persistence and mailbox acceptance so the
+    // API future can be cancelled while the detached receipt task is pending.
+    let emit_guard = manager.event_emit.lock().await;
+    let steer_manager = manager.clone();
+    let thread_id = thread.id.clone();
+    let turn_id = turn.id.clone();
+    let steer_task = tokio::spawn(async move {
+        steer_manager
+            .steer_turn(
+                &thread_id,
+                &turn_id,
+                SteerTurnRequest {
+                    prompt: "keep the accepted steer".to_string(),
+                },
+            )
+            .await
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), rx_steer.recv()).await?,
+        Some("keep the accepted steer".to_string())
+    );
+    steer_task.abort();
+    assert!(
+        steer_task
+            .await
+            .expect_err("caller task must be cancelled")
+            .is_cancelled()
+    );
+    drop(emit_guard);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = manager.events_since(&thread.id, None)?;
+        let steered = events.iter().any(|event| event.event == "turn.steered");
+        let completed = events.iter().any(|event| {
+            event.event == "item.completed"
+                && event
+                    .payload
+                    .get("item")
+                    .and_then(|item| item.get("detail"))
+                    .and_then(Value::as_str)
+                    == Some("keep the accepted steer")
+        });
+        if steered && completed {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("detached steer receipts were not persisted after caller cancellation");
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let persisted_turn = manager.store.load_turn(&turn.id)?;
+    assert_eq!(persisted_turn.steer_count, 1);
+    let items = manager.store.list_items_for_turn(&turn.id)?;
+    let steer_item = items
+        .iter()
+        .find(|item| item.detail.as_deref() == Some("keep the accepted steer"))
+        .context("accepted steer item must remain durable")?;
+    assert!(persisted_turn.item_ids.contains(&steer_item.id));
+
+    tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    tx_event
+        .send(EngineEvent::MessageDelta {
+            index: 0,
+            content: "accepted steer completed".to_string(),
+        })
+        .await?;
+    tx_event
+        .send(EngineEvent::MessageComplete { index: 0 })
+        .await?;
+    tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn steer_rejects_a_terminal_durable_turn_without_dispatch_or_item() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let mut rx_steer = harness.rx_steer;
+    let tx_event = harness.tx_event;
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "initial".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(rx_op.recv().await, Some(Op::SendMessage { .. })));
+    let original_item_ids = turn.item_ids.clone();
+    {
+        let _turn_mutation = manager.store.turn_mutation.lock();
+        let mut terminal = manager.store.load_turn(&turn.id)?;
+        terminal.status = RuntimeTurnStatus::Completed;
+        terminal.ended_at = Some(Utc::now());
+        manager.store.save_turn(&terminal)?;
+    }
+
+    let error = manager
+        .steer_turn(
+            &thread.id,
+            &turn.id,
+            SteerTurnRequest {
+                prompt: "must be rejected".to_string(),
+            },
+        )
+        .await
+        .expect_err("terminal turn must reject steering");
+    assert!(error.to_string().contains("no longer in progress"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), rx_steer.recv())
+            .await
+            .is_err(),
+        "rejected terminal steer must not reach the engine"
+    );
+    let persisted = manager.store.load_turn(&turn.id)?;
+    assert_eq!(persisted.steer_count, 0);
+    assert_eq!(persisted.item_ids, original_item_ids);
+    assert_eq!(manager.store.list_items_for_turn(&turn.id)?.len(), 1);
+
+    // Restore the synthetic record and let the real monitor settle normally.
+    {
+        let _turn_mutation = manager.store.turn_mutation.lock();
+        let mut active = manager.store.load_turn(&turn.id)?;
+        active.status = RuntimeTurnStatus::InProgress;
+        active.ended_at = None;
+        manager.store.save_turn(&active)?;
+    }
+    tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    tx_event
+        .send(EngineEvent::MessageDelta {
+            index: 0,
+            content: "terminal rejection test completed".to_string(),
+        })
+        .await?;
+    tx_event
+        .send(EngineEvent::MessageComplete { index: 0 })
+        .await?;
+    tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_event_publication_keeps_live_and_durable_sequence_order() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut live_rx = manager.subscribe_events();
+
+    let mut emitters = Vec::new();
+    for index in 0..24_u64 {
+        let emitter = manager.clone();
+        let thread_id = thread.id.clone();
+        emitters.push(tokio::spawn(async move {
+            emitter
+                .emit_event(
+                    &thread_id,
+                    None,
+                    None,
+                    "test.concurrent",
+                    json!({ "index": index }),
+                )
+                .await
+        }));
+    }
+    for emitter in emitters {
+        emitter.await??;
+    }
+
+    let mut live = Vec::new();
+    for _ in 0..24 {
+        live.push(tokio::time::timeout(Duration::from_secs(2), live_rx.recv()).await??);
+    }
+    assert!(live.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+
+    let durable: Vec<_> = manager
+        .events_since(&thread.id, None)?
+        .into_iter()
+        .filter(|event| event.event == "test.concurrent")
+        .collect();
+    assert_eq!(durable.len(), 24);
+    assert_eq!(
+        live.iter()
+            .map(|event| (event.seq, event.payload.clone()))
+            .collect::<Vec<_>>(),
+        durable
+            .iter()
+            .map(|event| (event.seq, event.payload.clone()))
+            .collect::<Vec<_>>(),
+        "broadcast order must exactly match append order"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn closed_engine_event_stream_fails_turn_items_and_evicts_engine() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let tx_event = harness.tx_event;
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "engine stream will close".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(rx_op.recv().await, Some(Op::SendMessage { .. })));
+    drop(tx_event);
+
+    let terminal = wait_for_terminal_turn(&manager, &turn.id, Duration::from_secs(2)).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Failed);
+    let terminal_error = terminal.error.as_deref().unwrap_or_default();
+    assert!(
+        terminal.error.as_deref().is_some_and(|error| {
+            error.contains("Failed to monitor") || error.contains("without producing any output")
+        }),
+        "unexpected terminal error: {terminal_error:?}"
+    );
+    assert!(
+        manager
+            .store
+            .list_items_for_turn(&turn.id)?
+            .iter()
+            .all(|item| !matches!(
+                item.status,
+                TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::InProgress
+            ))
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if !manager.active.lock().await.engines.contains_key(&thread.id) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("failed engine was not evicted");
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(rx_op.recv().await, Some(Op::Shutdown)));
     Ok(())
 }
 

@@ -1505,10 +1505,17 @@ impl Engine {
             SubAgentCompletion(SubAgentCompletion),
         }
 
+        // RuntimeThreadManager owns durable turn claims and installs a thread
+        // id in runtime services. Only the interactive TUI may autonomously
+        // create a new turn while the engine is otherwise idle; a hosted
+        // engine must wait for its host to claim and explicitly dispatch the
+        // next turn so events cannot be attached to the wrong durable record.
+        let host_managed_turns = self.host_managed_turns();
+
         loop {
             let input = tokio::select! {
                 op = self.rx_op.recv() => op.map(|op| EngineRunInput::Operation(Box::new(op))),
-                completion = self.rx_subagent_completion.recv() => {
+                completion = self.rx_subagent_completion.recv(), if !host_managed_turns => {
                     completion.map(EngineRunInput::SubAgentCompletion)
                 }
             };
@@ -2072,6 +2079,10 @@ impl Engine {
             let mut guard = pool.lock().await;
             guard.shutdown_all().await;
         }
+    }
+
+    fn host_managed_turns(&self) -> bool {
+        self.config.runtime_services.active_thread_id.is_some()
     }
 
     async fn emit_session_updated(&self) {
@@ -3007,14 +3018,13 @@ impl Engine {
         }
 
         // ── Cross-turn goal continuation ───────────────────────────────────
-        // If the turn completed successfully and a goal is still Active (and
-        // under any optional budget), re-dispatch a synthetic continuation
-        // message back into the engine's own op channel. This makes `/goal` a
-        // persistent loop that runs until the model self-reports complete or
-        // blocked, the user pauses/clears, or an optional budget is exhausted.
-        // There is no continuation cap. A Failed or Interrupted turn does NOT
-        // continue — Esc cancels the loop by interrupting the turn.
-        if status == TurnOutcomeStatus::Completed
+        // When the interactive engine owns turn lifecycle, a successful turn
+        // with an active goal re-dispatches a synthetic continuation through
+        // its own op channel. RuntimeThreadManager engines instead yield here:
+        // their host must create the next durable claim before dispatching any
+        // further turn. A Failed or Interrupted turn never continues.
+        if !self.host_managed_turns()
+            && status == TurnOutcomeStatus::Completed
             && let Some(continuation) = self.goal_continuation_if_active()
         {
             // Re-dispatch with the same route/mode/approval settings as
