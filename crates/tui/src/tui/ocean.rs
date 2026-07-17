@@ -167,12 +167,14 @@ impl OceanColumn {
 impl OceanRamp {
     #[must_use]
     pub fn for_theme(theme: &UiTheme) -> Option<Self> {
-        // Solarized Light's Base3 (#fdf6e3) background is part of the named
-        // palette's contract. Tinting it with the underwater field turns the
-        // shell green-grey and no longer renders Solarized Light (#4457).
-        // Keep foreground ambient life, just as the flat treatment does, but
-        // leave the canonical background untouched.
-        if theme.mode == PaletteMode::SolarizedLight {
+        // Solarized Light's canonical Base3 (#fdf6e3) background is part of
+        // the named palette's contract. Tinting it with the underwater field
+        // turns the shell green-grey and no longer renders Solarized Light
+        // (#4457). A non-canonical user-supplied background is a separate
+        // contract and must keep the configured ombre treatment.
+        if theme.mode == PaletteMode::SolarizedLight
+            && theme.surface_bg == crate::palette::SOLARIZED_LIGHT_UI_THEME.surface_bg
+        {
             return None;
         }
 
@@ -180,7 +182,7 @@ impl OceanRamp {
         let seafoam = rgb(theme.accent_secondary).unwrap_or((79, 209, 197));
 
         let (surface, middle, deep) = match theme.mode {
-            PaletteMode::Light => (
+            PaletteMode::Light | PaletteMode::SolarizedLight => (
                 mix(base, seafoam, 0.07),
                 mix(base, seafoam, 0.13),
                 mix(base, (70, 139, 196), 0.18),
@@ -190,7 +192,6 @@ impl OceanRamp {
                 mix(base, (7, 30, 54), 0.40),
                 mix(base, (2, 9, 24), 0.64),
             ),
-            PaletteMode::SolarizedLight => unreachable!("handled above"),
         };
 
         Some(Self {
@@ -348,6 +349,16 @@ mod tests {
 
         assert_eq!(theme.surface_bg, Color::Rgb(0xfd, 0xf6, 0xe3));
         assert_eq!(OceanRamp::for_theme(&theme), None);
+    }
+
+    #[test]
+    fn solarized_light_custom_background_preserves_ombre() {
+        let custom = Color::Rgb(0x1a, 0x1b, 0x26);
+        let theme = crate::palette::SOLARIZED_LIGHT_UI_THEME.with_background_color(custom);
+        let ramp = OceanRamp::for_theme(&theme).expect("custom backgrounds retain ombre");
+
+        assert_ne!(ramp.surface, custom);
+        assert_ne!(ramp.surface, ramp.deep);
     }
 
     #[test]

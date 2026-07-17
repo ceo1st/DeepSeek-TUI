@@ -1840,6 +1840,10 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
         "theme" | "ui_theme" | "background_color" | "background" | "bg" => {
             app.theme_id = crate::palette::ThemeId::from_name(&settings.theme)
                 .unwrap_or(crate::palette::ThemeId::System);
+            app.background_color_override = settings
+                .background_color
+                .as_deref()
+                .and_then(crate::palette::parse_hex_rgb_color);
             app.ui_theme = crate::palette::ui_theme_from_settings(
                 &settings.theme,
                 settings.background_color.as_deref(),
@@ -3799,6 +3803,40 @@ max_concurrent = 4
         assert_eq!(app.theme_id, crate::palette::ThemeId::Grayscale);
         assert_eq!(app.ui_theme.mode, crate::palette::PaletteMode::Grayscale);
         assert!(app.needs_redraw);
+    }
+
+    #[test]
+    fn explicit_default_background_override_survives_theme_preview() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-background-override-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(temp_root.join(".deepseek")).expect("settings dir");
+        let _guard = EnvGuard::new(&temp_root);
+        fs::write(
+            temp_root.join(".deepseek").join("settings.toml"),
+            "theme = \"solarized-light\"\nbackground_color = \"#fdf6e3\"\n",
+        )
+        .expect("seed settings");
+
+        let mut app = create_test_app();
+        let explicit_base3 = ratatui::style::Color::Rgb(0xfd, 0xf6, 0xe3);
+        assert_eq!(app.background_color_override, Some(explicit_base3));
+
+        let result = set_config_value(&mut app, "theme", "dark", false);
+
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_eq!(app.theme_id, crate::palette::ThemeId::Whale);
+        assert_eq!(app.background_color_override, Some(explicit_base3));
+        assert_eq!(app.ui_theme.surface_bg, explicit_base3);
+        assert!(
+            crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme).is_some(),
+            "the explicit surface must retain ombre when previewing another theme"
+        );
     }
 
     #[test]

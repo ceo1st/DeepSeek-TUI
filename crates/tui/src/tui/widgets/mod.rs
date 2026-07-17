@@ -5910,6 +5910,25 @@ mod tests {
     }
 
     #[test]
+    fn solarized_light_custom_background_keeps_ombre() {
+        let mut app = create_test_app();
+        let custom = Color::Rgb(0x1a, 0x1b, 0x26);
+        app.ui_theme = crate::palette::SOLARIZED_LIGHT_UI_THEME.with_background_color(custom);
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Ombre;
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert_ne!(buf[(0, 0)].bg, custom);
+        assert_ne!(
+            buf[(0, 0)].bg,
+            buf[(0, 29)].bg,
+            "custom Solarized Light backgrounds must retain ombre depth"
+        );
+    }
+
+    #[test]
     fn terminal_owned_background_still_carries_foreground_life() {
         let mut app = create_test_app();
         app.ui_theme = crate::palette::TERMINAL_UI_THEME;
