@@ -67,7 +67,9 @@ pub enum ShellStatus {
 pub struct ShellResult {
     pub task_id: Option<String>,
     pub status: ShellStatus,
-    pub exit_code: Option<i32>,
+    /// Lossless process exit status. Windows exception/NTSTATUS values use
+    /// the full unsigned 32-bit range, so an i32 would corrupt them.
+    pub exit_code: Option<i64>,
     pub stdout: String,
     pub stderr: String,
     pub duration_ms: u64,
@@ -108,7 +110,7 @@ pub struct ShellJobSnapshot {
     pub command: String,
     pub cwd: PathBuf,
     pub status: ShellStatus,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub elapsed_ms: u64,
     pub stdout_tail: String,
     pub stderr_tail: String,
@@ -131,7 +133,7 @@ pub struct ShellCompletionEvent {
     pub task_id: String,
     pub command: String,
     pub status: ShellStatus,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub duration_ms: u64,
     pub stdout_tail: String,
     pub stderr_tail: String,
@@ -388,26 +390,38 @@ fn attach_windows_job(child: &Child, command: &str) -> Option<WindowsJob> {
 
 #[derive(Clone, Copy, Debug)]
 struct ShellExitStatus {
-    code: Option<i32>,
+    code: Option<i64>,
     success: bool,
 }
 
 impl ShellExitStatus {
     fn from_std(status: std::process::ExitStatus) -> Self {
         Self {
-            code: status.code(),
+            code: status.code().map(std_exit_code_i64),
             success: status.success(),
         }
     }
 
     #[cfg(not(target_env = "ohos"))]
     fn from_pty(status: portable_pty::ExitStatus) -> Self {
-        let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
         Self {
-            code: Some(code),
+            code: Some(i64::from(status.exit_code())),
             success: status.success(),
         }
     }
+}
+
+#[cfg(windows)]
+fn std_exit_code_i64(code: i32) -> i64 {
+    // std exposes Windows DWORD process statuses through i32. Reinterpret
+    // negative values as their original unsigned bit pattern so codes such
+    // as 0xC0000005 survive JSON, persistence, and diagnostics unchanged.
+    i64::from(code as u32)
+}
+
+#[cfg(not(windows))]
+fn std_exit_code_i64(code: i32) -> i64 {
+    i64::from(code)
 }
 
 impl ShellChild {
@@ -514,7 +528,7 @@ pub struct BackgroundShell {
     pub command: String,
     pub working_dir: PathBuf,
     pub status: ShellStatus,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub started_at: Instant,
     last_output_at: Instant,
     last_observed_output_len: usize,
@@ -695,7 +709,9 @@ impl BackgroundShell {
         let (_, stderr_full, _, _) = self.full_output();
         SandboxManager::was_denied(
             self.sandbox_type,
-            self.exit_code.unwrap_or(-1),
+            self.exit_code
+                .and_then(|code| i32::try_from(code).ok())
+                .unwrap_or(-1),
             &stderr_full,
         )
     }
@@ -1237,6 +1253,7 @@ impl ShellManager {
 
         // Wait with timeout
         if let Some(status) = child.wait_timeout(timeout)? {
+            let status = ShellExitStatus::from_std(status);
             #[cfg(unix)]
             let _ = kill_child_process_group(&mut child);
             #[cfg(windows)]
@@ -1245,7 +1262,10 @@ impl ShellManager {
             let stderr = recv_sync_reader_output(&stderr_rx);
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
             let stderr_str = String::from_utf8_lossy(&stderr).to_string();
-            let exit_code = status.code().unwrap_or(-1);
+            let exit_code = status
+                .code
+                .and_then(|code| i32::try_from(code).ok())
+                .unwrap_or(-1);
 
             // Check if sandbox denied the operation
             let sandbox_denied = SandboxManager::was_denied(sandbox_type, exit_code, &stderr_str);
@@ -1254,12 +1274,12 @@ impl ShellManager {
 
             Ok(ShellResult {
                 task_id: None,
-                status: if status.success() {
+                status: if status.success {
                     ShellStatus::Completed
                 } else {
                     ShellStatus::Failed
                 },
-                exit_code: status.code(),
+                exit_code: status.code,
                 stdout,
                 stderr,
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1296,7 +1316,9 @@ impl ShellManager {
             Ok(ShellResult {
                 task_id: None,
                 status: ShellStatus::TimedOut,
-                exit_code: status.and_then(|s| s.code()),
+                exit_code: status
+                    .map(ShellExitStatus::from_std)
+                    .and_then(|status| status.code),
                 stdout,
                 stderr,
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1374,16 +1396,17 @@ impl ShellManager {
         let windows_job = attach_windows_job(&child, original_command);
 
         if let Some(status) = child.wait_timeout(timeout)? {
+            let status = ShellExitStatus::from_std(status);
             #[cfg(windows)]
             terminate_and_close_windows_job(windows_job);
             Ok(ShellResult {
                 task_id: None,
-                status: if status.success() {
+                status: if status.success {
                     ShellStatus::Completed
                 } else {
                     ShellStatus::Failed
                 },
-                exit_code: status.code(),
+                exit_code: status.code,
                 stdout: String::new(),
                 stderr: String::new(),
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1413,7 +1436,9 @@ impl ShellManager {
             Ok(ShellResult {
                 task_id: None,
                 status: ShellStatus::TimedOut,
-                exit_code: status.and_then(|s| s.code()),
+                exit_code: status
+                    .map(ShellExitStatus::from_std)
+                    .and_then(|status| status.code),
                 stdout: String::new(),
                 stderr: String::new(),
                 duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1923,11 +1948,17 @@ use RUN --mount directives).";
 /// Human-readable exit status for a shell result: the numeric code when the
 /// process returned one, or "terminated by signal" when it did not (rather
 /// than leaking `Some(127)` / `None` Debug output to the user).
-fn exit_code_label(code: Option<i32>) -> String {
-    match code {
-        Some(code) => format!("exit code {code}"),
-        None => "terminated by signal".to_string(),
+fn exit_code_label(code: Option<i64>) -> String {
+    match (code, exit_code_hex(code)) {
+        (Some(code), Some(hex)) => format!("exit code {code} ({hex})"),
+        (Some(code), None) => format!("exit code {code}"),
+        (None, _) => "terminated by signal".to_string(),
     }
+}
+
+fn exit_code_hex(code: Option<i64>) -> Option<String> {
+    code.filter(|code| *code > i64::from(i32::MAX) && *code <= i64::from(u32::MAX))
+        .map(|code| format!("0x{code:08X}"))
 }
 const PYTHON_BUILD_DEPENDENCY_HINT: &str = "Python build dependency missing: setuptools is not \
 available in the active environment. Install the declared build requirements first, for example \
@@ -1938,9 +1969,12 @@ fn attach_cargo_failure_summary(
     command: &str,
     result: &ShellResult,
 ) {
-    if let Some(summary) =
-        summarize_cargo_failure(command, &result.stdout, &result.stderr, result.exit_code)
-    {
+    if let Some(summary) = summarize_cargo_failure(
+        command,
+        &result.stdout,
+        &result.stderr,
+        result.exit_code.and_then(|code| i32::try_from(code).ok()),
+    ) {
         metadata["cargo_failure_summary"] = summary.to_metadata_value();
     }
 }
@@ -2507,7 +2541,7 @@ impl ToolSpec for ExecShellTool {
                         } else {
                             ShellStatus::Failed
                         },
-                        exit_code: Some(output.exit_code),
+                        exit_code: Some(i64::from(output.exit_code)),
                         stdout,
                         stderr,
                         duration_ms: u64::try_from(started.elapsed().as_millis())
@@ -2550,6 +2584,7 @@ impl ToolSpec for ExecShellTool {
 
             let mut metadata = json!({
                 "exit_code": result.exit_code,
+                "exit_code_hex": exit_code_hex(result.exit_code),
                 "status": format!("{:?}", result.status),
                 "duration_ms": result.duration_ms,
                 "sandboxed": true,
@@ -2705,6 +2740,7 @@ impl ToolSpec for ExecShellTool {
 
                 let mut metadata = json!({
                     "exit_code": result.exit_code,
+                    "exit_code_hex": exit_code_hex(result.exit_code),
                     "status": format!("{:?}", result.status),
                     "duration_ms": result.duration_ms,
                     "sandboxed": result.sandboxed,
@@ -2850,6 +2886,7 @@ fn build_shell_delta_tool_result(delta: ShellDeltaResult, context: &ToolContext)
 
     let mut metadata = json!({
         "exit_code": result.exit_code,
+        "exit_code_hex": exit_code_hex(result.exit_code),
         "status": format!("{:?}", result.status),
         "duration_ms": result.duration_ms,
         "sandboxed": result.sandboxed,
@@ -3110,6 +3147,7 @@ impl ToolSpec for ShellCancelTool {
                 "status": format!("{:?}", result.status),
                 "task_id": task_id,
                 "exit_code": result.exit_code,
+                "exit_code_hex": exit_code_hex(result.exit_code),
                 "duration_ms": result.duration_ms,
             })),
         })

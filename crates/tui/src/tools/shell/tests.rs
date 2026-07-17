@@ -21,6 +21,37 @@ fn env_lock() -> &'static Mutex<()> {
 
 const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
 
+#[cfg(not(target_env = "ohos"))]
+#[test]
+fn pty_exit_status_preserves_high_windows_code_losslessly() {
+    let raw = 0xC000_0005;
+    let status = ShellExitStatus::from_pty(portable_pty::ExitStatus::with_exit_code(raw));
+
+    assert!(!status.success);
+    assert_eq!(status.code, Some(i64::from(raw)));
+    assert_eq!(
+        exit_code_label(status.code),
+        "exit code 3221225477 (0xC0000005)"
+    );
+    assert_eq!(exit_code_hex(status.code).as_deref(), Some("0xC0000005"));
+}
+
+#[cfg(not(target_env = "ohos"))]
+#[test]
+fn ordinary_pty_exit_status_keeps_concise_label() {
+    let status = ShellExitStatus::from_pty(portable_pty::ExitStatus::with_exit_code(127));
+
+    assert_eq!(status.code, Some(127));
+    assert_eq!(exit_code_label(status.code), "exit code 127");
+    assert_eq!(exit_code_hex(status.code), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn std_windows_exit_status_reinterprets_signed_dword() {
+    assert_eq!(std_exit_code_i64(0xC000_0005_u32 as i32), 0xC000_0005);
+}
+
 #[cfg(windows)]
 const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
 
@@ -884,6 +915,35 @@ fn shell_delta_result_surfaces_network_restricted_hint() {
             .and_then(Value::as_bool),
         Some(true)
     );
+}
+
+#[test]
+fn shell_delta_result_exposes_lossless_high_exit_code_and_hex() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let mut result = failed_network_shell_result("", "");
+    result.exit_code = Some(0xC000_0005);
+
+    let tool_result = build_shell_delta_tool_result(
+        ShellDeltaResult {
+            command: "echo probe".to_string(),
+            result,
+            stdout_total_len: 0,
+            stderr_total_len: 0,
+        },
+        &ctx,
+    );
+
+    assert!(
+        tool_result
+            .content
+            .contains("exit code 3221225477 (0xC0000005)"),
+        "{}",
+        tool_result.content
+    );
+    let metadata = tool_result.metadata.expect("metadata");
+    assert_eq!(metadata["exit_code"], json!(3221225477_i64));
+    assert_eq!(metadata["exit_code_hex"], json!("0xC0000005"));
 }
 
 #[test]
