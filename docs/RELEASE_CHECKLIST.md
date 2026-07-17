@@ -72,8 +72,10 @@ generic checklist does not enumerate.
 - [ ] `./scripts/release/check-versions.sh` reports
       `Version state OK: workspace=X.Y.Z, npm=X.Y.Z, lockfile in sync.`
 - [ ] `./scripts/release/check-ohos-deps.sh` reports that the OpenHarmony
-      target graph does not pull the unsupported `nix` 0.28/0.29,
-      `portable-pty`, `starlark`, `arboard`, or `keyring` crates.
+      Windows linker keeps the target/sysroot flags, the target enables the
+      `rquickjs-sys` bindgen edge, and its graph does not pull the unsupported
+      `nix` 0.28/0.29, `portable-pty`, `starlark`, `arboard`, or `keyring`
+      crates.
 
 ## 3. Preflight gates
 

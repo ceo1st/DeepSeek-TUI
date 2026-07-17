@@ -88,6 +88,12 @@ site's draft, feed, login, and content-watch boundaries.
 - Keep the Hotbar Setup action list synchronized with keyboard focus when the
   selection moves beyond the visible rows, including Down past `/export`
   (#4418).
+- Route Windows OpenHarmony Cargo links through the repository's target-aware
+  clang launcher so the final Rust link keeps its target, sysroot, and MUSL
+  flags, and extend the no-SDK release guard to protect that contract. This
+  completes [@shenjackyuanjie](https://github.com/shenjackyuanjie)'s PR #4470
+  setup alongside [@shenyongqing](https://github.com/shenyongqing)'s original
+  bindgen approach in PR #4384.
 - Reconcile the website roadmap with reality: the retired share-link
   direction is now an explicit non-goal, Workrooms is the considered
   direction, and the local web client appears as underway, in English and

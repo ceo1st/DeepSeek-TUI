@@ -15,6 +15,63 @@ target="${1:-aarch64-unknown-linux-ohos}"
 package="${CODEWHALE_OHOS_DEP_PACKAGE:-codewhale-tui}"
 workflow_js_package="${CODEWHALE_OHOS_WORKFLOW_JS_PACKAGE:-codewhale-workflow-js}"
 
+require_literal() {
+  local file="$1"
+  local literal="$2"
+  local description="$3"
+
+  if ! grep -qF -- "${literal}" "${file}"; then
+    echo "::error::OHOS Windows linker contract lost ${description}: ${file}" >&2
+    return 1
+  fi
+}
+
+# Cargo invokes its configured linker directly. On Windows that entry point
+# must be the repository launcher, not the SDK's bare clang.exe, so the final
+# Rust link receives the OHOS target, sysroot, and musl flags as reliably as C,
+# C++, and bindgen invocations do. This is a static, no-SDK contract check; the
+# launcher delegates to the PowerShell compiler wrapper that validates the SDK
+# and preserves Cargo's linker arguments and exit status.
+require_literal \
+  scripts/ohos-env.ps1 \
+  '$linker = [System.IO.Path]::Combine($PSScriptRoot, "ohos", "ohos-clang.cmd")' \
+  "the repository-local linker launcher"
+require_literal \
+  scripts/ohos-env.ps1 \
+  '$env:CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER = $linker' \
+  "Cargo's target-specific linker assignment"
+require_literal \
+  scripts/ohos-env.ps1 \
+  '$env:OHOS_NATIVE_SDK = $sdk' \
+  "the absolute SDK path inherited by Cargo"
+require_literal \
+  scripts/ohos/ohos-clang.cmd \
+  'ohos-clang.ps1' \
+  "the cmd-to-PowerShell delegation"
+require_literal \
+  scripts/ohos/ohos-clang.cmd \
+  '-File "%OHOS_LINKER_SCRIPT%" %*' \
+  "linker argument forwarding"
+require_literal \
+  scripts/ohos/ohos-clang.cmd \
+  'exit /b %ERRORLEVEL%' \
+  "PowerShell exit-status propagation"
+require_literal \
+  scripts/ohos/ohos-clang.ps1 \
+  '& $clang -target aarch64-linux-ohos "--sysroot=$sysroot" -D__MUSL__ @args' \
+  "the target/sysroot/musl linker flags"
+require_literal \
+  scripts/ohos/ohos-clang.ps1 \
+  'exit $LASTEXITCODE' \
+  "native linker exit-status propagation"
+
+if grep -qF -- '$env:CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER = $clang' scripts/ohos-env.ps1; then
+  echo "::error::OHOS Windows Cargo linker points directly at clang.exe instead of the target-aware wrapper." >&2
+  exit 1
+fi
+
+echo "OHOS Windows linker wrapper contract OK."
+
 cargo_tree_with_retry() {
   local package="$1"
   shift

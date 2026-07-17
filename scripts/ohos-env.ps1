@@ -16,18 +16,24 @@ if (-not (Test-Path -LiteralPath $env:OHOS_NATIVE_SDK -PathType Container -Error
 }
 
 $sdk = (Resolve-Path -LiteralPath $env:OHOS_NATIVE_SDK -ErrorAction Stop).Path
+$env:OHOS_NATIVE_SDK = $sdk
 $clang = [System.IO.Path]::Combine($sdk, "llvm", "bin", "clang.exe")
 $clangxx = [System.IO.Path]::Combine($sdk, "llvm", "bin", "clang++.exe")
 $ar = [System.IO.Path]::Combine($sdk, "llvm", "bin", "llvm-ar.exe")
 $libclang = [System.IO.Path]::Combine($sdk, "llvm", "bin", "libclang.dll")
 $sysroot = [System.IO.Path]::Combine($sdk, "sysroot")
 $cmakeToolchain = [System.IO.Path]::Combine($sdk, "build", "cmake", "ohos.toolchain.cmake")
+$linker = [System.IO.Path]::Combine($PSScriptRoot, "ohos", "ohos-clang.cmd")
 
 $requiredFiles = @($clang, $clangxx, $ar, $libclang, $cmakeToolchain)
 foreach ($path in $requiredFiles) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction SilentlyContinue)) {
         Stop-OhosEnv "required OpenHarmony SDK file is missing: $path"
     }
+}
+
+if (-not (Test-Path -LiteralPath $linker -PathType Leaf -ErrorAction SilentlyContinue)) {
+    Stop-OhosEnv "required repository linker wrapper is missing: $linker"
 }
 
 if (-not (Test-Path -LiteralPath $sysroot -PathType Container -ErrorAction SilentlyContinue)) {
@@ -38,7 +44,7 @@ $target = "aarch64_unknown_linux_ohos"
 $targetUpper = "AARCH64_UNKNOWN_LINUX_OHOS"
 $commonFlags = "-target aarch64-linux-ohos --sysroot=`"$sysroot`" -D__MUSL__"
 
-$env:CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER = $clang
+$env:CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER = $linker
 $env:AR_aarch64_unknown_linux_ohos = $ar
 $env:CC_aarch64_unknown_linux_ohos = $clang
 $env:CXX_aarch64_unknown_linux_ohos = $clangxx
