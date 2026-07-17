@@ -15,6 +15,7 @@ mod qa_harness;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -955,6 +956,90 @@ fn paste_bracketed_from_macos_client_into_linux_ssh_stays_in_composer() -> anyho
         !frame.contains("Working") && !frame.contains("thinking"),
         "SSH bracketed paste unexpectedly submitted a turn:\n{dump}"
     );
+
+    let _ = h.shutdown();
+    Ok(())
+}
+
+/// End-to-end regression for SSH inside stock tmux: make a real Codewhale
+/// selection, press the in-app Ctrl+C binding, and verify the text reaches the
+/// tmux paste buffer through `load-buffer -w`. A stock `/dev/null` tmux config
+/// keeps `allow-passthrough` off, which is the case the old DCS wrapper lost.
+#[test]
+fn copy_selection_over_ssh_uses_default_tmux_clipboard_path() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+    if !Command::new("tmux")
+        .arg("-V")
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        eprintln!("skipping SSH tmux PTY test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let socket = format!("codewhale-pty-{}-{nonce}", std::process::id());
+    struct TmuxServer(String);
+    impl Drop for TmuxServer {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", self.0.as_str(), "kill-server"])
+                .status();
+        }
+    }
+    let server = TmuxServer(socket);
+    let started = Command::new("tmux")
+        .args([
+            "-L",
+            server.0.as_str(),
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+        ])
+        .status()?;
+    anyhow::ensure!(started.success(), "isolated tmux server failed to start");
+    let tmux_env = Command::new("tmux")
+        .args([
+            "-L",
+            server.0.as_str(),
+            "display-message",
+            "-p",
+            "-t",
+            "0",
+            "#{socket_path},#{session_id},#{window_id}",
+        ])
+        .output()?;
+    anyhow::ensure!(tmux_env.status.success(), "could not resolve TMUX value");
+    let tmux_env = String::from_utf8(tmux_env.stdout)?.trim().to_string();
+    let path = std::env::var("PATH").unwrap_or_default();
+
+    let ws = make_sealed_workspace()?;
+    let (_ws, mut h) = spawn_minimal_with_env(
+        ws,
+        &[
+            ("SSH_CONNECTION", "192.0.2.10 51234 192.0.2.20 22"),
+            ("TMUX", tmux_env.as_str()),
+            ("PATH", path.as_str()),
+        ],
+    )?;
+    h.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+
+    let text = "copy-over-ssh-tmux";
+    h.send(keys::key::text(text))?;
+    h.wait_for_text(text, KEY_TIMEOUT)?;
+    let shift_left = b"\x1b[1;2D".repeat(text.chars().count());
+    h.send(&shift_left)?;
+    h.send(b"\x03")?; // Ctrl+C in raw mode.
+    h.wait_for_text("Selection copied", KEY_TIMEOUT)?;
+
+    let buffer = Command::new("tmux")
+        .args(["-L", server.0.as_str(), "show-buffer"])
+        .output()?;
+    anyhow::ensure!(buffer.status.success(), "tmux buffer could not be read");
+    assert_eq!(buffer.stdout, text.as_bytes());
 
     let _ = h.shutdown();
     Ok(())

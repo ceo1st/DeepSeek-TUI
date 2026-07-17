@@ -278,7 +278,10 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Clipboard,
     },
     KeybindingEntry {
-        chord: "Cmd+C / Ctrl+Shift+C",
+        // Terminal-native copy chords are normally consumed by the local
+        // terminal and never become Codewhale key events. Ctrl+C is the
+        // reliable in-app copy path when a Codewhale selection is active.
+        chord: "Ctrl+C (selection)",
         description_id: crate::localization::MessageId::KbCopySelection,
         section: KeybindingSection::Clipboard,
     },
@@ -349,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_help_is_terminal_client_neutral_for_ssh() {
+    fn clipboard_help_distinguishes_terminal_paste_from_in_app_copy() {
         let paste = KEYBINDINGS
             .iter()
             .find(|entry| entry.description_id == crate::localization::MessageId::KbPasteAttach)
@@ -361,8 +364,9 @@ mod tests {
 
         assert!(paste.chord.contains("Cmd+V"));
         assert!(paste.chord.contains("Ctrl+Shift+V"));
-        assert!(copy.chord.contains("Cmd+C"));
-        assert!(copy.chord.contains("Ctrl+Shift+C"));
+        assert_eq!(copy.chord, "Ctrl+C (selection)");
+        assert!(!copy.chord.contains("Cmd+C"));
+        assert!(!copy.chord.contains("Ctrl+Shift+C"));
     }
 
     #[test]

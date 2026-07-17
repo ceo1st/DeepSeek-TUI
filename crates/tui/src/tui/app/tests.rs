@@ -2961,10 +2961,14 @@ fn ssh_direct_clipboard_paste_points_to_terminal_owned_bracketed_paste() {
     assert!(hint.contains("Cmd+V on macOS"));
     assert!(hint.contains("Ctrl+Shift+V on Linux/Windows"));
 
+    app.ui_locale = Locale::Ja;
     app.status_message = None;
     assert!(!app.paste_api_key_from_clipboard());
     assert!(app.api_key_input.is_empty());
-    assert_eq!(app.status_message.as_deref(), Some(hint.as_str()));
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some(tr(Locale::Ja, MessageId::ClipboardSshPasteHint).as_ref())
+    );
 }
 
 #[test]

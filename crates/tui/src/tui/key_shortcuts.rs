@@ -21,9 +21,9 @@ pub(super) fn has_control_like_modifier_for_platform(
         || (is_macos && modifiers.contains(KeyModifiers::SUPER))
 }
 
-/// Copy-to-clipboard: accept both `Cmd+C` and `Ctrl+Shift+C` regardless of the
-/// compiled host OS. Over SSH, the terminal client and the Codewhale host can
-/// be different operating systems.
+/// Compatibility path for enhanced terminal clients that forward `Cmd+C` or
+/// `Ctrl+Shift+C` as key events. Most terminals consume these locally, so the
+/// user-visible Codewhale binding remains `Ctrl+C` with an active selection.
 pub(super) fn is_copy_shortcut(key: &KeyEvent) -> bool {
     let is_c = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
     if !is_c {
@@ -146,7 +146,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clipboard_shortcuts_follow_terminal_client_not_compiled_host() {
+    fn enhanced_keyboard_clipboard_events_are_accepted_cross_platform() {
         let mac_copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
         let mac_paste = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER);
         let linux_copy = KeyEvent::new(

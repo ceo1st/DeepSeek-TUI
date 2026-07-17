@@ -8,15 +8,12 @@
 //! them in the request).
 
 use std::ffi::OsStr;
+#[cfg(any(not(test), all(test, unix)))]
+use std::io::Write;
 #[cfg(not(test))]
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-#[cfg(any(
-    all(test, unix),
-    all(not(test), target_os = "macos"),
-    all(not(test), target_os = "windows"),
-    all(not(test), target_os = "linux", not(target_env = "ohos"))
-))]
+#[cfg(any(not(test), all(test, unix)))]
 use std::process::{Command, Stdio};
 #[cfg(any(
     target_os = "macos",
@@ -41,13 +38,24 @@ use base64::Engine as _;
 use image::{ImageBuffer, Rgba};
 
 const OSC52_MAX_BYTES: usize = 100 * 1024;
-const REMOTE_PASTE_HINT: &str =
-    "SSH paste uses your local terminal: press Cmd+V on macOS or Ctrl+Shift+V on Linux/Windows.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardEndpoint {
+    /// The TUI and desktop clipboard live on the same host.
+    NativeHost,
+    /// SSH exported a graphical display (X11 or Wayland), so the native
+    /// clipboard intentionally addresses that forwarded display.
+    ForwardedDisplay,
+    /// No graphical endpoint is available over SSH. Clipboard transfer must
+    /// be requested from the terminal client instead.
+    TerminalClient,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardWriteOrder {
-    /// An SSH TUI must target the terminal client. A native clipboard on the
-    /// remote host can succeed while writing to the wrong machine.
+    /// An SSH TUI without an exported graphical display must target the
+    /// terminal client. A native clipboard on the remote host can succeed
+    /// while writing to the wrong machine.
     TerminalClientOnly,
     /// A local TUI should prefer the native clipboard (including images) and
     /// retain OSC 52 as the terminal fallback.
@@ -56,7 +64,7 @@ enum ClipboardWriteOrder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TerminalClipboardContext {
-    in_ssh_session: bool,
+    endpoint: ClipboardEndpoint,
     in_tmux: bool,
 }
 
@@ -65,11 +73,17 @@ impl TerminalClipboardContext {
         let ssh_client = std::env::var_os("SSH_CLIENT");
         let ssh_connection = std::env::var_os("SSH_CONNECTION");
         let ssh_tty = std::env::var_os("SSH_TTY");
+        let display = std::env::var_os("DISPLAY");
+        let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+        let ssh_clipboard = std::env::var_os("CODEWHALE_SSH_CLIPBOARD");
         let tmux = std::env::var_os("TMUX");
         Self::from_env_values(
             ssh_client.as_deref(),
             ssh_connection.as_deref(),
             ssh_tty.as_deref(),
+            display.as_deref(),
+            wayland_display.as_deref(),
+            ssh_clipboard.as_deref(),
             tmux.as_deref(),
         )
     }
@@ -78,25 +92,56 @@ impl TerminalClipboardContext {
         ssh_client: Option<&OsStr>,
         ssh_connection: Option<&OsStr>,
         ssh_tty: Option<&OsStr>,
+        display: Option<&OsStr>,
+        wayland_display: Option<&OsStr>,
+        ssh_clipboard: Option<&OsStr>,
         tmux: Option<&OsStr>,
     ) -> Self {
+        let in_ssh_session = [ssh_client, ssh_connection, ssh_tty]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_empty());
+        let has_graphical_display = [display, wayland_display]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_empty());
+        let forwarded_x11 = display.and_then(OsStr::to_str).is_some_and(|value| {
+            ["localhost:", "127.0.0.1:", "[::1]:", "::1:"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+        });
+        let use_graphical_display = match ssh_clipboard.and_then(OsStr::to_str) {
+            Some("graphical") => has_graphical_display,
+            Some("terminal") => false,
+            _ => forwarded_x11,
+        };
+
         Self {
             // OpenSSH normally exports SSH_CLIENT and SSH_CONNECTION. SSH_TTY
             // is limited to PTY sessions, so it cannot be the only signal.
-            in_ssh_session: [ssh_client, ssh_connection, ssh_tty]
-                .into_iter()
-                .flatten()
-                .any(|value| !value.is_empty()),
+            endpoint: match (in_ssh_session, use_graphical_display) {
+                (false, _) => ClipboardEndpoint::NativeHost,
+                (true, true) => ClipboardEndpoint::ForwardedDisplay,
+                (true, false) => ClipboardEndpoint::TerminalClient,
+            },
             in_tmux: tmux.is_some_and(|value| !value.is_empty()),
         }
     }
 
     fn write_order(self) -> ClipboardWriteOrder {
-        if self.in_ssh_session {
+        if self.endpoint == ClipboardEndpoint::TerminalClient {
             ClipboardWriteOrder::TerminalClientOnly
         } else {
             ClipboardWriteOrder::NativeHostThenTerminal
         }
+    }
+
+    fn permits_native_read(self) -> bool {
+        self.endpoint != ClipboardEndpoint::TerminalClient
+    }
+
+    fn requires_terminal_paste(self) -> bool {
+        self.endpoint == ClipboardEndpoint::TerminalClient
     }
 }
 
@@ -190,18 +235,21 @@ impl ClipboardHandler {
     #[cfg(test)]
     pub(crate) fn for_test(in_ssh_session: bool, in_tmux: bool) -> Self {
         Self::with_terminal_context(TerminalClipboardContext {
-            in_ssh_session,
+            endpoint: if in_ssh_session {
+                ClipboardEndpoint::TerminalClient
+            } else {
+                ClipboardEndpoint::NativeHost
+            },
             in_tmux,
         })
     }
 
-    /// SSH cannot synchronously read the terminal client's clipboard. Paste
-    /// must be initiated by the local terminal so it arrives as bracketed
-    /// paste (or a raw paste burst on older terminals).
-    pub(crate) fn terminal_paste_hint(&self) -> Option<&'static str> {
-        self.terminal_context
-            .in_ssh_session
-            .then_some(REMOTE_PASTE_HINT)
+    /// SSH without a forwarded graphical display cannot synchronously read
+    /// the terminal client's clipboard. Paste must be initiated by the local
+    /// terminal so it arrives as bracketed paste (or a raw paste burst on
+    /// older terminals).
+    pub(crate) fn requires_terminal_paste(&self) -> bool {
+        self.terminal_context.requires_terminal_paste()
     }
 
     /// Try to connect to the system clipboard, bounded by a short timeout.
@@ -238,11 +286,10 @@ impl ClipboardHandler {
     /// `workspace` is used as a fallback location when `~/.codewhale/` cannot
     /// be resolved (e.g. running with a stripped HOME in CI sandboxes).
     pub fn read(&mut self, workspace: &Path) -> Option<ClipboardContent> {
-        // In SSH, wl-paste/arboard address the remote host (or an unrelated
-        // forwarded display), not the keyboard user's terminal clipboard.
-        // The terminal-owned bracketed-paste path is handled in ui.rs before
-        // this direct-read fallback is considered.
-        if self.terminal_context.in_ssh_session {
+        // With no display exported over SSH there is no synchronously readable
+        // clipboard endpoint. A forwarded X11/Wayland display is explicit and
+        // remains readable, including its image clipboard.
+        if !self.terminal_context.permits_native_read() {
             return None;
         }
 
@@ -285,7 +332,7 @@ impl ClipboardHandler {
         #[cfg(not(test))]
         {
             if self.terminal_context.write_order() == ClipboardWriteOrder::TerminalClientOnly {
-                return write_text_with_osc52(text, self.terminal_context.in_tmux)
+                return write_text_to_terminal_client(text, self.terminal_context.in_tmux)
                     .map_err(|err| anyhow::anyhow!("Clipboard unavailable: {err}"));
             }
 
@@ -318,7 +365,7 @@ impl ClipboardHandler {
                 return Ok(());
             }
 
-            write_text_with_osc52(text, self.terminal_context.in_tmux)
+            write_text_to_terminal_client(text, self.terminal_context.in_tmux)
                 .map_err(|err| anyhow::anyhow!("Clipboard unavailable: {err}"))
         }
     }
@@ -421,30 +468,81 @@ fn write_text_with_wlcopy_using_argv(program: &str, text: &str) -> Result<()> {
 }
 
 #[cfg(not(test))]
-fn write_text_with_osc52(text: &str, in_tmux: bool) -> Result<()> {
+fn write_text_to_terminal_client(text: &str, in_tmux: bool) -> Result<()> {
+    if in_tmux {
+        return write_text_with_tmux(text);
+    }
+    write_text_with_osc52(text)
+}
+
+#[cfg(not(test))]
+fn write_text_with_tmux(text: &str) -> Result<()> {
+    write_text_with_tmux_using_argv("tmux", &[], text)
+}
+
+/// Ask tmux to set both its paste buffer and the attached client's clipboard.
+/// Unlike DCS passthrough, `load-buffer -w` works with tmux's default
+/// `allow-passthrough off` policy and returns a non-zero status when tmux
+/// cannot honor the command.
+#[cfg(any(not(test), all(test, unix)))]
+fn write_text_with_tmux_using_argv(program: &str, prefix_args: &[&str], text: &str) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(prefix_args)
+        .args(["load-buffer", "-w", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to run tmux load-buffer -w: {e}"))?;
+
+    let write_result = child
+        .stdin
+        .take()
+        .context("open tmux clipboard input")
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(text.as_bytes())
+                .context("write tmux clipboard input")
+        });
+    let output = child
+        .wait_with_output()
+        .context("wait for tmux load-buffer -w")?;
+    write_result?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        if detail.is_empty() {
+            bail!("tmux load-buffer -w exited with {}", output.status);
+        }
+        bail!(
+            "tmux load-buffer -w exited with {}: {detail}",
+            output.status
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn write_text_with_osc52(text: &str) -> Result<()> {
     let mut stdout = io::stdout();
     if !stdout.is_terminal() {
         bail!("OSC 52 clipboard fallback requires a terminal");
     }
 
-    let sequence = osc52_sequence(text, in_tmux)?;
+    let sequence = osc52_sequence(text)?;
     stdout
         .write_all(sequence.as_bytes())
         .context("write OSC 52 clipboard sequence")?;
     stdout.flush().context("flush OSC 52 clipboard sequence")
 }
 
-fn osc52_sequence(text: &str, in_tmux: bool) -> Result<String> {
+fn osc52_sequence(text: &str) -> Result<String> {
     if text.len() > OSC52_MAX_BYTES {
         bail!("selection is too large for OSC 52 clipboard fallback");
     }
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let sequence = format!("\x1b]52;c;{encoded}\x07");
-    if in_tmux {
-        return Ok(format!("\x1bPtmux;\x1b{sequence}\x1b\\"));
-    }
-    Ok(sequence)
+    Ok(format!("\x1b]52;c;{encoded}\x07"))
 }
 
 /// Resolve the directory pasted images should land in. Prefers
@@ -617,10 +715,16 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         );
         let connection = TerminalClipboardContext::from_env_values(
             None,
             Some(OsStr::new("192.0.2.10 51234 192.0.2.20 22")),
+            None,
+            None,
+            None,
             None,
             None,
         );
@@ -629,62 +733,217 @@ mod tests {
             None,
             Some(OsStr::new("/dev/pts/4")),
             None,
+            None,
+            None,
+            None,
         );
         let empty = TerminalClipboardContext::from_env_values(
             Some(OsStr::new("")),
             Some(OsStr::new("")),
             Some(OsStr::new("")),
             Some(OsStr::new("")),
+            Some(OsStr::new("")),
+            Some(OsStr::new("")),
+            Some(OsStr::new("")),
         );
 
-        assert!(client.in_ssh_session);
-        assert!(connection.in_ssh_session);
-        assert!(tty.in_ssh_session);
-        assert!(!empty.in_ssh_session);
+        assert_eq!(client.endpoint, ClipboardEndpoint::TerminalClient);
+        assert_eq!(connection.endpoint, ClipboardEndpoint::TerminalClient);
+        assert_eq!(tty.endpoint, ClipboardEndpoint::TerminalClient);
+        assert_eq!(empty.endpoint, ClipboardEndpoint::NativeHost);
         assert!(!empty.in_tmux);
     }
 
     #[test]
-    fn ssh_copy_targets_terminal_client_before_native_host_clipboards() {
+    fn ssh_without_display_targets_terminal_client() {
         let remote_tmux = TerminalClipboardContext::from_env_values(
             Some(OsStr::new("192.0.2.10 51234 22")),
             None,
             None,
+            None,
+            None,
+            None,
             Some(OsStr::new("/tmp/tmux-1000/default,1,0")),
         );
-        let local = TerminalClipboardContext::from_env_values(None, None, None, None);
+        let local =
+            TerminalClipboardContext::from_env_values(None, None, None, None, None, None, None);
 
         assert_eq!(
             remote_tmux.write_order(),
             ClipboardWriteOrder::TerminalClientOnly
         );
+        assert!(!remote_tmux.permits_native_read());
+        assert!(remote_tmux.requires_terminal_paste());
         assert!(remote_tmux.in_tmux);
         assert_eq!(
             local.write_order(),
             ClipboardWriteOrder::NativeHostThenTerminal
         );
+        assert!(local.permits_native_read());
+        assert!(!local.requires_terminal_paste());
+    }
+
+    #[test]
+    fn ssh_uses_forwarded_x11_or_explicit_graphical_clipboard_endpoint() {
+        let x11 = TerminalClipboardContext::from_env_values(
+            None,
+            Some(OsStr::new("192.0.2.10 51234 192.0.2.20 22")),
+            None,
+            Some(OsStr::new("localhost:10.0")),
+            None,
+            None,
+            None,
+        );
+        let wayland = TerminalClipboardContext::from_env_values(
+            Some(OsStr::new("192.0.2.10 51234 22")),
+            None,
+            None,
+            None,
+            Some(OsStr::new("wayland-1")),
+            Some(OsStr::new("graphical")),
+            None,
+        );
+
+        for context in [x11, wayland] {
+            assert_eq!(context.endpoint, ClipboardEndpoint::ForwardedDisplay);
+            assert_eq!(
+                context.write_order(),
+                ClipboardWriteOrder::NativeHostThenTerminal
+            );
+            assert!(context.permits_native_read());
+            assert!(!context.requires_terminal_paste());
+        }
+
+        let ambient_remote = TerminalClipboardContext::from_env_values(
+            Some(OsStr::new("192.0.2.10 51234 22")),
+            None,
+            None,
+            Some(OsStr::new(":0")),
+            Some(OsStr::new("wayland-0")),
+            None,
+            None,
+        );
+        assert_eq!(ambient_remote.endpoint, ClipboardEndpoint::TerminalClient);
+
+        let forced_terminal = TerminalClipboardContext::from_env_values(
+            Some(OsStr::new("192.0.2.10 51234 22")),
+            None,
+            None,
+            Some(OsStr::new("localhost:10.0")),
+            None,
+            Some(OsStr::new("terminal")),
+            None,
+        );
+        assert_eq!(forced_terminal.endpoint, ClipboardEndpoint::TerminalClient);
     }
 
     #[test]
     fn osc52_sequence_encodes_text_clipboard_write() {
-        let sequence = osc52_sequence("hello", false).expect("sequence");
+        let sequence = osc52_sequence("hello").expect("sequence");
         assert_eq!(sequence, "\x1b]52;c;aGVsbG8=\x07");
-    }
-
-    #[test]
-    fn osc52_sequence_wraps_for_tmux_passthrough() {
-        let sequence = osc52_sequence("copy", true).expect("sequence");
-        assert_eq!(sequence, "\x1bPtmux;\x1b\x1b]52;c;Y29weQ==\x07\x1b\\");
     }
 
     #[test]
     fn osc52_sequence_rejects_oversized_selection() {
         let text = "x".repeat(OSC52_MAX_BYTES + 1);
-        let err = osc52_sequence(&text, false).expect_err("oversized should fail");
+        let err = osc52_sequence(&text).expect_err("oversized should fail");
         assert!(
             err.to_string().contains("too large"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_helper_reports_command_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tmux");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+cat >/dev/null
+echo 'clipboard denied' >&2
+exit 42
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let err = write_text_with_tmux_using_argv(script.to_str().unwrap(), &[], "copy")
+            .expect_err("non-zero tmux status should fail");
+
+        assert!(err.to_string().contains("exited with"));
+        assert!(err.to_string().contains("clipboard denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_load_buffer_w_works_with_default_passthrough_disabled() {
+        let version = match Command::new("tmux").arg("-V").output() {
+            Ok(output) if output.status.success() => output,
+            _ => return,
+        };
+        assert!(
+            String::from_utf8_lossy(&version.stdout).starts_with("tmux "),
+            "unexpected tmux version output"
+        );
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let socket = format!("codewhale-clipboard-{}-{nonce}", std::process::id());
+
+        struct TmuxServer(String);
+        impl Drop for TmuxServer {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["-L", self.0.as_str(), "kill-server"])
+                    .status();
+            }
+        }
+        let server = TmuxServer(socket);
+        let started = Command::new("tmux")
+            .args([
+                "-L",
+                server.0.as_str(),
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+            ])
+            .status()
+            .expect("start isolated tmux server");
+        assert!(started.success(), "isolated tmux server should start");
+
+        let option = |name: &str| {
+            let output = Command::new("tmux")
+                .args(["-L", server.0.as_str(), "show-options", "-gv", name])
+                .output()
+                .expect("read tmux option");
+            assert!(output.status.success(), "read tmux option {name}");
+            String::from_utf8(output.stdout)
+                .expect("tmux option should be utf-8")
+                .trim()
+                .to_string()
+        };
+        assert_eq!(option("allow-passthrough"), "off");
+        assert_eq!(option("set-clipboard"), "external");
+
+        write_text_with_tmux_using_argv(
+            "tmux",
+            &["-L", server.0.as_str()],
+            "copy through default tmux",
+        )
+        .expect("tmux-native clipboard request");
+        let buffer = Command::new("tmux")
+            .args(["-L", server.0.as_str(), "show-buffer"])
+            .output()
+            .expect("read tmux buffer");
+        assert!(buffer.status.success(), "tmux buffer should be readable");
+        assert_eq!(buffer.stdout, b"copy through default tmux");
     }
 
     #[cfg(unix)]
