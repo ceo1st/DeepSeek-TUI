@@ -3561,6 +3561,91 @@ fn apply_loaded_session_does_not_restore_slash_command_tail_as_retry_draft() {
 }
 
 #[test]
+fn apply_loaded_session_projects_subagent_handoff_without_retry_draft_or_user_cell() {
+    let mut app = create_test_app();
+    let payload = concat!(
+        "Implemented the resume projection.\nCheckpoint: focused tests pass.\n",
+        "<codewhale:subagent.done>{\"agent_id\":\"agent_resume\",\"name\":\"Tide\",",
+        "\"agent_type\":\"implementer\",\"status\":\"completed\",",
+        "\"summary_location\":\"previous_line\"}</codewhale:subagent.done>",
+    );
+    // Literal v0.9.0 persisted fixture: keep this independent from the current
+    // producer so a producer/parser drift cannot make the regression test
+    // self-fulfilling.
+    let persisted_handoff = Message {
+        role: "user".to_string(),
+        content: vec![
+            ContentBlock::Text {
+                text: format!(
+                    "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
+This is an internal runtime event, not user input. Use the sub-agent completion \
+data below to continue coordinating the current task. Do not tell the user they \
+pasted sentinels, do not explain the sentinel protocol, and do not quote the raw \
+XML unless the user explicitly asks to debug sub-agent internals.\n\n\
+{payload}\n\
+</codewhale:runtime_event>"
+                ),
+                cache_control: None,
+            },
+            ContentBlock::Text {
+                text: "<turn_meta>\nInput provenance: subagent_handoff\nInput authority: non_authoritative\n</turn_meta>".to_string(),
+                cache_control: None,
+            },
+        ],
+    };
+    let session = saved_session_with_messages(vec![
+        text_message("user", "Fix the resume regression"),
+        text_message("assistant", "I delegated the restore path."),
+        persisted_handoff,
+    ]);
+
+    let recovered =
+        apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+
+    assert!(!recovered);
+    assert!(app.input.is_empty());
+    assert!(app.queued_draft.is_none());
+    assert_eq!(app.api_messages.len(), 3);
+    assert!(app.api_messages.iter().any(|message| {
+        message.role == "user"
+            && message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text, .. } if text == "Fix the resume regression")
+            })
+    }));
+    let restored = crate::runtime_handoff::restored_subagent_checkpoint_display(
+        app.api_messages.last().expect("restored handoff"),
+    )
+    .expect("projected handoff");
+    assert!(restored.contains("Status: completed"));
+    assert!(restored.contains("Checkpoint: focused tests pass."));
+    assert!(!restored.contains("runtime_event"));
+    assert!(!restored.contains("subagent.done"));
+    let checkpoint_cell = app
+        .history
+        .iter()
+        .find(|cell| {
+            matches!(cell, HistoryCell::System { content } if content.contains("Status: completed"))
+        })
+        .expect("restored checkpoint Note cell");
+    let rendered = checkpoint_cell
+        .lines(28)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(rendered.contains("Note"));
+    assert!(rendered.contains("Status: completed"));
+    assert!(
+        !rendered.contains('▎'),
+        "must not render with the user glyph"
+    );
+    assert!(!rendered.contains("runtime_event"));
+    assert!(app.history.iter().all(|cell| {
+        !matches!(cell, HistoryCell::User { content } if content.contains("agent_resume") || content.contains("runtime_event"))
+    }));
+}
+
+#[test]
 fn apply_loaded_session_resets_unpersisted_telemetry() {
     let mut app = create_test_app();
     app.session.session_cost = 1.25;

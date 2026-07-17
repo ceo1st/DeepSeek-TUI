@@ -5680,6 +5680,73 @@ async fn sync_session_restores_current_mode() {
 }
 
 #[tokio::test]
+async fn sync_session_projects_persisted_subagent_handoff_for_headless_restore() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        model: "deepseek-v4-pro".to_string(),
+        ..Default::default()
+    };
+    let (engine, handle) = Engine::new(config, &Config::default());
+    let payload = concat!(
+        "Child result retained.\nCheckpoint: engine restore is covered.\n",
+        "<codewhale:subagent.done>{\"agent_id\":\"agent_headless\",",
+        "\"status\":\"completed\",\"summary_location\":\"previous_line\"}",
+        "</codewhale:subagent.done>",
+    );
+    let messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Keep the original task".to_string(),
+                cache_control: None,
+            }],
+        },
+        crate::runtime_handoff::subagent_completion_runtime_message(payload),
+    ];
+
+    let run = tokio::spawn(engine.run());
+    handle
+        .send(Op::SyncSession {
+            session_id: Some("headless-resume".to_string()),
+            messages,
+            system_prompt: None,
+            system_prompt_override: false,
+            model: "deepseek-v4-pro".to_string(),
+            workspace: tmp.path().to_path_buf(),
+            mode: AppMode::Agent,
+        })
+        .await
+        .expect("sync session");
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .send(Op::GetSessionSnapshot {
+            tx: std::sync::Arc::new(std::sync::Mutex::new(Some(tx))),
+        })
+        .await
+        .expect("request snapshot");
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("snapshot response")
+        .expect("snapshot");
+
+    assert_eq!(snapshot.messages.len(), 2);
+    assert!(snapshot.messages[0].content.iter().any(
+        |block| matches!(block, ContentBlock::Text { text, .. } if text == "Keep the original task")
+    ));
+    let restored =
+        crate::runtime_handoff::restored_subagent_checkpoint_display(&snapshot.messages[1])
+            .expect("projected headless checkpoint");
+    assert!(restored.contains("agent_headless"));
+    assert!(restored.contains("Checkpoint: engine restore is covered."));
+    assert!(!restored.contains("runtime_event"));
+    assert!(!restored.contains("subagent.done"));
+
+    run.abort();
+}
+
+#[tokio::test]
 async fn session_snapshot_omits_id_for_legacy_root_custom_route() {
     let tmp = tempdir().expect("tempdir");
     let api_config = Config {

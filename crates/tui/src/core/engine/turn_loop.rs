@@ -11,6 +11,9 @@ use super::stuck_guard::{
 use super::*;
 use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
+use crate::runtime_handoff::{
+    subagent_completion_runtime_message, waiting_for_subagents_runtime_message,
+};
 
 const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
 const TOOL_ERROR_DEGRADATION_THRESHOLD: u32 = 2;
@@ -2850,71 +2853,6 @@ impl Engine {
 
     pub(super) fn messages_with_turn_metadata(&self) -> Vec<Message> {
         self.session.messages.clone().into()
-    }
-}
-
-pub(super) fn subagent_completion_runtime_text(payload: &str) -> String {
-    format!(
-        "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
-This is an internal runtime event, not user input. Use the sub-agent completion \
-data below to continue coordinating the current task. Do not tell the user they \
-pasted sentinels, do not explain the sentinel protocol, and do not quote the raw \
-XML unless the user explicitly asks to debug sub-agent internals.\n\n\
-{payload}\n\
-</codewhale:runtime_event>"
-    )
-}
-
-fn waiting_for_subagents_runtime_message(running: usize) -> Message {
-    Message {
-        role: "user".to_string(),
-        content: vec![
-            ContentBlock::Text {
-                text: format!(
-                    "<codewhale:runtime_event kind=\"waiting_for_subagents\" visibility=\"internal\">\n\
-This is an internal runtime event, not user input. Your {running} sub-agent(s) \
-are still running. Do NOT poll them with agent(action=\"peek\") or \
-agent(action=\"status\"). Do NOT use sleep or any shell blocking primitive as a \
-waiting strategy. The runtime will deliver <codewhale:subagent.done> sentinels \
-automatically when each child finishes — polling will never make that happen \
-sooner. Stop immediately: emit zero tool calls and end the turn.\n\
-</codewhale:runtime_event>"
-                ),
-                cache_control: None,
-            },
-            runtime_event_turn_metadata_block(UserInputProvenance::SubAgentHandoff),
-        ],
-    }
-}
-
-fn subagent_completion_runtime_message(payload: &str) -> Message {
-    // Role is "user", not "system": some OpenAI-compatible backends apply a
-    // strict chat template (e.g. vLLM serving Qwen3) that requires any system
-    // message to be messages[0]. A system message appended mid-conversation
-    // makes the template raise "System message must be at the beginning",
-    // which surfaces as a 400 BadRequest and breaks the whole sub-agent
-    // hand-off in the parent turn. The `visibility="internal"` tag already
-    // tells the model this is a runtime event rather than user input, so the
-    // role carries no semantic weight here — only template-compatibility cost.
-    Message {
-        role: "user".to_string(),
-        content: vec![
-            ContentBlock::Text {
-                text: subagent_completion_runtime_text(payload),
-                cache_control: None,
-            },
-            runtime_event_turn_metadata_block(UserInputProvenance::SubAgentHandoff),
-        ],
-    }
-}
-
-fn runtime_event_turn_metadata_block(provenance: UserInputProvenance) -> ContentBlock {
-    ContentBlock::Text {
-        text: format!(
-            "<turn_meta>\nInput provenance: {}\nInput authority: non_authoritative\n</turn_meta>",
-            provenance.as_str()
-        ),
-        cache_control: None,
     }
 }
 

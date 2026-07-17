@@ -13303,7 +13303,9 @@ fn apply_loaded_session(
     // wholly intact.
     app.restore_work_state(session.work_state.as_ref())?;
     *config = *restored_route.config;
-    let (messages, recovered_draft) = recover_interrupted_user_tail(&session.messages);
+    let projected_messages =
+        crate::runtime_handoff::project_messages_for_restore(&session.messages);
+    let (messages, recovered_draft) = recover_interrupted_user_tail(&projected_messages);
     app.api_messages = messages;
     app.clear_history();
     app.tool_cells.clear();
@@ -13568,6 +13570,9 @@ fn recover_interrupted_user_tail(messages: &[Message]) -> (Vec<Message>, Option<
         return (recovered, None);
     };
     if last.role != "user" {
+        return (recovered, None);
+    }
+    if crate::runtime_handoff::restored_subagent_checkpoint_display(last).is_some() {
         return (recovered, None);
     }
     let Some(display) = retry_display_from_user_message(last) else {

@@ -447,6 +447,12 @@ impl HistoryCell {
 /// Convert a message into history cells for rendering.
 #[must_use]
 pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
+    if let Some(display) = crate::runtime_handoff::restored_subagent_checkpoint_display(msg) {
+        return vec![HistoryCell::System {
+            content: display.to_string(),
+        }];
+    }
+
     let mut cells = Vec::new();
 
     for block in &msg.content {

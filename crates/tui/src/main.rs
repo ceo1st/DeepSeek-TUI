@@ -95,6 +95,7 @@ mod route_billing;
 mod route_budget;
 mod route_runtime;
 mod runtime_api;
+mod runtime_handoff;
 mod runtime_log;
 mod runtime_threads;
 mod sandbox;

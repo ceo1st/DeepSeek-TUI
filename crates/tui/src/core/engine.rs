@@ -1914,7 +1914,8 @@ impl Engine {
                         } else if messages.is_empty() && system_prompt.is_none() {
                             self.session.id = uuid::Uuid::new_v4().to_string();
                         }
-                        self.session.messages = messages.into();
+                        self.session.messages =
+                            crate::runtime_handoff::project_messages_for_restore(&messages).into();
                         self.session.compaction_summary_prompt =
                             extract_compaction_summary_prompt(system_prompt.clone());
                         self.session.system_prompt = system_prompt;
@@ -2415,7 +2416,9 @@ impl Engine {
         let count = completions.len();
         let content = completions
             .iter()
-            .map(|completion| turn_loop::subagent_completion_runtime_text(&completion.payload))
+            .map(|completion| {
+                crate::runtime_handoff::subagent_completion_runtime_text(&completion.payload)
+            })
             .collect::<Vec<_>>()
             .join("\n\n");
 
