@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Anchor `FREQ=HOURLY` automations with `BYHOUR`/`BYMINUTE` to persisted
+  local-calendar slots so intervals keep their wall-clock phase across DST,
+  restart, resume, RRULE updates, duplicate-slot recovery, and post-run
+  advancement. Nonexistent clock slots are skipped and ambiguous slots run at
+  their first occurrence (#4381 by @h3c-hexin).
 - Convert persisted sub-agent completion and still-running control events into
   concise, non-authoritative resume checkpoints, keeping their raw runtime
   envelopes, sentinels, and retry instructions out of restored model and TUI

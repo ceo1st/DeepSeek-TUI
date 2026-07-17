@@ -40,7 +40,7 @@ impl ToolSpec for AutomationCreateTool {
                 "prompt": { "type": "string" },
                 "rrule": {
                     "type": "string",
-                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30"
+                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU][;BYHOUR=9][;BYMINUTE=30] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30. For HOURLY, BYHOUR/BYMINUTE choose the initial local wall-clock anchor and INTERVAL advances from that anchor; BYHOUR is not a daily-only filter. Anchored wall times skip nonexistent clock times and use the first occurrence of ambiguous clock times."
                 },
                 "cwds": { "type": "array", "items": { "type": "string" } },
                 "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },

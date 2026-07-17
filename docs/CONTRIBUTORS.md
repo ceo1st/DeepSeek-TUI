@@ -30,6 +30,8 @@ notes, and relevant issue/PR comments.
 <details open>
 <summary><strong>v0.9.1 — provider and runtime hardening</strong></summary>
 
+- **[h3c-hexin](https://github.com/h3c-hexin)** — calendar-anchored hourly
+  automation recurrence across DST and lifecycle transitions (PR #4381)
 - **[zhangweiii](https://github.com/zhangweiii)** and
   **[Sterne Lee / sternelee](https://github.com/sternelee)** — the original
   first-class OpenCode Go implementations in PRs #773 and #1050, harvested
