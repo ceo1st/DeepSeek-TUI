@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selection moves beyond the visible rows, including Down past `/export`
   (#4418).
 
+### Security
+
+- Restrict cross-origin Runtime API browser preflights to the documented
+  authentication and content headers, explicitly allowing `Authorization`
+  instead of relying on a wildcard (#4454).
+
 ## [0.9.0] - 2026-07-16
 
 Codewhale v0.9.0 replaces the default terminal shell with the underwater

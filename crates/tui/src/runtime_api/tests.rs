@@ -5044,7 +5044,7 @@ async fn set_config_response_contains_all_expected_fields() -> Result<()> {
 }
 
 #[tokio::test]
-async fn cors_layer_restricts_headers() -> Result<()> {
+async fn cors_layer_advertises_only_supported_request_headers() -> Result<()> {
     let layer = cors_layer(&[]);
     let router: Router = Router::new()
         .route("/probe", get(|| async { "ok" }))
@@ -5073,18 +5073,29 @@ async fn cors_layer_restricts_headers() -> Result<()> {
         .send()
         .await?;
 
+    assert!(resp.status().is_success());
     let allow_headers = resp
         .headers()
         .get("access-control-allow-headers")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let advertised = allow_headers
+        .split(',')
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        "accept",
+        "authorization",
+        "content-type",
+        "x-codewhale-runtime-token",
+        "x-deepseek-runtime-token",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
 
-    assert!(allow_headers.contains("authorization"));
-    assert!(allow_headers.contains("content-type"));
-    assert!(allow_headers.contains("accept"));
-    assert!(allow_headers.contains("x-codewhale-runtime-token"));
-    assert!(allow_headers.contains("x-deepseek-runtime-token"));
-    assert!(!allow_headers.contains("x-malicious-header"));
+    assert_eq!(advertised, expected);
 
     handle.abort();
     Ok(())
