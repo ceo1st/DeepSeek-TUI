@@ -20,38 +20,12 @@
 
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
-  "@bistack",
-  "@CCChisato",
-  "@ci4ic4",
-  "@cyq1017",
-  "@DarrellThomas",
-  "@findshan",
-  "@gaord",
-  "@hongqitai",
-  "@idling11",
-  "@JayBeest",
-  "@knqiufan",
-  "@LeoLin990405",
-  "@moduvoice",
-  "@mvanhorn",
-  "@Mr-Moon121",
-  "@MXAntian",
-  "@nightt5879",
-  "@nsfoxer",
-  "@octo-patch",
-  "@qinlinwang",
-  "@SamhandsomeLee",
-  "@wuisabel-gif",
+  "@h3c-hexin",
+  "@sternelee",
+  "@zhangweiii",
 ];
 
 /** Contributors who helped with reports, reproductions, and verification. */
 export const RELEASE_HELPERS: string[] = [
-  "@Angel-Hair",
-  "@amuthantamil",
-  "@bruce6135",
-  "@eugenicum",
-  "@hmr-BH",
-  "@taixinguo",
-  "@WavesMan",
-  "@yekern",
+  "@seanthefuturegorilla",
 ];
