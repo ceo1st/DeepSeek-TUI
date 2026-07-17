@@ -20,6 +20,10 @@ describe("relativeTime", () => {
     expect(relativeTime("2026-06-01T11:59:45Z")).toBe("just now");
   });
 
+  it("returns 'just now' for dates in the future", () => {
+    expect(relativeTime("2026-06-02T12:00:00Z")).toBe("just now");
+  });
+
   it("returns minutes for < 1 hour", () => {
     expect(relativeTime("2026-06-01T11:55:00Z")).toBe("5m");
     expect(relativeTime("2026-06-01T11:30:00Z")).toBe("30m");
