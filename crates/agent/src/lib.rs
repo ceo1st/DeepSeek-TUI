@@ -993,6 +993,13 @@ impl Default for ModelRegistry {
                 supports_reasoning: true,
             },
             ModelInfo {
+                id: "grok-4.5".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/grok-4.5".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
                 id: "glm-5.2".to_string(),
                 provider: ProviderKind::OpencodeGo,
                 aliases: vec!["opencode-go/glm-5.2".to_string()],
@@ -1003,6 +1010,13 @@ impl Default for ModelRegistry {
                 id: "glm-5.1".to_string(),
                 provider: ProviderKind::OpencodeGo,
                 aliases: vec!["opencode-go/glm-5.1".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "kimi-k3".to_string(),
+                provider: ProviderKind::OpencodeGo,
+                aliases: vec!["opencode-go/kimi-k3".to_string()],
                 supports_tools: true,
                 supports_reasoning: true,
             },
@@ -1784,8 +1798,10 @@ mod tests {
             models,
             vec![
                 "deepseek-v4-pro",
+                "grok-4.5",
                 "glm-5.2",
                 "glm-5.1",
+                "kimi-k3",
                 "kimi-k2.7-code",
                 "kimi-k2.6",
                 "deepseek-v4-flash",
@@ -1798,11 +1814,14 @@ mod tests {
         assert_eq!(default.resolved.provider, ProviderKind::OpencodeGo);
         assert_eq!(default.resolved.id, "deepseek-v4-pro");
 
-        let prefixed =
-            registry.resolve(Some("opencode-go/glm-5.2"), Some(ProviderKind::OpencodeGo));
-        assert_eq!(prefixed.resolved.provider, ProviderKind::OpencodeGo);
-        assert_eq!(prefixed.resolved.id, "glm-5.2");
-        assert!(!prefixed.used_fallback);
+        for model in ["grok-4.5", "kimi-k3"] {
+            for requested in [model.to_string(), format!("opencode-go/{model}")] {
+                let resolved = registry.resolve(Some(&requested), Some(ProviderKind::OpencodeGo));
+                assert_eq!(resolved.resolved.provider, ProviderKind::OpencodeGo);
+                assert_eq!(resolved.resolved.id, model);
+                assert!(!resolved.used_fallback);
+            }
+        }
 
         for messages_only in [
             "minimax-m3",

@@ -2706,6 +2706,25 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
     }
 }
 
+/// OpenCode Go models documented for its OpenAI Chat Completions endpoint.
+///
+/// Keep config validation, picker/catalog projections, and live-roster
+/// sanitization on this one protocol-scoped contract. The provider's combined
+/// `/models` roster also contains Anthropic-Messages-only models, which are
+/// deliberately absent here.
+pub const OPENCODE_GO_CHAT_MODELS: &[&str] = &[
+    DEFAULT_OPENCODE_GO_MODEL,
+    OPENCODE_GO_GROK_4_5_MODEL,
+    OPENCODE_GO_GLM_5_2_MODEL,
+    OPENCODE_GO_GLM_5_1_MODEL,
+    OPENCODE_GO_KIMI_K3_MODEL,
+    OPENCODE_GO_KIMI_K2_7_CODE_MODEL,
+    OPENCODE_GO_KIMI_K2_6_MODEL,
+    OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL,
+    OPENCODE_GO_MIMO_V2_5_MODEL,
+    OPENCODE_GO_MIMO_V2_5_PRO_MODEL,
+];
+
 /// Canonicalize an OpenCode Go model that is documented for the OpenAI Chat
 /// Completions endpoint. The live `/models` roster also contains
 /// Anthropic-Messages-only models; returning `None` for those is the protocol
@@ -2716,17 +2735,24 @@ pub fn opencode_go_chat_model_id(model: &str) -> Option<&'static str> {
     let normalized = normalized
         .strip_prefix("opencode-go/")
         .unwrap_or(&normalized);
-    match normalized {
-        "glm-5.2" | "glm-5-2" => Some(OPENCODE_GO_GLM_5_2_MODEL),
-        "glm-5.1" | "glm-5-1" => Some(OPENCODE_GO_GLM_5_1_MODEL),
-        "kimi-k2.7-code" | "kimi-k2-7-code" => Some(OPENCODE_GO_KIMI_K2_7_CODE_MODEL),
-        "kimi-k2.6" | "kimi-k2-6" => Some(OPENCODE_GO_KIMI_K2_6_MODEL),
-        "deepseek-v4-pro" | "deepseek-v4pro" => Some(DEFAULT_OPENCODE_GO_MODEL),
-        "deepseek-v4-flash" | "deepseek-v4flash" => Some(OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL),
-        "mimo-v2.5" | "mimo-v2-5" => Some(OPENCODE_GO_MIMO_V2_5_MODEL),
-        "mimo-v2.5-pro" | "mimo-v2-5-pro" => Some(OPENCODE_GO_MIMO_V2_5_PRO_MODEL),
+    let familiar_alias = match normalized {
+        "grok-4-5" => Some(OPENCODE_GO_GROK_4_5_MODEL),
+        "glm-5-2" => Some(OPENCODE_GO_GLM_5_2_MODEL),
+        "glm-5-1" => Some(OPENCODE_GO_GLM_5_1_MODEL),
+        "kimi-k2-7-code" => Some(OPENCODE_GO_KIMI_K2_7_CODE_MODEL),
+        "kimi-k2-6" => Some(OPENCODE_GO_KIMI_K2_6_MODEL),
+        "deepseek-v4pro" => Some(DEFAULT_OPENCODE_GO_MODEL),
+        "deepseek-v4flash" => Some(OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL),
+        "mimo-v2-5" => Some(OPENCODE_GO_MIMO_V2_5_MODEL),
+        "mimo-v2-5-pro" => Some(OPENCODE_GO_MIMO_V2_5_PRO_MODEL),
         _ => None,
-    }
+    };
+    familiar_alias.or_else(|| {
+        OPENCODE_GO_CHAT_MODELS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == normalized)
+    })
 }
 
 fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {

@@ -892,15 +892,17 @@ api_key = {provider_api_key:?}
             }
         }
 
-        let mut valid = ConfigToml {
-            provider: ProviderKind::OpencodeGo,
-            ..ConfigToml::default()
-        };
-        valid.providers.opencode_go.model = Some("opencode-go/glm-5.2".to_string());
-        let endpoint = resolve_endpoint(&valid, &registry, None).expect("valid Go route");
-        assert_eq!(endpoint.provider, ProviderKind::OpencodeGo);
-        assert_eq!(endpoint.model, "glm-5.2");
-        assert_eq!(endpoint.wire_format, WireFormat::ChatCompletions);
+        for model in ["grok-4.5", "kimi-k3"] {
+            let mut valid = ConfigToml {
+                provider: ProviderKind::OpencodeGo,
+                ..ConfigToml::default()
+            };
+            valid.providers.opencode_go.model = Some(format!("opencode-go/{model}"));
+            let endpoint = resolve_endpoint(&valid, &registry, None).expect("valid Go route");
+            assert_eq!(endpoint.provider, ProviderKind::OpencodeGo);
+            assert_eq!(endpoint.model, model);
+            assert_eq!(endpoint.wire_format, WireFormat::ChatCompletions);
+        }
     }
 
     #[test]

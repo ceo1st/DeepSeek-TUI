@@ -3801,6 +3801,14 @@ model = "opencode-go/glm-5.2"
     assert_eq!(resolved.base_url, DEFAULT_OPENCODE_GO_BASE_URL);
     assert_eq!(resolved.model, OPENCODE_GO_MIMO_V2_5_PRO_MODEL);
 
+    for model in [OPENCODE_GO_GROK_4_5_MODEL, OPENCODE_GO_KIMI_K3_MODEL] {
+        assert_eq!(opencode_go_chat_model_id(model), Some(model));
+        assert_eq!(
+            opencode_go_chat_model_id(&format!("opencode-go/{model}")),
+            Some(model)
+        );
+    }
+
     // The Go roster also includes Messages-only models. Even a custom base URL
     // cannot make one safe for this Chat Completions provider; resolution falls
     // back to the provider default instead of sending an incompatible request.

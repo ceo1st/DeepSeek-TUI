@@ -680,18 +680,11 @@ fn openrouter_custom_endpoint_preserves_qwen37_alias() {
 #[test]
 fn opencode_go_resolver_accepts_only_chat_completions_models() {
     let resolver = RouteResolver::new();
-    let chat_models = [
-        "glm-5.2",
-        "glm-5.1",
-        "kimi-k2.7-code",
-        "kimi-k2.6",
-        "deepseek-v4-pro",
-        "deepseek-v4-flash",
-        "mimo-v2.5",
-        "mimo-v2.5-pro",
-    ];
+    let chat_models = crate::OPENCODE_GO_CHAT_MODELS;
+    assert!(chat_models.contains(&"grok-4.5"));
+    assert!(chat_models.contains(&"kimi-k3"));
 
-    for model in chat_models {
+    for &model in chat_models {
         for requested in [model.to_string(), format!("opencode-go/{model}")] {
             let route = resolver
                 .resolve(&req(Some(ProviderKind::OpencodeGo), Some(&requested)))

@@ -3274,6 +3274,30 @@ mod tests {
     }
 
     #[test]
+    fn picker_lists_current_opencode_go_chat_models_only() {
+        let (mut app, config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::OpencodeGo;
+        app.model = crate::config::DEFAULT_OPENCODE_GO_MODEL.to_string();
+        app.auto_model = false;
+
+        let view = ModelPickerView::new(&app, &config);
+        let model_ids = view.visible_model_ids();
+
+        for expected in ["grok-4.5", "kimi-k3"] {
+            assert!(
+                model_ids.contains(&expected),
+                "missing {expected}: {model_ids:?}"
+            );
+        }
+        for messages_only in ["minimax-m3", "qwen3.7-max"] {
+            assert!(
+                !model_ids.contains(&messages_only),
+                "{messages_only} must remain excluded from the Chat-only picker"
+            );
+        }
+    }
+
+    #[test]
     fn picker_for_ollama_preserves_current_local_tag_without_hosted_static_rows() {
         let (mut app, config, _lock) = create_test_app();
         app.api_provider = crate::config::ApiProvider::Ollama;

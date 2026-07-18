@@ -573,8 +573,9 @@ max_subagents = 10 # optional (1-20)
 # OpenCode Go (https://opencode.ai/docs/go/)
 # Subscription-backed OpenAI-compatible Chat Completions route.
 # Env vars: OPENCODE_GO_API_KEY, OPENCODE_GO_BASE_URL, OPENCODE_GO_MODEL
-# Chat Completions models: glm-5.2, glm-5.1, kimi-k2.7-code, kimi-k2.6,
-# deepseek-v4-pro, deepseek-v4-flash, mimo-v2.5, mimo-v2.5-pro.
+# Chat Completions models: deepseek-v4-pro, grok-4.5, glm-5.2, glm-5.1,
+# kimi-k3, kimi-k2.7-code, kimi-k2.6, deepseek-v4-flash, mimo-v2.5,
+# mimo-v2.5-pro.
 # Models documented only on OpenCode Go's Anthropic `/messages` endpoint are
 # intentionally not advertised by this provider yet.
 [providers.opencode_go]
