@@ -12,7 +12,7 @@ export default async function (args) {
   const target = args?.target ?? "docs/AUTOMATIC_WORKFLOWS.md";
   const change =
     args?.change ??
-    "Add a one-line note that #4131 dogfood scenarios live in docs/DOGFOOD_AUTOMATIC_WORKFLOWS.md.";
+    "Add a one-line note that #4131 example scenarios live in docs/examples/dogfood-automatic/.";
 
   phase("Implement");
   const implement = await task({

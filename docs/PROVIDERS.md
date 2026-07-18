@@ -378,9 +378,6 @@ selects the standard API endpoint and standard MiMo key family. Xiaomi Token
 Plan docs and console expose credit/quota semantics, but Codewhale does not
 currently have a documented balance endpoint to poll, so cost display remains
 unknown rather than reusing token-price estimates from another provider.
-Evidence captured from Xiaomi's official docs on 2026-06-23 lives in
-[`docs/evidence/xiaomi-mimo-2026-06-23/`](evidence/xiaomi-mimo-2026-06-23/);
-those notes override the secondary workbook snapshot where they disagree.
 
 Voice-design and voice-clone shorthands map to `mimo-v2.5-tts-voicedesign` and
 `mimo-v2.5-tts-voiceclone`. Xiaomi's current
