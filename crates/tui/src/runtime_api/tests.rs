@@ -4793,6 +4793,70 @@ async fn decide_approval_404s_when_nothing_pending() -> Result<()> {
 }
 
 #[tokio::test]
+async fn submit_user_input_404s_without_entering_engine_mailbox_for_unknown_id() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread.id, harness.handle.clone())
+        .await?;
+
+    let response = crate::tls::reqwest_client()
+        .post(format!(
+            "http://{addr}/v1/user-input/{}/input-missing",
+            thread.id
+        ))
+        .json(&json!({
+            "answers": [{
+                "id": "choice",
+                "label": "Missing",
+                "value": "must-not-enter-engine-mailbox",
+            }],
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            harness.recv_user_input_submission()
+        )
+        .await
+        .is_err(),
+        "unknown user input reached the engine mailbox"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn events_endpoint_rejects_unbounded_tail_requests() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let response = crate::tls::reqwest_client()
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?replay_limit={}",
+            thread.id,
+            MAX_RUNTIME_EVENT_REPLAY_TAIL.saturating_add(1),
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn decide_approval_400s_on_bad_decision() -> Result<()> {
     let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
