@@ -1226,9 +1226,24 @@ pub async fn run_tui(
         let _ = app.execute_hooks(HookEvent::SessionEnd, &context);
     }
 
-    // Flush the persistence actor: clear checkpoint + graceful shutdown.
+    // Flush the persistence actor: clear this session's checkpoint, collect
+    // the durability report (write failures are surfaced, not discarded),
+    // then shut down gracefully.
     if let Some((handle, task)) = persistence_runtime {
-        handle.try_send(PersistRequest::ClearCheckpoint);
+        if let Some(session_id) = app.current_session_id.clone() {
+            handle.try_send(PersistRequest::ClearCheckpoint { session_id });
+        }
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        handle.try_send(PersistRequest::FlushAndReport { reply: report_tx });
+        if let Ok(report) = report_rx.await
+            && !report.failures.is_empty()
+        {
+            tracing::warn!(
+                target: "persistence",
+                failures = ?report.failures,
+                "session persistence reported write failures during shutdown",
+            );
+        }
         handle.try_send(PersistRequest::Shutdown);
         let _ = task.await;
     }
@@ -3051,16 +3066,18 @@ async fn run_event_loop(
                         // Auto-save completed turn and clear crash checkpoint.
                         // Offloaded to the persistence actor so the UI
                         // stays responsive.
-                        let mut completed_snapshot_queued = false;
+                        let mut completed_snapshot_id: Option<String> = None;
                         if let Ok(manager) = SessionManager::default_location()
                             && let Ok(session) = build_session_snapshot(app, &manager)
                         {
                             app.current_session_id = Some(session.metadata.id.clone());
+                            completed_snapshot_id = Some(session.metadata.id.clone());
                             persistence_actor::persist(PersistRequest::SessionSnapshot(session));
-                            completed_snapshot_queued = true;
                         }
-                        if completed_snapshot_queued {
-                            persistence_actor::persist(PersistRequest::ClearCheckpoint);
+                        if let Some(session_id) = completed_snapshot_id {
+                            persistence_actor::persist(PersistRequest::ClearCheckpoint {
+                                session_id,
+                            });
                         }
 
                         // Refresh DeepSeek account balance after each completed
@@ -3213,7 +3230,15 @@ async fn run_event_loop(
                         {
                             if let Ok(session) = build_session_snapshot(app, &manager) {
                                 app.session_title = Some(session.metadata.title.clone());
-                                persistence_actor::persist(PersistRequest::Checkpoint(session));
+                                // Pin the id so every checkpoint of this
+                                // session lands in the same per-session file
+                                // and the eventual clear targets it.
+                                if app.current_session_id.is_none() {
+                                    app.current_session_id = Some(session.metadata.id.clone());
+                                }
+                                persistence_actor::persist(PersistRequest::SaveCheckpoint {
+                                    session,
+                                });
                             }
                         } else if app.session_title.is_none() {
                             // Never synchronously reload the growing session
@@ -6910,7 +6935,11 @@ fn persist_full_reset_snapshot(app: &mut App) {
     // `/clear` and `/new` are explicit boundaries. Never let an older
     // in-flight checkpoint resurrect the session the user just discarded,
     // even if the replacement snapshot could not be constructed.
-    persistence_actor::persist(PersistRequest::ClearCheckpoint);
+    // `build_session_snapshot` reuses `current_session_id`, so this id is the
+    // discarded session's id whether or not the snapshot above succeeded.
+    if let Some(session_id) = app.current_session_id.clone() {
+        persistence_actor::persist(PersistRequest::ClearCheckpoint { session_id });
+    }
 }
 
 fn maybe_throttled_recovery_snapshot(
@@ -8247,7 +8276,12 @@ async fn dispatch_user_message(
     if let Ok(manager) = SessionManager::default_location()
         && let Ok(session) = build_session_snapshot(app, &manager)
     {
-        persistence_actor::persist(PersistRequest::Checkpoint(session));
+        // Pin the id so every checkpoint of this session lands in the same
+        // per-session file and the eventual clear targets it.
+        if app.current_session_id.is_none() {
+            app.current_session_id = Some(session.metadata.id.clone());
+        }
+        persistence_actor::persist(PersistRequest::SaveCheckpoint { session });
     }
 
     Ok(())

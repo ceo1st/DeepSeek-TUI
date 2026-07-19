@@ -275,8 +275,30 @@ pub struct SessionManager {
     sessions_dir: PathBuf,
 }
 
+/// Origin of a crash-recovery checkpoint file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointSource {
+    /// Per-session checkpoint file `checkpoints/<session_id>.json`.
+    Session(String),
+    /// Legacy single-slot checkpoint file `checkpoints/latest.json`.
+    Legacy,
+}
+
+/// A crash-recovery checkpoint file discovered on disk (metadata only —
+/// callers load the session content separately).
+#[derive(Debug, Clone)]
+pub struct CheckpointRef {
+    pub source: CheckpointSource,
+    pub path: PathBuf,
+    pub modified: std::time::SystemTime,
+}
+
+/// File names in `checkpoints/` that are never per-session checkpoints.
+const LEGACY_CHECKPOINT_FILE: &str = "latest.json";
+const OFFLINE_QUEUE_FILE: &str = "offline_queue.json";
+
 impl SessionManager {
-    fn validated_session_path(&self, id: &str) -> std::io::Result<PathBuf> {
+    fn validated_session_id<'a>(&self, id: &'a str) -> std::io::Result<&'a str> {
         let trimmed = id.trim();
         if trimmed.is_empty() {
             return Err(std::io::Error::new(
@@ -293,7 +315,31 @@ impl SessionManager {
                 format!("Invalid session id '{id}'"),
             ));
         }
+        Ok(trimmed)
+    }
+
+    fn validated_session_path(&self, id: &str) -> std::io::Result<PathBuf> {
+        let trimmed = self.validated_session_id(id)?;
         Ok(self.sessions_dir.join(format!("{trimmed}.json")))
+    }
+
+    fn checkpoints_dir(&self) -> PathBuf {
+        self.sessions_dir.join("checkpoints")
+    }
+
+    fn validated_checkpoint_path(&self, session_id: &str) -> std::io::Result<PathBuf> {
+        let trimmed = self.validated_session_id(session_id)?;
+        // Reserved file names inside `checkpoints/` must never collide with a
+        // per-session checkpoint file.
+        if format!("{trimmed}.json") == LEGACY_CHECKPOINT_FILE
+            || format!("{trimmed}.json") == OFFLINE_QUEUE_FILE
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Session id '{trimmed}' collides with a reserved checkpoint file"),
+            ));
+        }
+        Ok(self.checkpoints_dir().join(format!("{trimmed}.json")))
     }
 
     /// Create a new `SessionManager` with the specified sessions directory
@@ -331,23 +377,23 @@ impl SessionManager {
     }
 
     /// Save a crash-recovery checkpoint for in-flight turns.
+    ///
+    /// Checkpoints are keyed per session (`checkpoints/<session_id>.json`) so
+    /// concurrent sessions never overwrite each other's crash-recovery state.
     pub fn save_checkpoint(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
-        let checkpoints = self.sessions_dir.join("checkpoints");
-        fs::create_dir_all(&checkpoints)?;
-        let path = checkpoints.join("latest.json");
+        let path = self.validated_checkpoint_path(&session.metadata.id)?;
+        fs::create_dir_all(self.checkpoints_dir())?;
         let content = serde_json::to_string_pretty(&session)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_atomic(&path, content.as_bytes())?;
         Ok(path)
     }
 
-    /// Load the most recent crash-recovery checkpoint if present.
-    pub fn load_checkpoint(&self) -> std::io::Result<Option<SavedSession>> {
-        let path = self.sessions_dir.join("checkpoints").join("latest.json");
+    fn read_checkpoint_file(&self, path: &Path) -> std::io::Result<Option<SavedSession>> {
         if !path.exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(&path)?;
+        let content = fs::read_to_string(path)?;
         let mut session: SavedSession = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if session.schema_version > CURRENT_SESSION_SCHEMA_VERSION {
@@ -363,13 +409,100 @@ impl SessionManager {
         Ok(Some(session))
     }
 
-    /// Clear any crash-recovery checkpoint.
-    pub fn clear_checkpoint(&self) -> std::io::Result<()> {
-        let path = self.sessions_dir.join("checkpoints").join("latest.json");
+    /// Load a specific session's crash-recovery checkpoint if present.
+    pub fn load_session_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<SavedSession>> {
+        let path = self.validated_checkpoint_path(session_id)?;
+        self.read_checkpoint_file(&path)
+    }
+
+    /// Load the legacy single-slot checkpoint (`checkpoints/latest.json`) if
+    /// present. Compatibility read only — this release no longer writes it.
+    pub fn load_legacy_checkpoint(&self) -> std::io::Result<Option<SavedSession>> {
+        let path = self.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
+        self.read_checkpoint_file(&path)
+    }
+
+    /// Clear one session's crash-recovery checkpoint. Scoped: this can never
+    /// remove another session's checkpoint file or the legacy slot.
+    pub fn clear_session_checkpoint(&self, session_id: &str) -> std::io::Result<()> {
+        let path = self.validated_checkpoint_path(session_id)?;
         if path.exists() {
             fs::remove_file(path)?;
         }
         Ok(())
+    }
+
+    /// Remove the legacy single-slot checkpoint file.
+    pub fn clear_legacy_checkpoint(&self) -> std::io::Result<()> {
+        let path = self.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate all crash-recovery checkpoint files (per-session files plus
+    /// the legacy single slot), sorted most recently modified first. Only
+    /// file metadata is read here; callers load content per candidate.
+    pub fn list_checkpoints(&self) -> std::io::Result<Vec<CheckpointRef>> {
+        let dir = self.checkpoints_dir();
+        let mut refs = Vec::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(refs),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let source = if name == LEGACY_CHECKPOINT_FILE {
+                CheckpointSource::Legacy
+            } else if name == OFFLINE_QUEUE_FILE {
+                continue;
+            } else {
+                let session_id = name.trim_end_matches(".json").to_string();
+                if self.validated_checkpoint_path(&session_id).is_err() {
+                    continue;
+                }
+                CheckpointSource::Session(session_id)
+            };
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            refs.push(CheckpointRef {
+                source,
+                path,
+                modified,
+            });
+        }
+        refs.sort_by_key(|r| std::cmp::Reverse(r.modified));
+        Ok(refs)
+    }
+
+    /// Migrate a session recovered from the legacy single-slot checkpoint to
+    /// a per-session checkpoint file. Never overwrites an existing
+    /// per-session file and leaves the legacy file in place (older binaries
+    /// still read it; the legacy writer is already gone). Returns whether a
+    /// file was written.
+    pub fn write_session_checkpoint_if_absent(
+        &self,
+        session: &SavedSession,
+    ) -> std::io::Result<bool> {
+        let path = self.validated_checkpoint_path(&session.metadata.id)?;
+        if path.exists() {
+            return Ok(false);
+        }
+        self.save_checkpoint(session)?;
+        Ok(true)
     }
 
     /// Save offline queue state (queued + draft messages).
@@ -578,8 +711,9 @@ impl SessionManager {
     /// on boot; today the user-facing entry point is the
     /// `/sessions prune <days>` slash command.
     ///
-    /// Crash-recovery safety: skips the running checkpoint
-    /// (`checkpoints/latest.json`) and any file under `checkpoints/`
+    /// Crash-recovery safety: skips the per-session checkpoint files
+    /// (`checkpoints/<session_id>.json`), the legacy single-slot
+    /// checkpoint (`checkpoints/latest.json`), and any file under `checkpoints/`
     /// — those are owned by the checkpoint subsystem and live with
     /// stricter durability rules. Only top-level `<session_id>.json`
     /// files are candidates.
@@ -1892,21 +2026,138 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
         let messages = vec![make_test_message("user", "checkpoint me")];
-        let session = create_saved_session(&messages, "test-model", tmp.path(), 12, None);
+        let mut session = create_saved_session(&messages, "test-model", tmp.path(), 12, None);
+        session.work_state = Some(SessionWorkState {
+            todos: crate::tools::todo::TodoListSnapshot {
+                items: vec![crate::tools::todo::TodoItem {
+                    id: 1,
+                    content: "verify checkpoint durability".to_string(),
+                    status: crate::tools::todo::TodoStatus::InProgress,
+                }],
+                completion_pct: 0,
+                in_progress_id: Some(1),
+            },
+            ..SessionWorkState::default()
+        });
 
-        manager.save_checkpoint(&session).expect("save checkpoint");
+        let path = manager.save_checkpoint(&session).expect("save checkpoint");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(format!("{}.json", session.metadata.id).as_str()),
+            "checkpoint file must be keyed by session id"
+        );
         let loaded = manager
-            .load_checkpoint()
+            .load_session_checkpoint(&session.metadata.id)
             .expect("load checkpoint")
             .expect("checkpoint exists");
         assert_eq!(loaded.metadata.id, session.metadata.id);
+        assert_eq!(loaded.messages, session.messages);
+        assert_eq!(
+            loaded.work_state, session.work_state,
+            "work state must survive the checkpoint round trip"
+        );
 
-        manager.clear_checkpoint().expect("clear checkpoint");
+        manager
+            .clear_session_checkpoint(&session.metadata.id)
+            .expect("clear checkpoint");
         assert!(
             manager
-                .load_checkpoint()
+                .load_session_checkpoint(&session.metadata.id)
                 .expect("load checkpoint")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn checkpoints_are_independent_per_session() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let first = create_saved_session(
+            &[make_test_message("user", "session one")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let second = create_saved_session(
+            &[make_test_message("user", "session two")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+
+        manager.save_checkpoint(&first).expect("save first");
+        manager.save_checkpoint(&second).expect("save second");
+        manager
+            .clear_session_checkpoint(&first.metadata.id)
+            .expect("clear first");
+
+        assert!(
+            manager
+                .load_session_checkpoint(&first.metadata.id)
+                .expect("load first")
+                .is_none(),
+            "clearing one session must remove only that session's file"
+        );
+        let survivor = manager
+            .load_session_checkpoint(&second.metadata.id)
+            .expect("load second")
+            .expect("second checkpoint survives");
+        assert_eq!(survivor.metadata.id, second.metadata.id);
+    }
+
+    #[test]
+    fn list_checkpoints_includes_legacy_slot_and_skips_offline_queue() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let session = create_saved_session(
+            &[make_test_message("user", "list me")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        manager.save_checkpoint(&session).expect("save checkpoint");
+        let checkpoints = tmp.path().join("sessions").join("checkpoints");
+        fs::write(checkpoints.join("latest.json"), "{}").expect("write legacy slot");
+        fs::write(checkpoints.join("offline_queue.json"), "{}").expect("write offline queue");
+
+        let refs = manager.list_checkpoints().expect("list checkpoints");
+        assert_eq!(refs.len(), 2, "offline queue must not be a candidate");
+        assert!(
+            refs.iter()
+                .any(|r| r.source == CheckpointSource::Session(session.metadata.id.clone()))
+        );
+        assert!(refs.iter().any(|r| r.source == CheckpointSource::Legacy));
+    }
+
+    #[test]
+    fn legacy_migration_never_overwrites_existing_per_session_checkpoint() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let mut session = create_saved_session(
+            &[make_test_message("user", "original")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        manager.save_checkpoint(&session).expect("save checkpoint");
+
+        session.messages = vec![make_test_message("user", "stale legacy copy")];
+        let written = manager
+            .write_session_checkpoint_if_absent(&session)
+            .expect("migration attempt");
+        assert!(!written, "migration must not overwrite an existing file");
+        let loaded = manager
+            .load_session_checkpoint(&session.metadata.id)
+            .expect("load")
+            .expect("checkpoint exists");
+        assert_eq!(
+            loaded.messages,
+            vec![make_test_message("user", "original")],
+            "existing per-session checkpoint content must be preserved"
         );
     }
 
@@ -2090,7 +2341,16 @@ mod tests {
         )
         .expect("write checkpoint");
 
-        let err = manager.load_checkpoint().expect_err("should reject schema");
+        let err = manager
+            .load_legacy_checkpoint()
+            .expect_err("should reject schema");
+        assert!(err.to_string().contains("newer than supported"));
+
+        // The same guard applies to per-session checkpoint files.
+        fs::rename(&path, checkpoints.join("sid.json")).expect("rename to per-session file");
+        let err = manager
+            .load_session_checkpoint("sid")
+            .expect_err("should reject schema");
         assert!(err.to_string().contains("newer than supported"));
     }
 
