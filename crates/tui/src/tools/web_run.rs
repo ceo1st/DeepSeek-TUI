@@ -7,7 +7,7 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_u64, required_str,
 };
-use crate::network_policy::{Decision, host_from_url};
+use super::web::guard::validate_fetch_target;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use regex::Regex;
@@ -27,6 +27,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_OPEN_TIMEOUT_MS: u64 = 20_000;
 const MAX_WEB_RUN_SESSIONS: usize = 64;
 const MAX_PAGES_PER_SESSION: usize = 256;
+const MAX_REDIRECTS: usize = 5;
 const WEB_RUN_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
@@ -758,8 +759,7 @@ async fn resolve_or_fetch_page(
         return Ok(page);
     }
     if looks_like_url(ref_id) {
-        check_network_policy(ref_id, context)?;
-        return fetch_page(ref_id, timeout_ms).await.map(Arc::new);
+        return fetch_page(ref_id, timeout_ms, context).await.map(Arc::new);
     }
     Err(ToolError::invalid_input(format!(
         "Unknown ref_id '{ref_id}'"
@@ -1103,45 +1103,64 @@ fn page_from_search(query: &str, results: &[SearchEntry]) -> WebPage {
     }
 }
 
-/// Check network policy for a URL before fetching.
-/// Returns an error if the policy denies access.
-fn check_network_policy(url: &str, context: &ToolContext) -> Result<(), ToolError> {
-    let Some(decider) = context.network_policy.as_ref() else {
-        return Ok(());
+async fn fetch_page(
+    url: &str,
+    timeout_ms: u64,
+    context: &ToolContext,
+) -> Result<WebPage, ToolError> {
+    let mut current_url = reqwest::Url::parse(url)
+        .map_err(|e| ToolError::invalid_input(format!("invalid URL: {e}")))?;
+    let mut redirects_followed = 0usize;
+
+    let resp = loop {
+        let dns_pinning = validate_fetch_target(&current_url, context, "web_run").await?;
+        let mut client_builder = crate::tls::reqwest_client_builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none());
+
+        // Pin validated IP to prevent DNS rebinding (TOCTOU) — reqwest will
+        // connect to the validated IP directly instead of re-resolving.
+        if let Some((hostname, validated_ip)) = dns_pinning {
+            client_builder =
+                client_builder.resolve(&hostname, std::net::SocketAddr::new(validated_ip, 0));
+        }
+
+        let client = client_builder.build().map_err(|e| {
+            ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
+        })?;
+
+        let resp = client
+            .get(current_url.clone())
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .send()
+            .await
+            .map_err(|e| ToolError::execution_failed(format!("Web request failed: {e}")))?;
+
+        if !resp.status().is_redirection() || redirects_followed >= MAX_REDIRECTS {
+            break resp;
+        }
+
+        let Some(location) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            break resp;
+        };
+
+        current_url = resp
+            .url()
+            .join(location)
+            .map_err(|e| ToolError::execution_failed(format!("invalid redirect location: {e}")))?;
+        redirects_followed += 1;
     };
-    let Some(host) = host_from_url(url) else {
-        return Ok(());
-    };
-    match decider.evaluate(&host, "web_run") {
-        Decision::Allow => Ok(()),
-        Decision::Deny => Err(ToolError::permission_denied(format!(
-            "network call to '{host}' blocked by network policy"
-        ))),
-        Decision::Prompt => Err(ToolError::permission_denied(format!(
-            "network call to '{host}' requires approval; \
-             re-run after `/network allow {host}` or set network.default = \"allow\" in config"
-        ))),
-    }
-}
 
-async fn fetch_page(url: &str, timeout_ms: u64) -> Result<WebPage, ToolError> {
-    let client = crate::tls::reqwest_client_builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| ToolError::execution_failed(format!("Failed to build HTTP client: {e}")))?;
-
-    let resp = client
-        .get(url)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-US,en;q=0.5")
-        .send()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Web request failed: {e}")))?;
-
+    let final_url = resp.url().to_string();
     let status = resp.status();
     let content_type = resp
         .headers()
@@ -1161,15 +1180,15 @@ async fn fetch_page(url: &str, timeout_ms: u64) -> Result<WebPage, ToolError> {
     }
 
     #[cfg(feature = "pdf")]
-    if is_pdf(&content_type, url) {
-        return parse_pdf_page(url, content_type, &bytes);
+    if is_pdf(&content_type, &final_url) {
+        return parse_pdf_page(&final_url, content_type, &bytes);
     }
 
     let body = String::from_utf8_lossy(&bytes).to_string();
-    let (lines, links, title) = parse_html(&body, url);
+    let (lines, links, title) = parse_html(&body, &final_url);
 
     Ok(WebPage {
-        url: url.to_string(),
+        url: final_url,
         title,
         content_type,
         lines,
@@ -1961,8 +1980,8 @@ mod tests {
         assert!(!looks_like_url("turn0search0"));
     }
 
-    #[test]
-    fn network_policy_denies_direct_open_url() {
+    #[tokio::test]
+    async fn network_policy_denies_direct_open_url() {
         use crate::network_policy::{Decision, NetworkPolicy, NetworkPolicyDecider};
 
         let policy = NetworkPolicy {
@@ -1975,8 +1994,104 @@ mod tests {
         let decider = NetworkPolicyDecider::new(policy, None);
         let ctx = ToolContext::new(PathBuf::from(".")).with_network_policy(decider);
 
-        let err = check_network_policy("https://example.com/private", &ctx)
+        let err = fetch_page("https://example.com/private", 5_000, &ctx)
+            .await
             .expect_err("blocked host should fail");
         assert!(format!("{err}").contains("blocked by network policy"));
+    }
+
+    fn ssrf_ctx() -> ToolContext {
+        ToolContext::new(PathBuf::from("."))
+    }
+
+    #[tokio::test]
+    async fn open_refuses_loopback_ip_url() {
+        let err = resolve_or_fetch_page("http://127.0.0.1/", 5_000, &ssrf_ctx())
+            .await
+            .expect_err("loopback open must be refused");
+        assert!(
+            format!("{err}").contains("restricted address"),
+            "expected restricted-address error; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_refuses_private_range_ip_url() {
+        let err = resolve_or_fetch_page("http://192.168.1.50/admin", 5_000, &ssrf_ctx())
+            .await
+            .expect_err("private-range open must be refused");
+        assert!(
+            format!("{err}").contains("restricted address"),
+            "expected restricted-address error; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_refuses_metadata_endpoint_ip_url() {
+        let err = resolve_or_fetch_page(
+            "http://169.254.169.254/latest/meta-data",
+            5_000,
+            &ssrf_ctx(),
+        )
+        .await
+        .expect_err("cloud metadata open must be refused");
+        assert!(
+            format!("{err}").contains("restricted address"),
+            "expected restricted-address error; got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_refuses_redirect_from_public_host_to_private_ip() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Serve a 302 from loopback; Location points at a private IP.
+        // fetch_page disables auto-redirects and re-validates every Location
+        // with the shared SSRF guard (same path as an open/click hop).
+        let server = MockServer::start().await;
+        let private_location = "http://10.0.0.5/internal";
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", private_location))
+            .mount(&server)
+            .await;
+
+        // Unguarded client confirms the mock shape (public-host stand-in → private).
+        let client = crate::tls::reqwest_client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let resp = client
+            .get(server.uri())
+            .send()
+            .await
+            .expect("unguarded mock fetch");
+        assert!(resp.status().is_redirection());
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("Location header");
+        let next = resp.url().join(location).expect("join redirect Location");
+        assert_eq!(next.as_str(), private_location);
+
+        // Exact re-validation hop fetch_page performs before following:
+        let err = validate_fetch_target(&next, &ssrf_ctx(), "web_run")
+            .await
+            .expect_err("redirect to private IP must be refused");
+        assert!(
+            format!("{err}").contains("restricted address"),
+            "expected restricted-address error consistent with fetch_url; got {err}"
+        );
+
+        // And the open path refuses when the target itself is the private URL
+        // (same guard entry point as a followed redirect).
+        let err = fetch_page(private_location, 5_000, &ssrf_ctx())
+            .await
+            .expect_err("private redirect target must be refused on open");
+        assert!(
+            format!("{err}").contains("restricted address"),
+            "expected restricted-address error; got {err}"
+        );
     }
 }
