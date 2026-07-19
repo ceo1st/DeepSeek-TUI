@@ -163,6 +163,7 @@ fn doctor_json_does_not_inherit_an_ambient_legacy_secret_from_an_explicit_home()
         )
         .env("DEEPSEEK_TUI_VERSION", env!("CARGO_PKG_VERSION"));
     preserve_host_rustup_home(&mut command);
+    preserve_host_platform_runtime(&mut command);
 
     let output = command.output().expect("run isolated doctor --json");
     assert!(
@@ -425,6 +426,7 @@ fn run_sealed_diagnostic<const N: usize>(args: [&str; N]) -> Output {
         )
         .env("DEEPSEEK_TUI_VERSION", env!("CARGO_PKG_VERSION"));
     preserve_host_rustup_home(&mut command);
+    preserve_host_platform_runtime(&mut command);
 
     let output = command.output().expect("run sealed diagnostic");
     assert!(
@@ -461,6 +463,7 @@ fn diagnostic_command(workspace: &std::path::Path, home: &std::path::Path) -> Co
         )
         .env("DEEPSEEK_TUI_VERSION", env!("CARGO_PKG_VERSION"));
     preserve_host_rustup_home(&mut command);
+    preserve_host_platform_runtime(&mut command);
     command
 }
 
@@ -581,6 +584,19 @@ fn preserve_host_rustup_home(command: &mut Command) {
         });
     if let Some(rustup_home) = rustup_home {
         command.env("RUSTUP_HOME", rustup_home);
+    }
+}
+
+/// `env_clear` is part of these tests' credential-isolation boundary, but a
+/// Windows child still needs the non-secret OS root variables used to locate
+/// platform networking components. Without them a reqwest client can fail its
+/// loopback connection before the local fixture ever receives a request.
+fn preserve_host_platform_runtime(_command: &mut Command) {
+    #[cfg(windows)]
+    for name in ["SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            _command.env(name, value);
+        }
     }
 }
 
