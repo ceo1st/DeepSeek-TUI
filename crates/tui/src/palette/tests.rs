@@ -427,8 +427,8 @@ fn adapt_color_drops_to_named_on_ansi16() {
 }
 
 #[test]
-fn semantic_tokens_keep_brand_compatibility_distinct_from_action() {
-    assert_eq!(WHALE_ACCENT_PRIMARY, WHALE_HUMAN);
+fn semantic_tokens_align_primary_accent_with_action_not_human_gold() {
+    assert_eq!(WHALE_ACCENT_PRIMARY, WHALE_ACTION);
     assert_eq!(WHALE_ACTION, WHALE_INFO);
     assert_ne!(WHALE_ACTION, WHALE_HUMAN);
 }

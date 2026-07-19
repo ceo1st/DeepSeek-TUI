@@ -11,9 +11,11 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Block, Borders, Widget},
 };
+
+use crate::palette;
 
 use super::renderable::Renderable;
 
@@ -113,13 +115,13 @@ impl Renderable for DecisionCard {
             return;
         }
 
-        let border_style = Style::default().fg(Color::Rgb(100, 160, 220));
+        let border_style = Style::default().fg(palette::WHALE_ACTION);
         let question_style = Style::default()
-            .fg(Color::Rgb(220, 220, 240))
+            .fg(palette::TEXT_BODY)
             .add_modifier(Modifier::BOLD);
-        let dim_style = Style::default().fg(Color::Rgb(140, 140, 160));
+        let dim_style = Style::default().fg(palette::TEXT_MUTED);
         let selected_style = Style::default()
-            .fg(Color::Rgb(80, 200, 255))
+            .fg(palette::WHALE_ACTION)
             .add_modifier(Modifier::BOLD);
 
         let block = Block::default()

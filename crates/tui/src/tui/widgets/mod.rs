@@ -3044,7 +3044,7 @@ fn apply_send_flash(
         return;
     };
 
-    let flash_bg = Color::Rgb(30, 40, 55); // subtle dark-blue tint
+    let flash_bg = palette::SURFACE_TOOL_ACTIVE; // subtle dark-blue tint
 
     for (idx, line) in lines.iter_mut().enumerate() {
         let line_index = top + idx;
@@ -4322,7 +4322,10 @@ mod tests {
 
         apply_send_flash(&mut lines, 0, &history, &line_meta, &original_index_map);
 
-        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Rgb(30, 40, 55)));
+        assert_eq!(
+            lines[0].spans[0].style.bg,
+            Some(palette::SURFACE_TOOL_ACTIVE)
+        );
     }
 
     #[test]

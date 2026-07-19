@@ -46,7 +46,7 @@ fn modal_block() -> Block<'static> {
     Block::default()
         .title(Line::from(vec![Span::styled(
             " Plan Confirmation ",
-            Style::default().fg(palette::WHALE_HUMAN).bold(),
+            Style::default().fg(palette::MODE_PLAN).bold(),
         )]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
@@ -905,6 +905,22 @@ mod tests {
 
         assert!(rendered.contains("> [2/y] Accept plan (Full Access)"));
         assert!(rendered.contains("Start implementation in Act without approval prompts"));
+    }
+
+    #[test]
+    fn plan_prompt_title_uses_structural_plan_ink_not_signal_gold() {
+        let area = Rect::new(0, 0, 110, 36);
+        let popup_area = centered_rect(72, 52, area);
+        let buf = render_buffer(&PlanPromptView::new(None), area.width, area.height);
+        let title_x = (popup_area.x..popup_area.x.saturating_add(popup_area.width))
+            .find(|x| {
+                buf[(*x, popup_area.y)].symbol() == "P"
+                    && buf[(x.saturating_add(1), popup_area.y)].symbol() == "l"
+            })
+            .expect("plan title should render");
+
+        assert_eq!(buf[(title_x, popup_area.y)].fg, palette::MODE_PLAN);
+        assert_ne!(buf[(title_x, popup_area.y)].fg, palette::WHALE_HUMAN);
     }
 
     #[test]

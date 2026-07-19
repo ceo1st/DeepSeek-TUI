@@ -15,16 +15,22 @@ pub const WHALE_TEXT_MUTED_RGB: (u8, u8, u8) = (147, 160, 184); // #93A0B8
 pub const WHALE_TEXT_HINT_RGB: (u8, u8, u8) = (132, 145, 170); // #8491AA
 #[allow(dead_code)]
 pub const WHALE_TEXT_DIM_RGB: (u8, u8, u8) = (105, 119, 145); // #697791
-pub const WHALE_ACTION_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Cobalt action blue
+pub const WHALE_ACTION_RGB: (u8, u8, u8) = (106, 174, 242); // #6AAEF2 Blue — owns interaction on dark
+#[allow(dead_code)]
+pub const WHALE_COBALT_RGB: (u8, u8, u8) = (49, 95, 216); // #315FD8 Cobalt — light-mode action
+#[allow(dead_code)]
+pub const WHALE_ICE_RGB: (u8, u8, u8) = (209, 235, 244); // #D1EBF4 Ice — structure on dark
+#[allow(dead_code)]
+pub const WHALE_CYAN_RGB: (u8, u8, u8) = (72, 215, 255); // #48D7FF Cyan — bounded accents only
 pub const WHALE_ACCENT_SECONDARY_RGB: (u8, u8, u8) = (79, 209, 197); // #4FD1C5 Seafoam
 pub const WHALE_HUMAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold
-/// Compatibility name retained for downstream callers that used the original
-/// Codewhale brand accent. New action/focus call sites should use
-/// [`WHALE_ACTION_RGB`] instead.
-pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = WHALE_HUMAN_RGB;
+/// Blue Stage grammar: the primary accent is the interaction blue. Signal Gold
+/// is reserved for the whale mark and human-attention roles
+/// ([`WHALE_HUMAN_RGB`]), never for general interaction.
+pub const WHALE_ACCENT_PRIMARY_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
 pub const WHALE_WORKING_GREEN_RGB: (u8, u8, u8) = (155, 214, 111); // #9BD66F Working Green
 #[allow(dead_code)]
-pub const WHALE_ACCENT_ACTION_RGB: (u8, u8, u8) = WHALE_HUMAN_RGB;
+pub const WHALE_ACCENT_ACTION_RGB: (u8, u8, u8) = WHALE_ACTION_RGB;
 pub const WHALE_ERROR_RGB: (u8, u8, u8) = (255, 134, 178); // #FF86B2 Rose danger
 pub const WHALE_ERROR_HOVER_RGB: (u8, u8, u8) = (255, 156, 194); // #FF9CC2
 pub const WHALE_ERROR_SURFACE_RGB: (u8, u8, u8) = (43, 21, 34); // #2B1522
@@ -68,7 +74,7 @@ pub const WHALE_DIFF_ADDED_BG_RGB: (u8, u8, u8) = (18, 42, 34); // #122A22
 pub const WHALE_DIFF_DELETED_BG_RGB: (u8, u8, u8) = (52, 24, 39); // #341827
 pub const WHALE_MODE_AGENT_RGB: (u8, u8, u8) = (118, 181, 245); // #76B5F5
 pub const WHALE_MODE_YOLO_RGB: (u8, u8, u8) = (255, 112, 160); // #FF70A0
-pub const WHALE_MODE_PLAN_RGB: (u8, u8, u8) = (255, 208, 106); // #FFD06A
+pub const WHALE_MODE_PLAN_RGB: (u8, u8, u8) = (185, 220, 236); // #B9DCEC Structural Ice
 pub const WHALE_MODE_OPERATE_RGB: (u8, u8, u8) = (173, 136, 255); // #AD88FF
 pub const WHALE_TOOL_LIVE_RGB: (u8, u8, u8) = WHALE_ACCENT_SECONDARY_RGB;
 pub const WHALE_TOOL_ISSUE_RGB: (u8, u8, u8) = WHALE_ERROR_RGB;
@@ -98,7 +104,7 @@ pub const LIGHT_DANGER_RGB: (u8, u8, u8) = (180, 35, 90); // #B4235A
 // adaptation can preserve it.
 pub const LIGHT_MODE_AGENT_RGB: (u8, u8, u8) = (50, 95, 216); // #325FD8
 pub const LIGHT_MODE_YOLO_RGB: (u8, u8, u8) = (181, 35, 90); // #B5235A
-pub const LIGHT_MODE_PLAN_RGB: (u8, u8, u8) = (123, 85, 0); // #7B5500
+pub const LIGHT_MODE_PLAN_RGB: (u8, u8, u8) = (52, 92, 128); // #345C80 Structural steel-blue
 pub const LIGHT_OPERATE_RGB: (u8, u8, u8) = (112, 71, 184); // #7047B8
 
 // Solarized Light palette colors
@@ -482,7 +488,6 @@ pub const SURFACE_TOOL: Color = Color::Rgb(
     WHALE_TOOL_SURFACE_RGB.1,
     WHALE_TOOL_SURFACE_RGB.2,
 );
-#[allow(dead_code)]
 pub const SURFACE_TOOL_ACTIVE: Color = Color::Rgb(
     WHALE_TOOL_ACTIVE_RGB.0,
     WHALE_TOOL_ACTIVE_RGB.1,

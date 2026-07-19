@@ -394,7 +394,7 @@ pub const DRACULA_UI_THEME: UiTheme = UiTheme {
 /// (the terminal's own default bg) and most text uses `Color::Reset`
 /// (terminal's own default fg). Accents are ANSI named colors so they
 /// also inherit the user's terminal palette (Solarized, Nord, custom
-/// schemes, etc.) rather than DeepSeek brand RGB.
+/// schemes, etc.) rather than Codewhale brand RGB.
 pub const TERMINAL_UI_THEME: UiTheme = UiTheme {
     name: "terminal",
     // Mode is reported as Dark to avoid the dark→light cell remap kicking
@@ -731,8 +731,8 @@ impl ThemeId {
         match self {
             Self::System => "Follow terminal background (COLORFGBG / macOS appearance)",
             Self::Terminal => "Inherit terminal colors fully (transparent surfaces, ANSI accents)",
-            Self::Whale => "Whale dark — deep navy & gold",
-            Self::WhaleLight => "DeepSeek light, paper-ish",
+            Self::Whale => "Whale dark — Blue Stage navy & action blue",
+            Self::WhaleLight => "Whale light — Blue Stage paper & cobalt",
             Self::Grayscale => "Color-minimal high contrast",
             Self::CatppuccinMocha => "Soft pastels on warm dark",
             Self::TokyoNight => "Deep blue/violet night palette",

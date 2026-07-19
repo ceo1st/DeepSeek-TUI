@@ -98,11 +98,11 @@ fn whale_roles_are_pinned_and_non_colliding() {
     assert_eq!(palette::WHALE_ERROR_RGB, (255, 134, 178));
     assert_eq!(palette::WHALE_MODE_AGENT_RGB, (118, 181, 245));
     assert_eq!(palette::WHALE_MODE_YOLO_RGB, (255, 112, 160));
-    assert_eq!(palette::WHALE_MODE_PLAN_RGB, (255, 208, 106));
+    assert_eq!(palette::WHALE_MODE_PLAN_RGB, (185, 220, 236));
     assert_eq!(palette::WHALE_MODE_OPERATE_RGB, (173, 136, 255));
     assert_eq!(palette::LIGHT_SUCCESS_FG_RGB, (20, 118, 61));
     assert_eq!(palette::LIGHT_MODE_AGENT_RGB, (50, 95, 216));
-    assert_eq!(palette::LIGHT_MODE_PLAN_RGB, (123, 85, 0));
+    assert_eq!(palette::LIGHT_MODE_PLAN_RGB, (52, 92, 128));
     assert_eq!(palette::LIGHT_OPERATE_RGB, (112, 71, 184));
     assert_eq!(palette::LIGHT_MODE_YOLO_RGB, (181, 35, 90));
     assert_eq!(palette::LIGHT_USER_BODY, palette::LIGHT_SUCCESS_FG);
@@ -115,6 +115,10 @@ fn whale_roles_are_pinned_and_non_colliding() {
     assert_eq!(ui.warning, palette::STATUS_WARNING);
     assert_eq!(ui.error_fg, palette::WHALE_ERROR);
     assert_eq!(ui.mode_operate, palette::MODE_OPERATE);
+    assert_ne!(
+        ui.mode_plan, ui.accent_action,
+        "Plan is structural; Signal Gold is reserved for human attention"
+    );
     assert_ne!(
         ui.status_working, ui.success,
         "live and done need separate ink"
@@ -226,7 +230,10 @@ fn contrast_guardrails_for_key_ui_pairs() {
         ("human", palette::UI_THEME.accent_action),
         ("warning", palette::UI_THEME.warning),
         ("danger", palette::UI_THEME.error_fg),
+        ("act mode", palette::UI_THEME.mode_agent),
+        ("plan mode", palette::UI_THEME.mode_plan),
         ("operate", palette::UI_THEME.mode_operate),
+        ("full-access mode", palette::UI_THEME.mode_yolo),
         ("success", palette::UI_THEME.success),
     ] {
         assert_min_contrast(label, foreground, palette::SURFACE_ELEVATED, min_readable);

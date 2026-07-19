@@ -27,8 +27,6 @@ use crate::tui::views::{
 };
 use unicode_width::UnicodeWidthStr;
 
-const STATUS_PICKER_SELECTION_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 72, 104);
-
 /// Picker state. We hold both the user's working selection AND the original
 /// snapshot so Esc can perfectly revert the live preview.
 pub struct StatusPickerView {
@@ -253,7 +251,7 @@ impl ModalView for StatusPickerView {
             if is_cursor {
                 let selected_style = Style::default()
                     .fg(palette::SELECTION_TEXT)
-                    .bg(STATUS_PICKER_SELECTION_BG)
+                    .bg(palette::SELECTION_BG)
                     .add_modifier(Modifier::BOLD);
                 let line = status_row_text(pointer, mark, item, content.width as usize);
                 lines.push(Line::from(Span::styled(line, selected_style)));
