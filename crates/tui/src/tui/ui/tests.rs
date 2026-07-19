@@ -11554,8 +11554,8 @@ fn session_snapshot_preserves_last_work_state_when_lock_is_busy() {
     assert_eq!(contended.work_state, expected);
 }
 
-#[test]
-fn session_snapshot_prefers_newer_memory_over_stale_disk_when_lock_is_busy() {
+#[tokio::test]
+async fn session_snapshot_prefers_newer_memory_over_stale_disk_when_lock_is_busy() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
@@ -11569,11 +11569,28 @@ fn session_snapshot_prefers_newer_memory_over_stale_disk_when_lock_is_busy() {
     manager
         .save_session(&disk_snapshot)
         .expect("save disk snapshot");
+    app.publish_pending_work_state()
+        .expect("publish saved disk state");
 
-    app.todos.try_lock().expect("todos lock").add(
+    let mut desired = crate::tools::todo::TodoList::from_snapshot(
+        &app.todos.try_lock().expect("todos lock").snapshot(),
+    )
+    .expect("current To-do state");
+    desired.add(
         "newer memory state".to_string(),
         crate::tools::todo::TodoStatus::InProgress,
     );
+    app.runtime_services
+        .work
+        .as_ref()
+        .expect("Work Graph runtime")
+        .apply_todo_update(
+            "work-cache-newer-than-disk",
+            "work_update",
+            &desired.snapshot(),
+        )
+        .await
+        .expect("graph-backed memory update");
     let memory_snapshot = build_session_snapshot(&mut app, &manager).expect("memory snapshot");
     assert_ne!(memory_snapshot.work_state, disk_snapshot.work_state);
 
@@ -11699,6 +11716,7 @@ fn contended_work_restore_leaves_current_session_wholly_unchanged() {
     app.current_session_id = Some("current-session".to_string());
     let mut session = saved_session_with_messages(vec![text_message("user", "replacement")]);
     session.work_state = Some(crate::session_manager::SessionWorkState {
+        graph: None,
         todos: crate::tools::todo::TodoListSnapshot {
             items: vec![crate::tools::todo::TodoItem {
                 id: 1,

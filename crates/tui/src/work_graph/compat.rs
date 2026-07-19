@@ -1,35 +1,121 @@
-//! Compat projections — signatures only in this slice.
+//! Pure compatibility projections for the pre-Work-Graph Plan and To-do wire
+//! formats.
 //!
-//! Invariant V10 is enforced at the type level: every projection is a pure
-//! function taking `&WorkGraphSnapshot` and returning owned data. Nothing
-//! hands a projection mutable graph access, so projections cannot write the
-//! graph or each other — one graph writes every projection.
-//!
-//! The session-compat slice implements these bodies (plan/todo snapshot
-//! derivation and legacy tool adapters). Until then they are declared but
-//! unimplemented so the type-level story — and its compile-time test — is
-//! already in force.
+//! The graph owns the ordering, metadata, titles, and states. These functions
+//! only derive owned snapshots; they never receive mutable graph access (V10).
 
-use super::model::WorkGraphSnapshot;
+use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
+use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
 
-/// Placeholder for the derived plan snapshot (shaped in the session-compat
-/// slice to match the existing plan store's wire format).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct PlanProjection;
+use super::model::{CompatPlanMetadata, NodeState, WorkGraphSnapshot, WorkNode};
 
-/// Placeholder for the derived todo snapshot (shaped in the session-compat
-/// slice to match the existing todo store's wire format).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct TodoProjection;
+pub type PlanProjection = PlanSnapshot;
+pub type TodoProjection = TodoListSnapshot;
 
-/// Derive the plan view. Pure function of the snapshot (V10).
-pub fn project_plan(snapshot: &WorkGraphSnapshot) -> PlanProjection {
-    let _ = snapshot;
-    unimplemented!("implemented in the session-compat slice")
+impl CompatPlanMetadata {
+    #[must_use]
+    pub fn from_plan_snapshot(snapshot: &PlanSnapshot) -> Self {
+        Self {
+            title: snapshot.title.clone(),
+            objective: snapshot.objective.clone(),
+            context_summary: snapshot.context_summary.clone(),
+            explanation: snapshot.explanation.clone(),
+            sources_used: snapshot.sources_used.clone(),
+            critical_files: snapshot.critical_files.clone(),
+            constraints: snapshot.constraints.clone(),
+            recommended_approach: snapshot.recommended_approach.clone(),
+            verification_plan: snapshot.verification_plan.clone(),
+            risks_and_unknowns: snapshot.risks_and_unknowns.clone(),
+            handoff_packet: snapshot.handoff_packet.clone(),
+        }
+    }
+
+    #[must_use]
+    fn to_plan_snapshot(&self) -> PlanSnapshot {
+        PlanSnapshot {
+            title: self.title.clone(),
+            objective: self.objective.clone(),
+            context_summary: self.context_summary.clone(),
+            explanation: self.explanation.clone(),
+            sources_used: self.sources_used.clone(),
+            critical_files: self.critical_files.clone(),
+            constraints: self.constraints.clone(),
+            recommended_approach: self.recommended_approach.clone(),
+            verification_plan: self.verification_plan.clone(),
+            risks_and_unknowns: self.risks_and_unknowns.clone(),
+            handoff_packet: self.handoff_packet.clone(),
+            items: Vec::new(),
+        }
+    }
 }
 
-/// Derive the todo view. Pure function of the snapshot (V10).
+/// Derive the complete legacy Strategy/Plan snapshot.
+#[must_use]
+pub fn project_plan(snapshot: &WorkGraphSnapshot) -> PlanProjection {
+    let mut plan = snapshot.compat.plan.to_plan_snapshot();
+    plan.items = snapshot
+        .compat
+        .plan_order
+        .iter()
+        .filter_map(|id| snapshot.node(id))
+        .map(|node| PlanItemArg {
+            step: node.title.clone(),
+            status: plan_status(node),
+        })
+        .collect();
+    plan
+}
+
+/// Derive the complete legacy To-do snapshot. Migration provenance stays in
+/// the graph; old readers receive clean, user-visible content.
+#[must_use]
 pub fn project_todos(snapshot: &WorkGraphSnapshot) -> TodoProjection {
-    let _ = snapshot;
-    unimplemented!("implemented in the session-compat slice")
+    let items = snapshot
+        .compat
+        .todos
+        .iter()
+        .filter_map(|binding| {
+            let node = snapshot.node(&binding.node)?;
+            Some(TodoItem {
+                id: binding.legacy_id,
+                content: node.title.clone(),
+                status: todo_status(node),
+            })
+        })
+        .collect::<Vec<_>>();
+    let completed = items
+        .iter()
+        .filter(|item| item.status == TodoStatus::Completed)
+        .count();
+    let completion_pct = if items.is_empty() {
+        0
+    } else {
+        let rounded = (completed.saturating_mul(100) + items.len() / 2) / items.len();
+        u8::try_from(rounded).unwrap_or(u8::MAX)
+    };
+    let in_progress_id = items
+        .iter()
+        .find(|item| item.status == TodoStatus::InProgress)
+        .map(|item| item.id);
+    TodoListSnapshot {
+        items,
+        completion_pct,
+        in_progress_id,
+    }
+}
+
+fn plan_status(node: &WorkNode) -> StepStatus {
+    match node.state {
+        NodeState::Active => StepStatus::InProgress,
+        NodeState::Completed | NodeState::Verified => StepStatus::Completed,
+        _ => StepStatus::Pending,
+    }
+}
+
+fn todo_status(node: &WorkNode) -> TodoStatus {
+    match node.state {
+        NodeState::Active => TodoStatus::InProgress,
+        NodeState::Completed | NodeState::Verified => TodoStatus::Completed,
+        _ => TodoStatus::Pending,
+    }
 }

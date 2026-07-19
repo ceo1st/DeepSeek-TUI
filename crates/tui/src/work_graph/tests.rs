@@ -464,6 +464,19 @@ fn v10_projections_are_pure_functions_of_snapshot() {
     let _todos: fn(&WorkGraphSnapshot) -> compat::TodoProjection = compat::project_todos;
 }
 
+#[test]
+fn compat_todo_binding_rejects_non_plan_step_node() {
+    let mut bad = seeded().snapshot().clone();
+    bad.compat.todos.push(CompatTodoBinding {
+        legacy_id: 1,
+        node: nid("root"),
+        plan_index: None,
+    });
+
+    let report = validate(&bad).expect_err("compat To-do rows must bind to PlanStep nodes");
+    assert!(report.contains_code(ValidationCode::Structural));
+}
+
 /// A representative change sequence exercising nodes, edges, bindings,
 /// reconciliation, evidence, proposals, and supersede.
 fn scripted_run() -> WorkGraph {

@@ -24,25 +24,30 @@
 mod compat;
 mod events;
 mod ids;
+mod migration;
 mod model;
 mod reducer;
+mod runtime;
 mod validate;
 
 #[cfg(test)]
 mod tests;
 
+pub use compat::{PlanProjection, TodoProjection, project_plan, project_todos};
 pub use events::{
     ApprovalRef, CancelOutcome, ChangeCtx, ChangeReceipt, ObservationSummary, OperationObservation,
     OwnerState, ProposedNodeUpdate, WorkGraphChange, WorkGraphProposal, WorkNodePatch,
 };
 pub use ids::{BindingId, ChangeId, ProposalId, WorkEdgeId, WorkNodeId};
+pub use migration::import_legacy;
 pub use model::{
-    AcceptanceRequirement, BoundedSet, BoundedVec, EdgeKind, EvidenceKind, EvidenceKindTag,
-    EvidenceRef, EvidenceRefError, HISTORY_CAP, IdempotencyKey, NodeKind, NodeState,
-    OperationBinding, Provenance, SCHEMA_VERSION, SEEN_KEYS_CAP, Ts, WorkEdge, WorkGraphSnapshot,
-    WorkNode, external_identity_is_well_formed,
+    AcceptanceRequirement, BoundedSet, BoundedVec, CompatPlanMetadata, CompatProjectionState,
+    CompatTodoBinding, EdgeKind, EvidenceKind, EvidenceKindTag, EvidenceRef, EvidenceRefError,
+    HISTORY_CAP, IdempotencyKey, NodeKind, NodeState, OperationBinding, Provenance, SCHEMA_VERSION,
+    SEEN_KEYS_CAP, Ts, WorkEdge, WorkGraphSnapshot, WorkNode, external_identity_is_well_formed,
 };
 pub use reducer::apply;
+pub use runtime::{SharedWorkRuntime, WorkRuntime, WorkRuntimeSnapshot, new_shared_work_runtime};
 pub use validate::{ValidationCode, ValidationReport, Violation, validate};
 
 /// Convenience wrapper owning the current snapshot. [`WorkGraph::apply`]

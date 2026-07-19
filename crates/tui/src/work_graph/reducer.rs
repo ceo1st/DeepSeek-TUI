@@ -173,6 +173,15 @@ fn apply_pure(
             };
             add_edge(&mut next, edge)?;
         }
+        WorkGraphChange::ReplaceCompatProjection { compat } => {
+            next.compat = compat.clone();
+        }
+        WorkGraphChange::SetImportDigest { digest } => {
+            if digest.is_empty() {
+                return Err(structural("legacy import digest cannot be empty"));
+            }
+            next.import_digest = Some(digest.clone());
+        }
     }
     Ok(next)
 }

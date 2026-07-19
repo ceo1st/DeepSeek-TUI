@@ -1130,6 +1130,7 @@ pub async fn run_tui(
         active_task_id: None,
         active_thread_id: None,
         dynamic_tool_executor: None,
+        work: app.runtime_services.work.clone(),
         // #456: plumb the App's HookExecutor so `exec_shell` can surface
         // the configured `shell_env` hooks. Clone the shared Arc.
         hook_executor: app.runtime_services.hook_executor.clone(),
@@ -2648,6 +2649,20 @@ async fn run_event_loop(
                         }
                         handle_tool_call_complete(app, &id, &name, &result);
 
+                        if result.is_ok()
+                            && is_work_graph_mutation_tool(&name)
+                            && let Err(err) = persist_pending_work_checkpoint(app).await
+                        {
+                            tracing::warn!(
+                                tool = %name,
+                                error = %err,
+                                "Work Graph checkpoint was not enqueued; projections remain unpublished"
+                            );
+                            app.status_message = Some(format!(
+                                "Work update is pending: checkpoint could not be queued ({err})"
+                            ));
+                        }
+
                         // Immediately refresh the task panel sidebar when a
                         // tool that changes task state completes, so the
                         // Tasks panel stays in sync with tool execution
@@ -3072,7 +3087,30 @@ async fn run_event_loop(
                         {
                             app.current_session_id = Some(session.metadata.id.clone());
                             completed_snapshot_id = Some(session.metadata.id.clone());
-                            persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+                            let queued = persistence_actor::try_persist(
+                                PersistRequest::SessionSnapshot(session),
+                            );
+                            if queued {
+                                if let Err(err) = publish_pending_work_projection(app).await {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "completed-turn Work projections remain unpublished"
+                                    );
+                                    app.status_message = Some(format!(
+                                        "Session queued, but Work views could not publish ({err})"
+                                    ));
+                                }
+                            } else if app
+                                .runtime_services
+                                .work
+                                .as_ref()
+                                .is_some_and(|work| work.has_pending_publish())
+                            {
+                                app.status_message = Some(
+                                    "Work update is pending: session snapshot could not be queued"
+                                        .to_string(),
+                                );
+                            }
                         }
                         if let Some(session_id) = completed_snapshot_id {
                             persistence_actor::persist(PersistRequest::ClearCheckpoint {
@@ -3236,9 +3274,14 @@ async fn run_event_loop(
                                 if app.current_session_id.is_none() {
                                     app.current_session_id = Some(session.metadata.id.clone());
                                 }
-                                persistence_actor::persist(PersistRequest::SaveCheckpoint {
-                                    session,
-                                });
+                                if let Err(err) = persist_with_pending_work_boundary(
+                                    app,
+                                    PersistRequest::SaveCheckpoint { session },
+                                ) {
+                                    app.status_message = Some(format!(
+                                        "Work update is pending: checkpoint could not be queued ({err})"
+                                    ));
+                                }
                             }
                         } else if app.session_title.is_none() {
                             // Never synchronously reload the growing session
@@ -6773,6 +6816,69 @@ fn build_session_snapshot(
     Ok(session)
 }
 
+fn is_work_graph_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "update_plan"
+            | "work_update"
+            | "checklist_write"
+            | "todo_write"
+            | "checklist_add"
+            | "todo_add"
+            | "checklist_update"
+            | "todo_update"
+    )
+}
+
+async fn publish_pending_work_projection(app: &mut App) -> Result<bool, String> {
+    let Some(work) = app.runtime_services.work.clone() else {
+        return Ok(false);
+    };
+    let published = work.publish_pending().await?;
+    if published {
+        app.cached_work_summary = None;
+    }
+    Ok(published)
+}
+
+async fn persist_pending_work_checkpoint(app: &mut App) -> Result<bool, String> {
+    let Some(work) = app.runtime_services.work.clone() else {
+        return Ok(false);
+    };
+    if !work.has_pending_publish() {
+        return Ok(false);
+    }
+    let manager = SessionManager::default_location()
+        .map_err(|err| format!("could not open sessions directory: {err}"))?;
+    let session = build_session_snapshot(app, &manager)?;
+    if app.current_session_id.is_none() {
+        app.current_session_id = Some(session.metadata.id.clone());
+    }
+    if !persistence_actor::try_persist(PersistRequest::SaveCheckpoint { session }) {
+        return Err("persistence actor is unavailable".to_string());
+    }
+    publish_pending_work_projection(app).await
+}
+
+fn persist_with_pending_work_boundary(
+    app: &mut App,
+    request: PersistRequest,
+) -> Result<(), String> {
+    let has_pending = app
+        .runtime_services
+        .work
+        .as_ref()
+        .is_some_and(|work| work.has_pending_publish());
+    if !has_pending {
+        persistence_actor::persist(request);
+        return Ok(());
+    }
+    if !persistence_actor::try_persist(request) {
+        return Err("persistence actor is unavailable".to_string());
+    }
+    app.publish_pending_work_state().map(|_| ())
+}
+
 fn apply_picker_session_rename_to_active_app(
     app: &mut App,
     metadata: crate::session_manager::SessionMetadata,
@@ -6921,7 +7027,13 @@ fn persist_recovery_snapshot(app: &mut App) {
         if app.current_session_id.is_none() {
             app.current_session_id = Some(session.metadata.id.clone());
         }
-        persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+        if let Err(err) =
+            persist_with_pending_work_boundary(app, PersistRequest::SessionSnapshot(session))
+        {
+            app.status_message = Some(format!(
+                "Work update is pending: recovery snapshot could not be queued ({err})"
+            ));
+        }
     }
 }
 
@@ -6930,7 +7042,13 @@ fn persist_full_reset_snapshot(app: &mut App) {
         && let Ok(session) = build_session_snapshot(app, &manager)
     {
         app.current_session_id = Some(session.metadata.id.clone());
-        persistence_actor::persist(PersistRequest::SessionSnapshot(session));
+        if let Err(err) =
+            persist_with_pending_work_boundary(app, PersistRequest::SessionSnapshot(session))
+        {
+            app.status_message = Some(format!(
+                "Work update is pending: reset snapshot could not be queued ({err})"
+            ));
+        }
     }
     // `/clear` and `/new` are explicit boundaries. Never let an older
     // in-flight checkpoint resurrect the session the user just discarded,
@@ -8281,7 +8399,13 @@ async fn dispatch_user_message(
         if app.current_session_id.is_none() {
             app.current_session_id = Some(session.metadata.id.clone());
         }
-        persistence_actor::persist(PersistRequest::SaveCheckpoint { session });
+        if let Err(err) =
+            persist_with_pending_work_boundary(app, PersistRequest::SaveCheckpoint { session })
+        {
+            app.status_message = Some(format!(
+                "Work update is pending: turn checkpoint could not be queued ({err})"
+            ));
+        }
     }
 
     Ok(())
@@ -10818,9 +10942,16 @@ async fn apply_plan_choice(
         PlanChoice::RevisePlan => PlanAcceptance::Revise,
         PlanChoice::ExitPlan => PlanAcceptance::Exit,
     };
-    project_accepted_plan(&app.plan_state, &app.todos, acceptance)
+    project_accepted_plan(
+        app.runtime_services.work.as_ref(),
+        app.current_session_id.as_deref(),
+        acceptance,
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("failed to project accepted plan: {err}"))?;
+    persist_pending_work_checkpoint(app)
         .await
-        .map_err(|err| anyhow::anyhow!("failed to project accepted plan: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("accepted plan was not checkpointed: {err}"))?;
 
     match choice {
         PlanChoice::AcceptAgent => {
@@ -12006,12 +12137,25 @@ async fn handle_view_events(
             ViewEvent::SessionRenamed { metadata } => {
                 let session_id = metadata.id.clone();
                 let title = metadata.title.clone();
+                let mut work_snapshot_warning = None;
                 if apply_picker_session_rename_to_active_app(app, metadata)
                     && let Ok(manager) = SessionManager::default_location()
                 {
                     match build_session_snapshot(app, &manager) {
                         Ok(session) => {
-                            persistence_actor::persist(PersistRequest::SessionSnapshot(session))
+                            if let Err(err) = persist_with_pending_work_boundary(
+                                app,
+                                PersistRequest::SessionSnapshot(session),
+                            ) {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    error = %err,
+                                    "Could not queue active session rename Work snapshot"
+                                );
+                                work_snapshot_warning = Some(format!(
+                                    "Session renamed, but Work snapshot is pending ({err})"
+                                ));
+                            }
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -12022,11 +12166,13 @@ async fn handle_view_events(
                         }
                     }
                 }
-                app.status_message = Some(format!(
-                    "Renamed session {} to \"{}\"",
-                    crate::session_manager::truncate_id(&session_id),
-                    title
-                ));
+                app.status_message = Some(work_snapshot_warning.unwrap_or_else(|| {
+                    format!(
+                        "Renamed session {} to \"{}\"",
+                        crate::session_manager::truncate_id(&session_id),
+                        title
+                    )
+                }));
             }
             ViewEvent::SessionDeleted { session_id, title } => {
                 app.status_message = Some(format!(
@@ -13629,7 +13775,7 @@ fn apply_loaded_session(
     // Restore/validate the contended state before mutating conversation or
     // workspace fields. A failed session switch must leave the current session
     // wholly intact.
-    app.restore_work_state(session.work_state.as_ref())?;
+    app.restore_work_state(&session.metadata.id, session.work_state.as_ref())?;
     *config = *restored_route.config;
     let projected_messages =
         crate::runtime_handoff::project_messages_for_restore(&session.messages);

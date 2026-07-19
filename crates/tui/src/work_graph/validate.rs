@@ -164,6 +164,81 @@ fn check_structural(snapshot: &WorkGraphSnapshot, out: &mut Vec<Violation>) {
             }
         }
     }
+
+    let mut plan_ids = HashSet::new();
+    for id in &snapshot.compat.plan_order {
+        if !plan_ids.insert(id) {
+            out.push(Violation {
+                code: ValidationCode::Structural,
+                message: format!("duplicate plan projection node {id}"),
+            });
+        }
+        match snapshot.node(id) {
+            Some(node) if matches!(node.kind, NodeKind::PlanStep) => {}
+            Some(_) => out.push(Violation {
+                code: ValidationCode::Structural,
+                message: format!("plan projection node {id} is not a PlanStep"),
+            }),
+            None => out.push(Violation {
+                code: ValidationCode::Structural,
+                message: format!("plan projection references missing node {id}"),
+            }),
+        }
+    }
+
+    let mut todo_ids = HashSet::new();
+    let mut active_todos = 0usize;
+    for binding in &snapshot.compat.todos {
+        if binding.legacy_id == 0 || !todo_ids.insert(binding.legacy_id) {
+            out.push(Violation {
+                code: ValidationCode::Structural,
+                message: format!("invalid or duplicate legacy To-do id {}", binding.legacy_id),
+            });
+        }
+        match snapshot.node(&binding.node) {
+            Some(node) => {
+                if node.kind != NodeKind::PlanStep {
+                    out.push(Violation {
+                        code: ValidationCode::Structural,
+                        message: format!(
+                            "To-do projection {} node {} is not a PlanStep",
+                            binding.legacy_id, binding.node
+                        ),
+                    });
+                }
+                if matches!(node.state, NodeState::Active) {
+                    active_todos += 1;
+                }
+            }
+            None => out.push(Violation {
+                code: ValidationCode::Structural,
+                message: format!(
+                    "To-do projection {} references missing node {}",
+                    binding.legacy_id, binding.node
+                ),
+            }),
+        }
+        if let Some(index) = binding.plan_index {
+            let aliased = usize::try_from(index)
+                .ok()
+                .and_then(|index| snapshot.compat.plan_order.get(index));
+            if aliased != Some(&binding.node) {
+                out.push(Violation {
+                    code: ValidationCode::Structural,
+                    message: format!(
+                        "To-do projection {} has an invalid plan alias",
+                        binding.legacy_id
+                    ),
+                });
+            }
+        }
+    }
+    if active_todos > 1 {
+        out.push(Violation {
+            code: ValidationCode::Structural,
+            message: "legacy To-do projection has more than one active row".to_string(),
+        });
+    }
 }
 
 /// V1: DFS three-color cycle detection over `DependsOn` edges.

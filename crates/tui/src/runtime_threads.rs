@@ -4990,6 +4990,7 @@ impl RuntimeThreadManager {
                     active_task_id: thread.task_id.clone(),
                     active_thread_id: Some(thread.id.clone()),
                     dynamic_tool_executor: Some(Arc::new(self.clone())),
+                    work: None,
                     shell_manager: None,
                     hook_executor: None,
                     handle_store: crate::tools::handle::new_shared_handle_store(),

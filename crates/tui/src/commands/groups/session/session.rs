@@ -59,11 +59,16 @@ pub fn save(app: &mut App, path: Option<&str>) -> CommandResult {
                 Ok(j) => j,
                 Err(e) => return CommandResult::error(format!("Failed to serialize session: {e}")),
             };
-            match std::fs::write(&save_path, json) {
+            match crate::utils::write_atomic(&save_path, json.as_bytes()) {
                 Ok(()) => {
                     app.current_session_id = Some(session.metadata.id.clone());
                     app.current_session_metadata = Some(session.metadata.clone());
                     app.session_title = Some(session.metadata.title.clone());
+                    if let Err(err) = app.publish_pending_work_state() {
+                        return CommandResult::error(format!(
+                            "Session saved, but Work views were not published: {err}"
+                        ));
+                    }
                     CommandResult::message(format!(
                         "Session saved to {} (ID: {})",
                         save_path.display(),
@@ -158,6 +163,11 @@ pub fn fork(app: &mut App) -> CommandResult {
 
     if let Err(err) = manager.save_session(&forked) {
         return CommandResult::error(format!("Failed to save forked session: {err}"));
+    }
+    if let Err(err) = app.publish_pending_work_state() {
+        return CommandResult::error(format!(
+            "Sessions saved, but Work views were not published: {err}"
+        ));
     }
 
     app.current_session_id = Some(forked.metadata.id.clone());

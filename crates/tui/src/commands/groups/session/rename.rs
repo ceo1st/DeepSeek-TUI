@@ -103,6 +103,11 @@ pub(crate) fn rename_with_manager(
         Ok(_) => {
             app.current_session_metadata = Some(session.metadata.clone());
             app.session_title = Some(new_title.to_string());
+            if let Err(err) = app.publish_pending_work_state() {
+                return CommandResult::error(format!(
+                    "Session renamed, but Work views were not published: {err}"
+                ));
+            }
             CommandResult::message(format!("Session renamed to \"{new_title}\""))
         }
         Err(e) => CommandResult::error(format!("Could not save session: {e}")),

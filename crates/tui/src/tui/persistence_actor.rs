@@ -114,9 +114,9 @@ pub struct PersistActorHandle {
 
 impl PersistActorHandle {
     /// Queue a persistence request without blocking. If the actor's channel is
-    /// closed (shutdown has already happened) the request is silently dropped.
-    pub fn try_send(&self, request: PersistRequest) {
-        let _ = self.tx.send(request);
+    /// closed (shutdown has already happened), return `false`.
+    pub fn try_send(&self, request: PersistRequest) -> bool {
+        self.tx.send(request).is_ok()
     }
 }
 
@@ -136,9 +136,15 @@ pub fn init_actor(handle: PersistActorHandle) {
 /// ignored) when the actor hasn't been initialised yet — this can happen in
 /// tests or early startup before the actor is ready.
 pub fn persist(request: PersistRequest) {
-    if let Some(handle) = ACTOR_TX.get() {
-        handle.try_send(request);
-    }
+    let _ = try_persist(request);
+}
+
+/// Queue persistence and report whether the actor accepted ownership. Work
+/// Graph projections use this acknowledgement as their publish boundary.
+pub fn try_persist(request: PersistRequest) -> bool {
+    ACTOR_TX
+        .get()
+        .is_some_and(|handle| handle.try_send(request))
 }
 
 // ---------------------------------------------------------------------------

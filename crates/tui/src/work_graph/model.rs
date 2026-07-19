@@ -404,6 +404,84 @@ pub struct WorkEdge {
     pub to: WorkNodeId,
 }
 
+/// Graph-owned presentation metadata for the legacy Strategy/Plan surface.
+///
+/// Plan steps themselves live as `PlanStep` nodes. These fields have no
+/// first-class node equivalent yet, so they remain attached to the graph as
+/// presentation metadata rather than living in a separately writable store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompatPlanMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources_used: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub critical_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_approach: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risks_and_unknowns: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_packet: Option<String>,
+}
+
+impl CompatPlanMetadata {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.objective.is_none()
+            && self.context_summary.is_none()
+            && self.explanation.is_none()
+            && self.sources_used.is_empty()
+            && self.critical_files.is_empty()
+            && self.constraints.is_empty()
+            && self.recommended_approach.is_none()
+            && self.verification_plan.is_none()
+            && self.risks_and_unknowns.is_none()
+            && self.handoff_packet.is_none()
+    }
+}
+
+/// One row in the legacy To-do projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompatTodoBinding {
+    pub legacy_id: u32,
+    pub node: WorkNodeId,
+    /// When present, the legacy row aliases this ordinal in `plan_order`.
+    /// The retired invisible marker is never reconstructed; the graph keeps
+    /// the provenance explicitly while old readers receive clean content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_index: Option<u32>,
+}
+
+/// Ordering and presentation state needed to derive old Plan/To-do snapshots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompatProjectionState {
+    #[serde(default, skip_serializing_if = "CompatPlanMetadata::is_empty")]
+    pub plan: CompatPlanMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_order: Vec<WorkNodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<CompatTodoBinding>,
+}
+
+impl CompatProjectionState {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.plan.is_empty() && self.plan_order.is_empty() && self.todos.is_empty()
+    }
+}
+
 /// Idempotency key for owner-reported observations: `(binding, seq)`. Applied
 /// changes carrying a key already inside the snapshot's dedup window become
 /// receipts without effect, so replayed runtime events cannot double-apply.
@@ -533,6 +611,9 @@ pub struct WorkGraphSnapshot {
     /// `(binding, seq)` dedup window for replayed runtime observations.
     pub seen_keys: BoundedSet<IdempotencyKey, SEEN_KEYS_CAP>,
     pub proposals: Vec<WorkGraphProposal>,
+    /// Graph-owned inputs for the fully populated legacy Plan/To-do views.
+    #[serde(default, skip_serializing_if = "CompatProjectionState::is_empty")]
+    pub compat: CompatProjectionState,
 }
 
 impl WorkGraphSnapshot {
@@ -547,6 +628,7 @@ impl WorkGraphSnapshot {
             import_digest: None,
             seen_keys: BoundedSet::new(),
             proposals: Vec::new(),
+            compat: CompatProjectionState::default(),
         }
     }
 
@@ -570,6 +652,16 @@ impl WorkGraphSnapshot {
     pub fn node_is_done(node: &WorkNode) -> bool {
         matches!(node.state, NodeState::Verified)
             || (matches!(node.state, NodeState::Completed) && node.acceptance.is_empty())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+            && self.edges.is_empty()
+            && self.history.is_empty()
+            && self.import_digest.is_none()
+            && self.proposals.is_empty()
+            && self.compat.is_empty()
     }
 }
 

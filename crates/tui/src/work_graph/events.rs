@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::{ChangeId, ProposalId, WorkEdgeId, WorkNodeId};
 use super::model::{
-    AcceptanceRequirement, EvidenceRef, IdempotencyKey, NodeState, OperationBinding, Provenance,
-    Ts, WorkEdge, WorkNode,
+    AcceptanceRequirement, CompatProjectionState, EvidenceRef, IdempotencyKey, NodeState,
+    OperationBinding, Provenance, Ts, WorkEdge, WorkNode,
 };
 
 /// A single mutation of the work graph. The reducer is the only write path;
@@ -63,6 +63,14 @@ pub enum WorkGraphChange {
         old: WorkNodeId,
         replacement: WorkNodeId,
     },
+    /// Atomically replace the inputs for the legacy Plan/To-do projections.
+    ReplaceCompatProjection {
+        compat: CompatProjectionState,
+    },
+    /// Record the canonical digest of a completed legacy import.
+    SetImportDigest {
+        digest: String,
+    },
 }
 
 impl WorkGraphChange {
@@ -81,6 +89,8 @@ impl WorkGraphChange {
             WorkGraphChange::ProposePlanDiff { .. } => "propose_plan_diff",
             WorkGraphChange::AcceptPlanDiff { .. } => "accept_plan_diff",
             WorkGraphChange::Supersede { .. } => "supersede",
+            WorkGraphChange::ReplaceCompatProjection { .. } => "replace_compat_projection",
+            WorkGraphChange::SetImportDigest { .. } => "set_import_digest",
         }
     }
 }

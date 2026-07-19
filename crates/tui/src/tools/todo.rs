@@ -332,7 +332,7 @@ impl ToolSpec for TodoAddTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let content = input
             .get("content")
@@ -344,9 +344,12 @@ impl ToolSpec for TodoAddTool {
             .and_then(TodoStatus::from_str)
             .unwrap_or(TodoStatus::Pending);
 
-        let mut list = self.todo_list.lock().await;
-        let item = list.add(content.to_string(), status);
-        let snapshot = list.snapshot();
+        let current = current_todo_snapshot(context, &self.todo_list).await?;
+        let mut desired = TodoList::from_snapshot(&current).map_err(ToolError::execution_failed)?;
+        let item = desired.add(content.to_string(), status);
+        let snapshot =
+            publish_todo_snapshot(context, &self.todo_list, self.tool_name, desired.snapshot())
+                .await?;
 
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
         Ok(ToolResult::success(format!(
@@ -428,7 +431,7 @@ impl ToolSpec for TodoUpdateTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let id = input
             .get("id")
@@ -441,9 +444,15 @@ impl ToolSpec for TodoUpdateTool {
             .and_then(TodoStatus::from_str)
             .ok_or_else(|| ToolError::invalid_input("Missing or invalid 'status'"))?;
 
-        let mut list = self.todo_list.lock().await;
-        let updated = list.update_status(id, status);
-        let snapshot = list.snapshot();
+        let current = current_todo_snapshot(context, &self.todo_list).await?;
+        let mut desired = TodoList::from_snapshot(&current).map_err(ToolError::execution_failed)?;
+        let updated = desired.update_status(id, status);
+        let snapshot = if updated.is_some() {
+            publish_todo_snapshot(context, &self.todo_list, self.tool_name, desired.snapshot())
+                .await?
+        } else {
+            current
+        };
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
 
         match updated {
@@ -517,10 +526,9 @@ impl ToolSpec for TodoListTool {
     async fn execute(
         &self,
         _input: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let list = self.todo_list.lock().await;
-        let snapshot = list.snapshot();
+        let snapshot = current_todo_snapshot(context, &self.todo_list).await?;
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
         Ok(ToolResult::success(format!(
             "Todo list ({} items, {}% complete)\n{}",
@@ -596,17 +604,14 @@ impl ToolSpec for TodoWriteTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let todos = input
             .get("todos")
             .and_then(|v| v.as_array())
             .ok_or_else(|| ToolError::invalid_input("Missing or invalid 'todos' array"))?;
 
-        let mut list = self.todo_list.lock().await;
-
-        // Clear and rebuild the list
-        list.clear();
+        let mut list = TodoList::new();
 
         for item in todos {
             let content = item
@@ -624,7 +629,9 @@ impl ToolSpec for TodoWriteTool {
             list.add(content.to_string(), status);
         }
 
-        let snapshot = list.snapshot();
+        let snapshot =
+            publish_todo_snapshot(context, &self.todo_list, self.tool_name, list.snapshot())
+                .await?;
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
 
         Ok(ToolResult::success(format!(
@@ -639,6 +646,40 @@ impl ToolSpec for TodoWriteTool {
 
 fn is_compat_alias(tool_name: &str) -> bool {
     tool_name != CANONICAL_PROGRESS_TOOL
+}
+
+async fn current_todo_snapshot(
+    context: &ToolContext,
+    todo_list: &SharedTodoList,
+) -> Result<TodoListSnapshot, ToolError> {
+    if let Some(work) = context.runtime.work.as_ref()
+        && work.matches_todos(todo_list)
+    {
+        return work
+            .current_todos()
+            .await
+            .map_err(ToolError::execution_failed);
+    }
+    Ok(todo_list.lock().await.snapshot())
+}
+
+async fn publish_todo_snapshot(
+    context: &ToolContext,
+    todo_list: &SharedTodoList,
+    tool_name: &str,
+    desired: TodoListSnapshot,
+) -> Result<TodoListSnapshot, ToolError> {
+    if let Some(work) = context.runtime.work.as_ref()
+        && work.matches_todos(todo_list)
+    {
+        return work
+            .apply_todo_update(&context.state_namespace, tool_name, &desired)
+            .await
+            .map_err(ToolError::execution_failed);
+    }
+    *todo_list.lock().await =
+        TodoList::from_snapshot(&desired).map_err(ToolError::execution_failed)?;
+    Ok(desired)
 }
 
 fn work_progress_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde_json::Value {
@@ -792,6 +833,45 @@ mod tests {
         assert_eq!(
             metadata["task_updates"]["checklist"]["items"][0]["content"],
             "wire durable task tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_update_and_hidden_alias_route_through_attached_graph() {
+        let todos = new_shared_todo_list();
+        let plan = crate::tools::plan::new_shared_plan_state();
+        let work = crate::work_graph::new_shared_work_runtime(todos.clone(), plan);
+        let mut context = ToolContext::new(std::env::temp_dir());
+        context.runtime.work = Some(work.clone());
+
+        TodoWriteTool::work_update(todos.clone())
+            .execute(
+                json!({"todos": [{"content": "Graph-owned", "status": "in_progress"}]}),
+                &context,
+            )
+            .await
+            .expect("work_update");
+        assert!(todos.lock().await.snapshot().is_empty());
+        TodoUpdateTool::checklist(todos.clone())
+            .execute(json!({"id": 1, "status": "completed"}), &context)
+            .await
+            .expect("hidden alias update");
+
+        let state = work
+            .capture(Some(&context.state_namespace))
+            .expect("capture")
+            .expect("graph state");
+        assert_eq!(state.todos.items[0].status, TodoStatus::Completed);
+        let node = state
+            .graph
+            .node(&state.graph.compat.todos[0].node)
+            .expect("projected node");
+        assert_eq!(node.state, crate::work_graph::NodeState::Completed);
+        assert!(todos.lock().await.snapshot().is_empty());
+        assert_eq!(work.publish_pending().await, Ok(true));
+        assert_eq!(
+            todos.lock().await.snapshot().items[0].status,
+            TodoStatus::Completed
         );
     }
 

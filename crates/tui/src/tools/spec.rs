@@ -57,6 +57,8 @@ pub struct RuntimeToolServices {
     pub active_task_id: Option<String>,
     pub active_thread_id: Option<String>,
     pub dynamic_tool_executor: Option<Arc<dyn DynamicToolExecutor>>,
+    /// Active-session Work Graph authority plus its legacy Plan/To-do views.
+    pub work: Option<crate::work_graph::SharedWorkRuntime>,
     /// Hook executor for `shell_env` injection (#456) and any future
     /// tool-side hook events. `None` outside the live engine — test
     /// contexts that don't care about hooks get a no-op.
@@ -78,6 +80,7 @@ impl Default for RuntimeToolServices {
             active_task_id: None,
             active_thread_id: None,
             dynamic_tool_executor: None,
+            work: None,
             hook_executor: None,
             handle_store: new_shared_handle_store(),
             rlm_sessions: new_shared_rlm_session_store(),
@@ -98,6 +101,7 @@ impl std::fmt::Debug for RuntimeToolServices {
                 "dynamic_tool_executor",
                 &self.dynamic_tool_executor.is_some(),
             )
+            .field("work", &self.work.is_some())
             .field("hook_executor", &self.hook_executor.is_some())
             .field("handle_store", &true)
             .field("rlm_sessions", &true)

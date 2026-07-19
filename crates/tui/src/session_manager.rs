@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 /// Maximum number of sessions to retain
 const MAX_SESSIONS: usize = 50;
+const WORK_GRAPH_IMPORT_ARCHIVE_DIR: &str = ".work-graph-import-archive";
 const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
 const CURRENT_QUEUE_SCHEMA_VERSION: u32 = 1;
 
@@ -212,8 +213,12 @@ impl SessionMetadata {
 
 /// Durable Work-panel state. Optional on [`SavedSession`] so every session
 /// written before v0.8.68 remains loadable without migration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionWorkState {
+    /// Authoritative Work Graph. Optional so pre-Work-Graph sessions and old
+    /// binaries continue to exchange fully populated Plan/To-do views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<crate::work_graph::WorkGraphSnapshot>,
     #[serde(default, skip_serializing_if = "TodoListSnapshot::is_empty")]
     pub todos: TodoListSnapshot,
     #[serde(default, skip_serializing_if = "PlanSnapshot::is_empty")]
@@ -223,7 +228,11 @@ pub struct SessionWorkState {
 impl SessionWorkState {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.todos.is_empty() && self.plan.is_empty()
+        self.graph
+            .as_ref()
+            .is_none_or(crate::work_graph::WorkGraphSnapshot::is_empty)
+            && self.todos.is_empty()
+            && self.plan.is_empty()
     }
 }
 
@@ -364,6 +373,8 @@ impl SessionManager {
     pub fn save_session(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
         let path = self.validated_session_path(&session.metadata.id)?;
 
+        self.archive_before_first_graph_write(session, &path)?;
+
         let content = serde_json::to_string_pretty(&session)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -382,11 +393,49 @@ impl SessionManager {
     /// concurrent sessions never overwrite each other's crash-recovery state.
     pub fn save_checkpoint(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
         let path = self.validated_checkpoint_path(&session.metadata.id)?;
+        let session_path = self.validated_session_path(&session.metadata.id)?;
+        self.archive_before_first_graph_write(session, &session_path)?;
         fs::create_dir_all(self.checkpoints_dir())?;
         let content = serde_json::to_string_pretty(&session)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_atomic(&path, content.as_bytes())?;
         Ok(path)
+    }
+
+    /// Preserve the exact pre-import session once, before the first graph-
+    /// bearing session or checkpoint write can replace it.
+    fn archive_before_first_graph_write(
+        &self,
+        session: &SavedSession,
+        source: &Path,
+    ) -> std::io::Result<()> {
+        let writes_graph = session
+            .work_state
+            .as_ref()
+            .and_then(|state| state.graph.as_ref())
+            .is_some_and(|graph| !graph.is_empty());
+        if !writes_graph || !source.exists() {
+            return Ok(());
+        }
+        let bytes = fs::read(source)?;
+        let already_graph_backed = serde_json::from_slice::<SavedSession>(&bytes)
+            .ok()
+            .and_then(|saved| saved.work_state)
+            .and_then(|state| state.graph)
+            .is_some_and(|graph| !graph.is_empty());
+        if already_graph_backed {
+            return Ok(());
+        }
+        let archive_dir = self.sessions_dir.join(WORK_GRAPH_IMPORT_ARCHIVE_DIR);
+        fs::create_dir_all(&archive_dir)?;
+        let archive =
+            archive_dir.join(source.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid session path")
+            })?);
+        if !archive.exists() {
+            write_atomic(&archive, &bytes)?;
+        }
+        Ok(())
     }
 
     fn read_checkpoint_file(&self, path: &Path) -> std::io::Result<Option<SavedSession>> {
@@ -2065,6 +2114,83 @@ mod tests {
                 .load_session_checkpoint(&session.metadata.id)
                 .expect("load checkpoint")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn graph_backed_work_state_remains_readable_by_legacy_shape() {
+        #[derive(serde::Deserialize)]
+        struct LegacyWorkState {
+            #[serde(default)]
+            todos: crate::tools::todo::TodoListSnapshot,
+            #[serde(default)]
+            plan: crate::tools::plan::PlanSnapshot,
+        }
+
+        let fixture = include_bytes!("../tests/fixtures/work_graph_session_v1_reader.json");
+        let current: SavedSession = serde_json::from_slice(fixture).expect("current reader");
+        let state = current.work_state.expect("fixture Work state");
+        let legacy: LegacyWorkState = serde_json::from_value(
+            serde_json::from_slice::<serde_json::Value>(fixture)
+                .expect("fixture JSON")["work_state"]
+                .clone(),
+        )
+        .expect("v1 reader ignores graph");
+        assert_eq!(legacy.todos, state.todos);
+        assert_eq!(legacy.plan, state.plan);
+        let graph = state.graph.expect("fixture graph");
+        crate::work_graph::validate(&graph).expect("valid fixture graph");
+        assert_eq!(crate::work_graph::project_todos(&graph), state.todos);
+        assert_eq!(crate::work_graph::project_plan(&graph), state.plan);
+    }
+
+    #[test]
+    fn first_graph_write_archives_exact_legacy_session_once() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let mut session = create_saved_session(
+            &[make_test_message("user", "archive before import")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let plan = crate::tools::plan::PlanSnapshot {
+            items: vec![crate::tools::plan::PlanItemArg {
+                step: "Import".to_string(),
+                status: crate::tools::plan::StepStatus::Pending,
+            }],
+            ..crate::tools::plan::PlanSnapshot::default()
+        };
+        let todos = crate::tools::todo::TodoListSnapshot::default();
+        session.work_state = Some(SessionWorkState {
+            graph: None,
+            todos: todos.clone(),
+            plan: plan.clone(),
+        });
+        let path = manager.save_session(&session).expect("save legacy session");
+        let legacy_bytes = fs::read(&path).expect("read legacy bytes");
+
+        let graph = crate::work_graph::import_legacy(&session.metadata.id, &plan, &todos)
+            .expect("import graph");
+        session.work_state = Some(SessionWorkState {
+            graph: Some(graph),
+            todos,
+            plan,
+        });
+        manager.save_session(&session).expect("first graph write");
+        let archive = manager
+            .sessions_dir
+            .join(WORK_GRAPH_IMPORT_ARCHIVE_DIR)
+            .join(path.file_name().expect("session filename"));
+        assert_eq!(fs::read(&archive).expect("archive exists"), legacy_bytes);
+
+        session.metadata.title = "later graph write".to_string();
+        manager.save_session(&session).expect("second graph write");
+        assert_eq!(
+            fs::read(&archive).expect("archive still exists"),
+            legacy_bytes,
+            "later graph writes must not replace the pre-import receipt"
         );
     }
 

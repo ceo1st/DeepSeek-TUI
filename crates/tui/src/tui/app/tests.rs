@@ -1644,7 +1644,7 @@ fn work_state_snapshot_round_trips_todos_and_plan() {
 
     let mut restored = App::new(test_options(false), &Config::default());
     restored
-        .restore_work_state(Some(&state))
+        .restore_work_state("restored-session", Some(&state))
         .expect("restore Work state");
     assert_eq!(
         restored.work_state_snapshot().expect("snapshot"),

@@ -3102,6 +3102,9 @@ impl App {
 
         // Initialize plan state
         let plan_state = new_shared_plan_state();
+        let todos = new_shared_todo_list();
+        let work_runtime =
+            crate::work_graph::new_shared_work_runtime(todos.clone(), plan_state.clone());
 
         let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
@@ -3366,9 +3369,10 @@ impl App {
             plan_state,
             plan_prompt_pending: false,
             plan_tool_used_in_turn: false,
-            todos: new_shared_todo_list(),
+            todos,
             runtime_services: RuntimeToolServices {
                 shell_manager: Some(shell_manager),
+                work: Some(work_runtime),
                 ..RuntimeToolServices::default()
             },
             mcp_snapshot: None,
@@ -6669,11 +6673,23 @@ impl App {
     /// Capture the durable Work state without ever converting lock contention
     /// into an empty snapshot.
     pub fn work_state_snapshot(&self) -> Result<Option<SessionWorkState>, String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            return work
+                .capture(self.current_session_id.as_deref())
+                .map(|state| {
+                    state.map(|state| SessionWorkState {
+                        graph: Some(state.graph),
+                        todos: state.todos,
+                        plan: state.plan,
+                    })
+                });
+        }
         let todos = Self::retry_lock(&self.todos, 100)
             .ok_or_else(|| "To-do state is busy; try saving again".to_string())?;
         let plan = Self::retry_lock(&self.plan_state, 100)
             .ok_or_else(|| "Plan state is busy; try saving again".to_string())?;
         let state = SessionWorkState {
+            graph: None,
             todos: todos.snapshot(),
             plan: plan.snapshot(),
         };
@@ -6684,6 +6700,19 @@ impl App {
     /// must skip a contended first save instead of pausing the UI or writing a
     /// false empty state.
     pub fn try_work_state_snapshot(&mut self) -> Result<Option<SessionWorkState>, String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            let state = work
+                .try_capture(self.current_session_id.as_deref())
+                .map(|state| {
+                    state.map(|state| SessionWorkState {
+                        graph: Some(state.graph),
+                        todos: state.todos,
+                        plan: state.plan,
+                    })
+                })?;
+            self.last_known_work_state = Some(state.clone());
+            return Ok(state);
+        }
         let todos = self
             .todos
             .try_lock()
@@ -6693,6 +6722,7 @@ impl App {
             .try_lock()
             .map_err(|_| "Plan state is busy".to_string())?;
         let state = SessionWorkState {
+            graph: None,
             todos: todos.snapshot(),
             plan: plan.snapshot(),
         };
@@ -6704,7 +6734,25 @@ impl App {
     }
 
     /// Atomically replace the live Work state from a saved session.
-    pub fn restore_work_state(&mut self, state: Option<&SessionWorkState>) -> Result<(), String> {
+    pub fn restore_work_state(
+        &mut self,
+        session_id: &str,
+        state: Option<&SessionWorkState>,
+    ) -> Result<(), String> {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            let empty = SessionWorkState::default();
+            let state = state.unwrap_or(&empty);
+            let restored =
+                work.restore(session_id, state.graph.as_ref(), &state.todos, &state.plan)?;
+            let normalized_state = restored.map(|state| SessionWorkState {
+                graph: Some(state.graph),
+                todos: state.todos,
+                plan: state.plan,
+            });
+            self.cached_work_summary = None;
+            self.last_known_work_state = Some(normalized_state);
+            return Ok(());
+        }
         let (restored_todos, restored_plan) = match state {
             Some(state) => (
                 TodoList::from_snapshot(&state.todos)?,
@@ -6713,6 +6761,7 @@ impl App {
             None => (TodoList::new(), PlanState::default()),
         };
         let normalized_state = SessionWorkState {
+            graph: None,
             todos: restored_todos.snapshot(),
             plan: restored_plan.snapshot(),
         };
@@ -6732,6 +6781,14 @@ impl App {
     }
 
     pub fn clear_todos(&mut self) -> bool {
+        if let Some(work) = self.runtime_services.work.as_ref() {
+            if !work.clear(self.current_session_id.as_deref()) {
+                return false;
+            }
+            self.cached_work_summary = None;
+            self.last_known_work_state = Some(None);
+            return true;
+        }
         // Acquire both stores before mutating either one. `/clear` must never
         // report success after clearing only half of the Work surface.
         let Some(mut todos) = Self::retry_lock(&self.todos, 100) else {
@@ -6747,6 +6804,20 @@ impl App {
         self.cached_work_summary = None;
         self.last_known_work_state = Some(None);
         true
+    }
+
+    /// Publish a validated Work Graph transaction after a synchronous caller
+    /// has completed its atomic session write.
+    pub fn publish_pending_work_state(&mut self) -> Result<bool, String> {
+        let published = self
+            .runtime_services
+            .work
+            .as_ref()
+            .map_or(Ok(false), |work| work.publish_pending_sync())?;
+        if published {
+            self.cached_work_summary = None;
+        }
+        Ok(published)
     }
 
     pub fn update_model_compaction_budget(&mut self) {
