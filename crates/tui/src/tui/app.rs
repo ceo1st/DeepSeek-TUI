@@ -1632,11 +1632,12 @@ pub enum SidebarRowAction {
     CancelAgent {
         agent_id: String,
     },
-    /// Safe read-only inspection for work rows without a mutable backend
-    /// action (for example an agent-owned To-do item).
-    InspectText {
-        label: String,
-        detail: String,
+    /// Open the Work Graph inspector in the shared pager. Any lifecycle stop
+    /// action is carried into that inspector instead of consuming row width.
+    InspectWork {
+        title: String,
+        body: String,
+        stop_action: Option<Box<SidebarRowAction>>,
     },
 }
 
@@ -1650,7 +1651,7 @@ impl SidebarRowAction {
             | Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
             | Self::CancelAgent { .. }
-            | Self::InspectText { .. } => None,
+            | Self::InspectWork { .. } => None,
         }
     }
 
@@ -1662,7 +1663,7 @@ impl SidebarRowAction {
             Self::CancelAgent { .. } => true,
             Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
-            | Self::InspectText { .. }
+            | Self::InspectWork { .. }
             | Self::HotbarSlot(_) => false,
         }
     }
