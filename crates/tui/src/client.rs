@@ -1012,7 +1012,8 @@ impl DeepSeekClient {
     /// Anthropic Messages, and OpenAI Responses — streaming and non-streaming
     /// alike — receive the same sanitized payload.
     fn prepare_model_bound_request(&self, mut request: MessageRequest) -> MessageRequest {
-        let repair = crate::tool_history_repair::repair_tool_call_pairs(&mut request.messages);
+        let repair =
+            crate::tool_history_repair::repair_tool_call_pairs_for_provider(&mut request.messages);
         if !repair.is_empty() {
             tracing::warn!(
                 repaired_call_ids = ?repair.repaired_call_ids,
@@ -2860,15 +2861,18 @@ mod tests {
                 )
             })
         }));
-        assert!(prepared.messages.iter().any(|message| {
-            message.role == "assistant"
-                && message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        ContentBlock::Text { text, .. }
-                            if text.contains("[tool_history_repair]")
-                    )
-                })
+        assert_eq!(
+            prepared.messages.last().expect("repaired result").role,
+            "user"
+        );
+        assert!(!prepared.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text, .. }
+                        if text.contains("[tool_history_repair]")
+                )
+            })
         }));
     }
 

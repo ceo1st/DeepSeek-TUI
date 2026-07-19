@@ -46,6 +46,24 @@ impl ToolRepairReceipt {
 /// call receives a synthetic error result directly after its assistant call
 /// message. A visible system receipt makes the repair apparent after resume.
 pub(crate) fn repair_tool_call_pairs(messages: &mut Vec<Message>) -> ToolRepairReceipt {
+    repair_tool_call_pairs_inner(messages, true)
+}
+
+/// Repair an ephemeral provider request without appending a trailing receipt.
+///
+/// Anthropic-style APIs interpret a final assistant message as a completion
+/// prefill. Pair repair must therefore leave the synthetic user tool result as
+/// the request tail; the durable session-facing path owns the visible receipt.
+pub(crate) fn repair_tool_call_pairs_for_provider(
+    messages: &mut Vec<Message>,
+) -> ToolRepairReceipt {
+    repair_tool_call_pairs_inner(messages, false)
+}
+
+fn repair_tool_call_pairs_inner(
+    messages: &mut Vec<Message>,
+    append_visible_receipt: bool,
+) -> ToolRepairReceipt {
     let mut call_message_by_id = HashMap::new();
     let mut call_ids_in_order = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
@@ -165,13 +183,15 @@ pub(crate) fn repair_tool_call_pairs(messages: &mut Vec<Message>) -> ToolRepairR
         }
     }
 
-    rebuilt.push(Message {
-        role: "assistant".to_string(),
-        content: vec![ContentBlock::Text {
-            text: receipt.visible_message(),
-            cache_control: None,
-        }],
-    });
+    if append_visible_receipt {
+        rebuilt.push(Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: receipt.visible_message(),
+                cache_control: None,
+            }],
+        });
+    }
     *messages = rebuilt;
     receipt
 }
@@ -248,6 +268,25 @@ mod tests {
             } if tool_use_id == "call-1" && content.contains("crashed_and_repaired")
         ));
         assert_eq!(messages.last().expect("receipt").role, "assistant");
+    }
+
+    #[test]
+    fn provider_repair_never_appends_an_assistant_prefill_receipt() {
+        let mut messages = vec![tool_call("call-1")];
+
+        let receipt = repair_tool_call_pairs_for_provider(&mut messages);
+
+        assert_eq!(receipt.repaired_call_ids, vec!["call-1"]);
+        assert_eq!(messages.last().expect("synthetic result").role, "user");
+        assert!(!messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text, .. }
+                        if text.contains("[tool_history_repair]")
+                )
+            })
+        }));
     }
 
     #[test]

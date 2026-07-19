@@ -39,8 +39,8 @@ impl ToolTerminalStatus {
 #[derive(Debug, Clone)]
 pub struct ToolExecutionOutcome {
     pub status: ToolTerminalStatus,
-    pub result: Option<ToolResult>,
-    pub error: Option<ToolError>,
+    result: Option<ToolResult>,
+    error: Option<ToolError>,
 }
 
 impl ToolExecutionOutcome {
