@@ -127,6 +127,20 @@ pub enum Op {
         provenance: UserInputProvenance,
     },
 
+    /// Re-check and dispatch an interactive goal continuation when this
+    /// operation reaches the front of the engine queue. Keeping this distinct
+    /// from `SendMessage` prevents a queued `/goal pause` or `/goal clear`
+    /// from being overwritten by a stale synthetic Active snapshot.
+    ContinueGoal {
+        /// Runtime-supplied tools remain available across the synthetic turn
+        /// that continues the same logical goal run.
+        dynamic_tools: Vec<DynamicToolSpec>,
+        /// Opaque identity for an engine-owned synthetic continuation. Direct
+        /// callers use `None`; the engine uses `Some` to coalesce one token
+        /// across capacity-waiting, enqueued, and running-adjacent states.
+        engine_schedule_id: Option<u64>,
+    },
+
     /// Execute a user-submitted composer shell command (`! <command>`) without
     /// sending a model turn. This still routes through `exec_shell`, approval,
     /// sandbox, and command-safety handling.

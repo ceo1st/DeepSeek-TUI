@@ -81,6 +81,9 @@ use super::session::Session;
 use super::tool_parser;
 use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
 
+const ENGINE_OP_CHANNEL_CAPACITY: usize = 32;
+const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
+
 /// Snapshot of parent state that can be passed to forked sub-agents without
 /// rewriting the parent transcript.
 #[derive(Debug, Clone, Default)]
@@ -645,6 +648,11 @@ pub struct Engine {
     /// Clone of the op-channel sender, so the engine can self-dispatch ops
     /// (e.g. a goal-continuation `SendMessage` after a turn completes).
     tx_op: mpsc::Sender<Op>,
+    /// At most one engine-owned continuation across capacity-waiting and
+    /// enqueued states. The authoritative dynamic-tool set stays here so a
+    /// later successful turn can refresh it without adding a second token.
+    scheduled_goal_continuation: Option<ScheduledGoalContinuation>,
+    goal_continuation_schedule_seq: u64,
     rx_approval: mpsc::Receiver<ApprovalDecision>,
     rx_user_input: mpsc::Receiver<UserInputDecision>,
     rx_steer: mpsc::Receiver<String>,
@@ -714,6 +722,44 @@ fn claim_subagent_completion(
     delivered_ids
         .insert(completion.agent_id.clone())
         .then_some(completion)
+}
+
+enum GoalContinuationAction {
+    Inactive,
+    Dispatch {
+        content: String,
+        snapshot: Box<GoalSnapshot>,
+    },
+    Stopped {
+        message: String,
+    },
+}
+
+struct ScheduledGoalContinuation {
+    id: u64,
+    dynamic_tools: Vec<DynamicToolSpec>,
+    enqueued: bool,
+}
+
+enum SendMessageOutcome {
+    NotStarted {
+        error: Option<String>,
+    },
+    Finished {
+        status: TurnOutcomeStatus,
+        error: Option<String>,
+    },
+}
+
+enum EngineRunInput {
+    Operation(Box<Op>),
+    SubAgentCompletion(SubAgentCompletion),
+}
+
+impl SendMessageOutcome {
+    fn started(&self) -> bool {
+        matches!(self, Self::Finished { .. })
+    }
 }
 
 // === Internal tool helpers ===
@@ -1008,7 +1054,7 @@ impl Engine {
             );
         }
 
-        let (tx_op, rx_op) = mpsc::channel(32);
+        let (tx_op, rx_op) = mpsc::channel(ENGINE_OP_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = mpsc::channel(256);
         let (tx_approval, rx_approval) = mpsc::channel(64);
         let (tx_user_input, rx_user_input) = mpsc::channel(32);
@@ -1204,6 +1250,8 @@ impl Engine {
             active_route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             rx_op,
             tx_op: tx_op.clone(),
+            scheduled_goal_continuation: None,
+            goal_continuation_schedule_seq: 0,
             rx_approval,
             rx_user_input,
             rx_steer,
@@ -1550,14 +1598,180 @@ impl Engine {
             || self.session.approval_mode == crate::tui::approval::ApprovalMode::Bypass;
     }
 
+    fn schedule_goal_continuation(&mut self, dynamic_tools: Vec<DynamicToolSpec>) {
+        if let Some(scheduled) = self.scheduled_goal_continuation.as_mut() {
+            // A normal user turn or idle child handoff can finish while the
+            // prior synthetic token is already queued. Refresh that one token
+            // instead of multiplying autonomous turns and provider spend.
+            scheduled.dynamic_tools = dynamic_tools;
+            self.try_flush_pending_goal_continuation();
+            return;
+        }
+
+        self.goal_continuation_schedule_seq =
+            self.goal_continuation_schedule_seq.wrapping_add(1).max(1);
+        self.scheduled_goal_continuation = Some(ScheduledGoalContinuation {
+            id: self.goal_continuation_schedule_seq,
+            dynamic_tools,
+            enqueued: false,
+        });
+        self.try_flush_pending_goal_continuation();
+    }
+
+    fn cancel_scheduled_goal_continuation(&mut self) {
+        if self.scheduled_goal_continuation.take().is_some() {
+            tracing::debug!(
+                "cancelled an outstanding goal continuation after a non-completed turn"
+            );
+        }
+    }
+
+    fn take_scheduled_goal_continuation(
+        &mut self,
+        engine_schedule_id: Option<u64>,
+        direct_dynamic_tools: Vec<DynamicToolSpec>,
+    ) -> Option<Vec<DynamicToolSpec>> {
+        let Some(schedule_id) = engine_schedule_id else {
+            return Some(direct_dynamic_tools);
+        };
+        let Some(scheduled) = self.scheduled_goal_continuation.take() else {
+            tracing::warn!(
+                schedule_id,
+                "discarding stale engine-owned goal continuation token"
+            );
+            return None;
+        };
+        if scheduled.id != schedule_id {
+            tracing::warn!(
+                schedule_id,
+                current_schedule_id = scheduled.id,
+                "discarding superseded engine-owned goal continuation token"
+            );
+            self.scheduled_goal_continuation = Some(scheduled);
+            return None;
+        }
+
+        // Clear before executing the synthetic turn. A successful execution
+        // may now schedule exactly one replacement; inactive/failed turns do
+        // not leave a phantom outstanding marker behind.
+        Some(scheduled.dynamic_tools)
+    }
+
+    fn has_scheduled_goal_continuation(&self) -> bool {
+        self.scheduled_goal_continuation.is_some()
+    }
+
+    fn bounded_redacted_goal_failure_detail(&self, detail: &str) -> Option<String> {
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return None;
+        }
+        // This message becomes durable goal state. Reuse the model boundary's
+        // exact configured-secret redactor when available; that helper also
+        // applies the config persistence redactor as a universal backstop.
+        let detail = self.deepseek_client.as_ref().map_or_else(
+            || codewhale_config::persistence::redact_secrets(detail),
+            |client| client.redact_model_bound_text(detail),
+        );
+        Some(crate::utils::truncate_with_ellipsis(
+            &detail,
+            GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES,
+            "…",
+        ))
+    }
+
+    fn goal_continuation_failure_message(&self, error: Option<&str>) -> String {
+        self.bounded_redacted_goal_failure_detail(error.unwrap_or_default()).map_or_else(
+            || {
+                "Goal continuation blocked because the model turn failed without a provider reason. Fix the provider route or credentials, then resume the goal."
+                    .to_string()
+            },
+            |detail| {
+                format!(
+                    "Goal continuation blocked because the model turn failed: {detail}. Fix the failure, then resume the goal."
+                )
+            },
+        )
+    }
+
+    fn goal_turn_not_started_message(&self, error: Option<&str>) -> String {
+        self.bounded_redacted_goal_failure_detail(error.unwrap_or_default()).map_or_else(
+            || {
+                "Goal continuation blocked because the next model turn could not be started. Fix the provider route or credentials, then resume the goal."
+                    .to_string()
+            },
+            |detail| {
+                format!(
+                    "Goal continuation blocked because the next model turn could not be started: {detail}. Fix the provider route or credentials, then resume the goal."
+                )
+            },
+        )
+    }
+
+    fn try_flush_pending_goal_continuation(&mut self) {
+        let Some(scheduled) = self.scheduled_goal_continuation.as_ref() else {
+            return;
+        };
+        if scheduled.enqueued {
+            return;
+        }
+        let schedule_id = scheduled.id;
+
+        match self.tx_op.try_send(Op::ContinueGoal {
+            // The authoritative set stays in `scheduled_goal_continuation` so
+            // later completed turns can refresh it without moving this token.
+            dynamic_tools: Vec::new(),
+            engine_schedule_id: Some(schedule_id),
+        }) {
+            Ok(()) => {
+                if let Some(scheduled) = self.scheduled_goal_continuation.as_mut()
+                    && scheduled.id == schedule_id
+                {
+                    scheduled.enqueued = true;
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("goal continuation dropped because the engine mailbox is closed");
+                if self
+                    .scheduled_goal_continuation
+                    .as_ref()
+                    .is_some_and(|scheduled| scheduled.id == schedule_id)
+                {
+                    self.scheduled_goal_continuation = None;
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+        }
+    }
+
+    async fn next_run_input(&mut self, host_managed_turns: bool) -> Option<EngineRunInput> {
+        // A full mailbox means queued controls must run first. Retrying at the
+        // top of each receive appends the continuation behind the remaining
+        // controls as soon as one slot becomes available.
+        self.try_flush_pending_goal_continuation();
+        if self.has_scheduled_goal_continuation() {
+            // The synthetic token sits behind every operation that was already
+            // queued when it was scheduled. Drain FIFO operations through that
+            // token before accepting an idle child completion, whether or not
+            // the mailbox happened to be full. Consuming or cancelling the
+            // schedule marker restores normal select fairness immediately.
+            self.rx_op
+                .recv()
+                .await
+                .map(|op| EngineRunInput::Operation(Box::new(op)))
+        } else {
+            tokio::select! {
+                op = self.rx_op.recv() => op.map(|op| EngineRunInput::Operation(Box::new(op))),
+                completion = self.rx_subagent_completion.recv(), if !host_managed_turns => {
+                    completion.map(EngineRunInput::SubAgentCompletion)
+                }
+            }
+        }
+    }
+
     /// Run the engine event loop
     #[allow(clippy::too_many_lines)]
     pub async fn run(mut self) {
-        enum EngineRunInput {
-            Operation(Box<Op>),
-            SubAgentCompletion(SubAgentCompletion),
-        }
-
         // RuntimeThreadManager owns durable turn claims and installs a thread
         // id in runtime services. Only the interactive TUI may autonomously
         // create a new turn while the engine is otherwise idle; a hosted
@@ -1566,13 +1780,7 @@ impl Engine {
         let host_managed_turns = self.host_managed_turns();
 
         loop {
-            let input = tokio::select! {
-                op = self.rx_op.recv() => op.map(|op| EngineRunInput::Operation(Box::new(op))),
-                completion = self.rx_subagent_completion.recv(), if !host_managed_turns => {
-                    completion.map(EngineRunInput::SubAgentCompletion)
-                }
-            };
-            let Some(input) = input else {
+            let Some(input) = self.next_run_input(host_managed_turns).await else {
                 break;
             };
 
@@ -1628,6 +1836,76 @@ impl Engine {
                             provenance,
                         )
                         .await;
+                    }
+                    Op::ContinueGoal {
+                        dynamic_tools,
+                        engine_schedule_id,
+                    } => {
+                        let Some(dynamic_tools) = self
+                            .take_scheduled_goal_continuation(engine_schedule_id, dynamic_tools)
+                        else {
+                            continue;
+                        };
+                        // Status controls queued while the previous turn was
+                        // running are processed before this operation. Re-read
+                        // the live goal now so pause/clear/complete/blocked can
+                        // cancel a stale continuation without starting a turn.
+                        let (content, goal_snapshot) = match self.goal_continuation_if_active() {
+                            GoalContinuationAction::Inactive => continue,
+                            GoalContinuationAction::Dispatch { content, snapshot } => {
+                                (content, *snapshot)
+                            }
+                            GoalContinuationAction::Stopped { message } => {
+                                self.block_goal_continuation(message).await;
+                                continue;
+                            }
+                        };
+                        // Budget and inactive-state decisions are route
+                        // independent. Resolve the live route only for a real
+                        // dispatch so an exhausted goal still reaches its
+                        // truthful terminal state when provider config drifted.
+                        let route = match self.current_runtime_route() {
+                            Ok(route) => route,
+                            Err(err) => {
+                                let message = format!(
+                                    "Goal continuation blocked because its provider route is no longer valid: {err}. Fix the route, then resume the goal."
+                                );
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                        "Goal continuation stopped because its provider route is no longer valid: {err}"
+                                    ))))
+                                    .await;
+                                self.block_goal_continuation(message).await;
+                                continue;
+                            }
+                        };
+
+                        let _ = self
+                            .handle_send_message(
+                                content,
+                                self.current_mode,
+                                route,
+                                self.config.compaction.clone(),
+                                goal_snapshot.objective,
+                                goal_snapshot.token_budget,
+                                GoalStatus::Active,
+                                self.session.reasoning_effort.clone(),
+                                self.session.reasoning_effort_auto,
+                                self.session.auto_model,
+                                self.session.allow_shell,
+                                self.session.trust_mode,
+                                self.session.auto_approve,
+                                self.session.approval_mode,
+                                self.config.translation_enabled,
+                                self.config.show_thinking,
+                                self.config.allowed_tools.clone(),
+                                dynamic_tools,
+                                self.config.hook_executor.clone(),
+                                self.config.verbosity.clone(),
+                                UserInputProvenance::Runtime,
+                            )
+                            .await;
                     }
                     Op::RunShellCommand {
                         command,
@@ -2087,6 +2365,12 @@ impl Engine {
                                         "Cannot edit the last turn because its provider route is no longer valid: {err}"
                                     ))))
                                     .await;
+                                let outcome = SendMessageOutcome::NotStarted {
+                                    error: Some(format!(
+                                        "provider route is no longer valid: {err}"
+                                    )),
+                                };
+                                self.reconcile_non_completed_goal_turn(&outcome).await;
                                 continue;
                             }
                         };
@@ -2529,6 +2813,10 @@ impl Engine {
                         "Cannot resume the turn because its provider route is no longer valid: {err}"
                     ))))
                     .await;
+                let outcome = SendMessageOutcome::NotStarted {
+                    error: Some(format!("provider route is no longer valid: {err}")),
+                };
+                self.reconcile_non_completed_goal_turn(&outcome).await;
                 return;
             }
         };
@@ -2549,7 +2837,7 @@ impl Engine {
             )))
             .await;
 
-        let recorded = self
+        let outcome = self
             .handle_send_message(
                 content,
                 self.current_mode,
@@ -2574,7 +2862,7 @@ impl Engine {
                 UserInputProvenance::SubAgentHandoff,
             )
             .await;
-        if !recorded {
+        if !outcome.started() {
             for agent_id in claimed_ids {
                 self.delivered_subagent_completion_ids.remove(&agent_id);
             }
@@ -2583,17 +2871,24 @@ impl Engine {
 
     /// Handle a send message operation
     #[allow(clippy::too_many_arguments)]
-    /// After a turn completes, check whether an active goal should keep going.
-    /// Returns a continuation message to re-dispatch as a new turn, or `None`
-    /// if the goal is complete, blocked, paused, or over an optional budget.
+    /// After a turn completes, decide whether an active goal should keep going.
+    /// Returns a continuation to dispatch, an explicit terminal budget stop,
+    /// or `Inactive` when no follow-up turn belongs in the queue.
     ///
     /// There is no continuation cap — a goal runs until the model self-reports
     /// done/blocked, the user pauses or clears, or an optional token/time
     /// budget is exhausted. The loop is "until done," not "until N turns."
-    fn goal_continuation_if_active(&self) -> Option<String> {
-        let snapshot = self.config.goal_state.lock().ok()?.snapshot();
+    fn goal_continuation_if_active(&self) -> GoalContinuationAction {
+        let mut state = match self.config.goal_state.lock() {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned during continuation check: {err}");
+                return GoalContinuationAction::Inactive;
+            }
+        };
+        let snapshot = state.snapshot();
         if !snapshot.is_active() {
-            return None;
+            return GoalContinuationAction::Inactive;
         }
 
         // The snapshot status is a string ("active", "paused", "complete",
@@ -2602,7 +2897,7 @@ impl Engine {
             "active" => crate::goal_loop::GoalRunStatus::Active,
             "complete" => crate::goal_loop::GoalRunStatus::Completed,
             // Paused / Blocked / unknown → no continuation.
-            _ => return None,
+            _ => return GoalContinuationAction::Inactive,
         };
 
         let decision = crate::goal_loop::decide_continuation(
@@ -2620,25 +2915,182 @@ impl Engine {
 
         match decision {
             crate::goal_loop::ContinuationDecision::Continue => {
-                Some(crate::tools::goal::render_continuation_prompt(
-                    &snapshot,
-                    snapshot.continuation_count,
-                ))
+                // A cross-turn dispatch is a real continuation pass just like
+                // the bounded intra-turn retry in `turn_loop`. Record it before
+                // rendering and carrying the snapshot so the durable prompt,
+                // telemetry, and next host sync all agree on the pass number.
+                state.record_continuation();
+                let snapshot = state.snapshot();
+                GoalContinuationAction::Dispatch {
+                    content: crate::tools::goal::render_continuation_prompt(
+                        &snapshot,
+                        snapshot.continuation_count,
+                    ),
+                    snapshot: Box::new(snapshot),
+                }
             }
-            // All stop reasons → no continuation. The caller (the async turn
-            // completion path) emits a status message for budget-exhaustion.
             crate::goal_loop::ContinuationDecision::Stop(reason) => {
                 tracing::info!(?reason, "goal continuation stopped");
-                None
+                let message = match reason {
+                    crate::goal_loop::StopReason::TokenBudget => format!(
+                        "Goal token budget reached ({} / {} tokens); automatic continuation stopped and the goal is blocked.",
+                        snapshot.tokens_used,
+                        snapshot.token_budget.unwrap_or_default(),
+                    ),
+                    crate::goal_loop::StopReason::TimeBudget => format!(
+                        "Goal time budget reached ({} seconds); automatic continuation stopped and the goal is blocked.",
+                        snapshot.time_used_seconds,
+                    ),
+                    crate::goal_loop::StopReason::ContinuationLimit => {
+                        "Goal continuation limit reached; automatic continuation stopped and the goal is blocked."
+                            .to_string()
+                    }
+                    crate::goal_loop::StopReason::Completed
+                    | crate::goal_loop::StopReason::Blocked => {
+                        return GoalContinuationAction::Inactive;
+                    }
+                };
+                GoalContinuationAction::Stopped { message }
             }
         }
+    }
+
+    /// Reconcile a turn that did not complete with the autonomous goal loop.
+    /// Hosted engines leave lifecycle decisions to their durable host. The
+    /// interactive engine must cancel any older queued synthetic token first,
+    /// then project an active goal into a truthful non-running state.
+    async fn reconcile_non_completed_goal_turn(&mut self, outcome: &SendMessageOutcome) {
+        if self.host_managed_turns() {
+            return;
+        }
+
+        self.cancel_scheduled_goal_continuation();
+        match outcome {
+            SendMessageOutcome::NotStarted { error } => {
+                let message = self.goal_turn_not_started_message(error.as_deref());
+                self.block_goal_continuation(message).await;
+            }
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Failed,
+                error,
+            } => {
+                let message = self.goal_continuation_failure_message(error.as_deref());
+                self.block_goal_continuation(message).await;
+            }
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                ..
+            } => self.pause_goal_after_interruption().await,
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Completed,
+                ..
+            } => {}
+        }
+    }
+
+    /// A route/client rejection can happen before normal turn setup copies the
+    /// host's just-declared goal into SharedGoalState. Seed only that goal
+    /// descriptor so the rejection can publish a truthful Blocked snapshot;
+    /// no user message or provider turn state is mutated here.
+    fn sync_unstarted_goal_for_terminal_projection(
+        &mut self,
+        objective: Option<&str>,
+        token_budget: Option<u32>,
+        status: GoalStatus,
+    ) {
+        let objective = normalized_goal_objective(objective);
+        if objective.is_none() || status != GoalStatus::Active {
+            return;
+        }
+        sync_goal_state_from_host(
+            &self.config.goal_state,
+            objective.as_deref(),
+            token_budget,
+            status,
+        );
+        self.config.goal_objective = objective;
+        self.config.goal_token_budget = token_budget;
+        self.config.goal_status = status;
+    }
+
+    /// Transition a still-active interactive goal to Blocked and publish every
+    /// host projection in one ordered path. Continuation failures happen
+    /// outside a model tool call, so without this bridge the loop can stop while
+    /// the prompt and sidebar continue to claim the goal is actively running.
+    async fn block_goal_continuation(&mut self, message: String) {
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if state.is_active()
+                    && let Err(err) = state.mark_blocked(message.clone())
+                {
+                    tracing::warn!("failed to mark goal continuation blocked: {err}");
+                    return;
+                }
+                let snapshot = state.snapshot();
+                if snapshot.status != GoalStatus::Blocked.as_str() {
+                    tracing::warn!(
+                        status = %snapshot.status,
+                        "goal changed before continuation blocker could be published"
+                    );
+                    return;
+                }
+                snapshot
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while blocking continuation: {err}");
+                return;
+            }
+        };
+
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = GoalStatus::Blocked;
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.tx_event.send(Event::status(message)).await;
+    }
+
+    /// A user cancellation is neither success nor a provider failure. Pause a
+    /// still-active goal so the sidebar and stable prompt do not claim that an
+    /// autonomous run remains live, and require an explicit `/goal resume`.
+    async fn pause_goal_after_interruption(&mut self) {
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if !state.is_active() {
+                    return;
+                }
+                let objective = state.objective().map(str::to_string);
+                let budget = state.token_budget();
+                state.sync_from_host_status(objective.as_deref(), budget, GoalStatus::Paused);
+                state.snapshot()
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while pausing interruption: {err}");
+                return;
+            }
+        };
+
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = GoalStatus::Paused;
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self
+            .tx_event
+            .send(Event::status(
+                "Goal paused because its model turn was interrupted; use /goal resume to continue."
+                    .to_string(),
+            ))
+            .await;
     }
 
     /// Handle `/goal pause|resume|clear|complete|blocked` by writing the new
     /// status to `SharedGoalState` so the cross-turn continuation loop respects
     /// it. This does NOT dispatch a model turn — it's a control-plane update.
     async fn handle_set_goal_status(&mut self, status: GoalStatus, clear: bool) {
-        match self.config.goal_state.lock() {
+        let snapshot = match self.config.goal_state.lock() {
             Ok(mut state) => {
                 if clear {
                     // `/goal clear` — wipe the objective entirely.
@@ -2652,11 +3104,34 @@ impl Engine {
                     let budget = state.token_budget();
                     state.sync_from_host_status(objective.as_deref(), budget, status);
                 }
+                state.snapshot()
             }
             Err(err) => {
                 tracing::warn!("goal state lock poisoned during SetGoalStatus: {err}");
+                return;
             }
-        }
+        };
+
+        // Keep every host-side projection aligned with the authoritative
+        // SharedGoalState. In particular, a cleared state must also clear the
+        // configured fallback used by `goal_objective_for_prompt`; otherwise a
+        // prompt refresh would silently restore the old <session_goal> block.
+        self.config.goal_objective.clone_from(&snapshot.objective);
+        self.config.goal_token_budget = snapshot.token_budget;
+        self.config.goal_status = if snapshot.objective.is_some() {
+            status
+        } else {
+            GoalStatus::Active
+        };
+        self.refresh_system_prompt();
+        self.emit_session_updated().await;
+        // Unlike routine end-of-turn updates, an explicit clear must publish
+        // the canonical empty snapshot. Keeping this scoped to the control op
+        // avoids an unrelated no-goal turn racing with a newly declared goal in
+        // the UI while still letting the clear win over a preceding active
+        // TurnComplete snapshot.
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+
         let label = if clear {
             "cleared"
         } else {
@@ -2671,7 +3146,6 @@ impl Engine {
             .tx_event
             .send(Event::status(format!("Goal {label}.")))
             .await;
-        self.emit_goal_updated().await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2698,7 +3172,7 @@ impl Engine {
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
         verbosity: Option<String>,
         provenance: UserInputProvenance,
-    ) -> bool {
+    ) -> SendMessageOutcome {
         let effective_provider = route.identity.provider;
         let provider_identity = route.identity.key.clone();
         let model = route.model.clone();
@@ -2710,7 +3184,14 @@ impl Engine {
                     "Cannot start the turn because its provider route is not ready: {err}"
                 ))))
                 .await;
-            return false;
+            self.sync_unstarted_goal_for_terminal_projection(
+                goal_objective.as_deref(),
+                goal_token_budget,
+                goal_status,
+            );
+            let outcome = SendMessageOutcome::NotStarted { error: Some(err) };
+            self.reconcile_non_completed_goal_turn(&outcome).await;
+            return outcome;
         }
 
         let input_policy = effective_input_policy(
@@ -2808,12 +3289,21 @@ impl Engine {
                 .send(Event::TurnComplete {
                     usage: turn.usage.clone(),
                     status: TurnOutcomeStatus::Failed,
-                    error: Some(message),
+                    error: Some(message.clone()),
                     tool_catalog: None,
                     base_url: None,
                 })
                 .await;
-            return false;
+            self.sync_unstarted_goal_for_terminal_projection(
+                goal_objective.as_deref(),
+                goal_token_budget,
+                goal_status,
+            );
+            let outcome = SendMessageOutcome::NotStarted {
+                error: Some(message),
+            };
+            self.reconcile_non_completed_goal_turn(&outcome).await;
+            return outcome;
         }
 
         self.session
@@ -3130,7 +3620,7 @@ impl Engine {
             .send(Event::TurnComplete {
                 usage: turn.usage,
                 status,
-                error,
+                error: error.clone(),
                 tool_catalog: tool_catalog_for_event,
                 base_url: base_url_for_event,
             })
@@ -3162,54 +3652,24 @@ impl Engine {
         // its own op channel. RuntimeThreadManager engines instead yield here:
         // their host must create the next durable claim before dispatching any
         // further turn. A Failed or Interrupted turn never continues.
+        let outcome = SendMessageOutcome::Finished { status, error };
         if !self.host_managed_turns()
-            && status == TurnOutcomeStatus::Completed
-            && let Some(continuation) = self.goal_continuation_if_active()
+            && matches!(
+                &outcome,
+                SendMessageOutcome::Finished {
+                    status: TurnOutcomeStatus::Completed,
+                    ..
+                }
+            )
         {
-            // Re-dispatch with the same route/mode/approval settings as
-            // the prior turn. The non-Copy values were moved into
-            // `self.config` / `self.session` earlier in this function, so
-            // we clone them back out here.
-            match self.current_runtime_route() {
-                Ok(route) => {
-                    let _ = self
-                        .tx_op
-                        .send(Op::SendMessage {
-                            content: continuation,
-                            mode,
-                            route: Box::new(route),
-                            compaction: Box::new(self.config.compaction.clone()),
-                            goal_objective: None,
-                            goal_token_budget: None,
-                            goal_status: GoalStatus::Active,
-                            reasoning_effort: self.session.reasoning_effort.clone(),
-                            reasoning_effort_auto,
-                            auto_model,
-                            allow_shell,
-                            trust_mode,
-                            auto_approve,
-                            approval_mode,
-                            translation_enabled,
-                            show_thinking,
-                            allowed_tools: self.config.allowed_tools.clone(),
-                            dynamic_tools: dynamic_tools.clone(),
-                            hook_executor: self.config.hook_executor.clone(),
-                            verbosity: self.config.verbosity.clone(),
-                            provenance: UserInputProvenance::Runtime,
-                        })
-                        .await;
-                }
-                Err(err) => {
-                    let _ = self
-                        .tx_event
-                        .send(Event::error(ErrorEnvelope::fatal_auth(format!(
-                            "Goal continuation stopped because its provider route is no longer valid: {err}"
-                        ))))
-                        .await;
-                }
-            }
+            // Queue a typed continuation instead of freezing an Active goal
+            // snapshot into a generic message. The operation re-reads the live
+            // state when consumed, after any already-queued goal controls.
+            self.schedule_goal_continuation(dynamic_tools);
+        } else {
+            self.reconcile_non_completed_goal_turn(&outcome).await;
         }
-        true
+        outcome
     }
 
     async fn handle_manual_compaction(&mut self) {
