@@ -7102,18 +7102,17 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
     let execution_config = config_for_cli_route(config, &route);
     let route_provider = execution_config.provider_identity_for(route.provider);
     let model = route.model.clone();
-    let reasoning_effort = route
-        .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &model, effort));
+    let user_prompt =
+        format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.");
+    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
+        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, &user_prompt)
+    });
 
     let system = SystemPrompt::Text(
         "You are a senior code reviewer. Focus on bugs, risks, behavioral regressions, and missing tests. \
 Provide findings ordered by severity with file references, then open questions, then a brief summary."
             .to_string(),
     );
-    let user_prompt =
-        format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.");
-
     let client = DeepSeekClient::new(&execution_config)?;
     let request = MessageRequest {
         model: model.clone(),
@@ -9008,6 +9007,20 @@ fn cli_reasoning_effort_value(
         .map(str::to_string)
 }
 
+fn cli_reasoning_effort_value_for_prompt(
+    config: &Config,
+    model: &str,
+    effort: crate::tui::app::ReasoningEffort,
+    prompt: &str,
+) -> Option<String> {
+    let resolved = if effort == crate::tui::app::ReasoningEffort::Auto {
+        crate::auto_reasoning::select(false, prompt)
+    } else {
+        effort
+    };
+    cli_reasoning_effort_value(config, model, resolved)
+}
+
 fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -9138,9 +9151,9 @@ async fn run_one_shot(
     let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route);
     let client = DeepSeekClient::new(&execution_config)?;
-    let reasoning_effort = route
-        .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &route.model, effort));
+    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
+        cli_reasoning_effort_value_for_prompt(&execution_config, &route.model, effort, prompt)
+    });
 
     let request = MessageRequest {
         model: route.model,
@@ -9188,9 +9201,9 @@ async fn run_one_shot_json(
     let provider = execution_config.provider_identity_for(route.provider);
     let client = DeepSeekClient::new(&execution_config)?;
     let model = route.model.clone();
-    let reasoning_effort = route
-        .reasoning_effort
-        .and_then(|effort| cli_reasoning_effort_value(&execution_config, &model, effort));
+    let reasoning_effort = route.reasoning_effort.and_then(|effort| {
+        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, prompt)
+    });
     let request = MessageRequest {
         model: model.clone(),
         messages: vec![Message {
@@ -13388,6 +13401,52 @@ mod terminal_mode_tests {
         );
         assert_eq!(normalize_cli_reasoning_effort("default").unwrap(), None);
         assert!(normalize_cli_reasoning_effort("expensive").is_err());
+    }
+
+    #[test]
+    fn cli_prompt_paths_resolve_auto_before_k3_route_normalization() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                moonshot: crate::config::ProviderConfig {
+                    base_url: Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                    model: Some(crate::config::KIMI_CODE_K3_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for (prompt, expected) in [
+            ("lookup the public docs", "low"),
+            ("debug this error", "max"),
+            ("review this ordinary change", "high"),
+        ] {
+            assert_eq!(
+                cli_reasoning_effort_value_for_prompt(
+                    &config,
+                    crate::config::KIMI_CODE_K3_MODEL,
+                    crate::tui::app::ReasoningEffort::Auto,
+                    prompt,
+                )
+                .as_deref(),
+                Some(expected),
+                "prompt selector must resolve Auto for `{prompt}`"
+            );
+        }
+
+        assert_eq!(
+            cli_reasoning_effort_value_for_prompt(
+                &config,
+                crate::config::KIMI_CODE_K3_MODEL,
+                crate::tui::app::ReasoningEffort::Off,
+                "debug must not override an explicit effort",
+            )
+            .as_deref(),
+            Some("low"),
+            "membership K3 still applies its exact-route always-thinking floor"
+        );
     }
 
     #[test]
