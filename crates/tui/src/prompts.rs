@@ -2983,7 +2983,9 @@ mod tests {
             // sentinel, workflow, and fork-context invariant. Keep the budget
             // tight so procedural detail stays out of the system prefix.
             let max_words = if name == "agent" { 580 } else { 350 };
-            let max_tokens = if name == "agent" { 1350 } else { 700 };
+            // The auto-fork contract sentence (#4599-adjacent cache work)
+            // costs a handful of tokens over the original compression target.
+            let max_tokens = if name == "agent" { 1360 } else { 700 };
 
             assert!(
                 word_count <= max_words,
@@ -3355,7 +3357,8 @@ mod tests {
             assert!(haystack.contains("byte-identical"));
             assert!(haystack.contains("DeepSeek prefix-cache reuse"));
         }
-        assert!(AGENT_MODE.contains("Fresh sessions are the default"));
+        assert!(AGENT_MODE.contains("`fork_context` is auto-chosen"));
+        assert!(AGENT_MODE.contains("write-capable, isolated, or re-routed children start fresh"));
     }
 
     #[test]
