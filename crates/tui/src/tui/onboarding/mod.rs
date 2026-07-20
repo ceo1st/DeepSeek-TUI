@@ -148,17 +148,36 @@ pub fn tips_lines(app: &App) -> Vec<ratatui::text::Line<'static>> {
 }
 
 pub fn default_marker_path() -> Option<PathBuf> {
-    crate::config::effective_home_dir().map(|home| marker_path_with_home(&home))
+    let primary_home = codewhale_config::codewhale_home().ok()?;
+    let legacy_home = if codewhale_config::codewhale_home_is_explicit() {
+        None
+    } else {
+        codewhale_config::legacy_deepseek_home().ok()
+    };
+    Some(marker_path_with_roots(
+        &primary_home,
+        legacy_home.as_deref(),
+    ))
 }
 
+#[cfg(test)]
 fn marker_path_with_home(home: &Path) -> PathBuf {
-    let primary = home.join(".codewhale").join(ONBOARDED_MARKER_FILE);
+    marker_path_with_roots(
+        &home.join(".codewhale"),
+        Some(home.join(".deepseek").as_path()),
+    )
+}
+
+fn marker_path_with_roots(primary_home: &Path, legacy_home: Option<&Path>) -> PathBuf {
+    let primary = primary_home.join(ONBOARDED_MARKER_FILE);
     if primary.exists() {
         return primary;
     }
-    let legacy = home.join(".deepseek").join(ONBOARDED_MARKER_FILE);
-    if legacy.exists() {
-        return legacy;
+    if let Some(legacy_home) = legacy_home {
+        let legacy = legacy_home.join(ONBOARDED_MARKER_FILE);
+        if legacy.exists() {
+            return legacy;
+        }
     }
     primary
 }
@@ -168,14 +187,22 @@ pub fn is_onboarded() -> bool {
 }
 
 pub fn mark_onboarded() -> std::io::Result<PathBuf> {
-    let home = crate::config::effective_home_dir().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "Home directory not found")
+    let path = default_marker_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Codewhale home directory not found",
+        )
     })?;
-    mark_onboarded_at_home(&home)
+    mark_onboarded_at_path(path)
 }
 
+#[cfg(test)]
 fn mark_onboarded_at_home(home: &Path) -> std::io::Result<PathBuf> {
     let path = marker_path_with_home(home);
+    mark_onboarded_at_path(path)
+}
+
+fn mark_onboarded_at_path(path: PathBuf) -> std::io::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -477,6 +504,37 @@ mod tests {
         }
 
         assert_eq!(marker_path_with_home(tmp.path()), primary);
+    }
+
+    #[test]
+    fn explicit_codewhale_home_marker_survives_restart_resolution() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ambient_home = tmp.path().join("ambient profile");
+        let isolated_home = tmp.path().join("isolated Codewhale state");
+        let ambient_legacy = ambient_home.join(".deepseek").join(ONBOARDED_MARKER_FILE);
+        std::fs::create_dir_all(ambient_legacy.parent().expect("legacy parent"))
+            .expect("mkdir legacy");
+        std::fs::write(&ambient_legacy, "").expect("seed ambient legacy marker");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", &ambient_home);
+        let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", &ambient_home);
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &isolated_home);
+
+        let expected = isolated_home.join(ONBOARDED_MARKER_FILE);
+        assert_eq!(default_marker_path().as_deref(), Some(expected.as_path()));
+        assert!(!is_onboarded());
+
+        let written = mark_onboarded().expect("mark onboarded");
+
+        assert_eq!(written, expected);
+        assert!(is_onboarded());
+        assert_eq!(default_marker_path().as_deref(), Some(expected.as_path()));
+        assert!(ambient_legacy.exists(), "legacy marker remains untouched");
+        assert!(
+            !ambient_home.join(".codewhale").exists(),
+            "an explicit state root must not write into the ambient profile"
+        );
     }
 
     #[test]

@@ -1785,6 +1785,19 @@ impl SetupWizardView {
         }
         let mut state = self.state.clone();
         state.set_step(spec.id(), entry);
+        if spec.id() == SetupStep::Constitution && status == StepStatus::Skipped {
+            // `S` is a durable response to the versioned checkpoint, just like
+            // choosing the explicit defer action. It only skips this setup
+            // checkpoint, though; it must not replace an already active
+            // bundled or custom Constitution choice. A fresh state has no
+            // active choice, so keep the bundled floor by recording Deferred.
+            let choice = if state.constitution_choice.is_explicit() {
+                state.constitution_choice
+            } else {
+                ConstitutionChoice::Deferred
+            };
+            state.complete_constitution_checkpoint(CONSTITUTION_CHECKPOINT_VERSION, choice);
+        }
         self.state = state.clone();
         if advance {
             self.move_next();
@@ -4106,8 +4119,15 @@ mod tests {
             panic!("expected skipped setup-state commit event");
         };
         assert_eq!(state.status(SetupStep::Constitution), StepStatus::Skipped);
+        assert_eq!(
+            state.constitution_checkpoint_completed_for.as_deref(),
+            Some(CONSTITUTION_CHECKPOINT_VERSION)
+        );
+        assert_eq!(state.constitution_choice, ConstitutionChoice::Deferred);
         assert!(message.contains("skipped"));
         assert_eq!(view.selected_step(), SetupStep::OperateFleet);
+        let restarted = SetupWizardView::new(state, Locale::En);
+        assert_eq!(restarted.selected_step(), SetupStep::Language);
 
         let action = view.handle_key(key(KeyCode::Char('r')));
 
@@ -4120,6 +4140,54 @@ mod tests {
             StepStatus::NeedsAction
         );
         assert!(message.contains("retry"));
+    }
+
+    #[test]
+    fn skipping_checkpoint_preserves_active_custom_constitution() {
+        let mut state = SetupState {
+            constitution_choice: ConstitutionChoice::GuidedCustom,
+            constitution_source: ConstitutionSource::UserGlobal,
+            constitution_validity: ConstitutionValidity::Valid,
+            constitution_authoring: Some(ConstitutionAuthoring::Guided),
+            constitution_preview_hash: Some("sha256:existing-custom-preview".to_string()),
+            constitution_preview_version: 7,
+            ..SetupState::default()
+        };
+        state.constitution_checkpoint_completed_for = Some("0.8.66".to_string());
+        let mut view = SetupWizardView::new_at_with_facts(
+            state,
+            Locale::En,
+            SetupStep::Constitution,
+            SetupRuntimeFacts::default(),
+        );
+
+        let action = view.handle_key(key(KeyCode::Char('s')));
+
+        let ViewAction::Emit(ViewEvent::SetupStateCommitRequested { state, message }) = action
+        else {
+            panic!("expected skipped setup-state commit event");
+        };
+        assert_eq!(state.status(SetupStep::Constitution), StepStatus::Skipped);
+        assert_eq!(
+            state.constitution_checkpoint_completed_for.as_deref(),
+            Some(CONSTITUTION_CHECKPOINT_VERSION)
+        );
+        assert_eq!(state.constitution_choice, ConstitutionChoice::GuidedCustom);
+        assert_eq!(state.constitution_source, ConstitutionSource::UserGlobal);
+        assert_eq!(state.constitution_validity, ConstitutionValidity::Valid);
+        assert_eq!(
+            state.constitution_authoring,
+            Some(ConstitutionAuthoring::Guided)
+        );
+        assert_eq!(
+            state.constitution_preview_hash.as_deref(),
+            Some("sha256:existing-custom-preview")
+        );
+        assert_eq!(state.constitution_preview_version, 7);
+        assert!(message.contains("skipped"));
+
+        let restarted = SetupWizardView::new(state, Locale::En);
+        assert_eq!(restarted.selected_step(), SetupStep::Language);
     }
 
     #[test]
