@@ -4,17 +4,22 @@
  * Fetches source-of-truth files from raw.githubusercontent.com on a schedule,
  * re-derives the same RepoFacts shape, compares to the value cached in KV (or
  * to the build-time fallback on first run), and if anything changed writes
- * the new facts to CURATED_KV under "facts:current". Pages prefer the KV
- * value over the build-time `FACTS` constant via `getFacts()`.
+ * the new facts to CURATED_KV under "facts:current". `getFacts()` accepts the
+ * KV value only when its exact source provenance is at least as new as the
+ * deployed build; published-release metadata is resolved separately.
  *
  * Mechanical drift (provider added, sandbox backend renamed, version bumped)
  * fixes itself within one cron tick — no redeploy. Semantic drift (a new
  * feature should be advertised on the homepage) is still left to humans.
  */
-import type { RepoFacts, ProviderFact } from "./facts.generated";
+import type {
+  PublishedReleaseFact,
+  RepoFacts,
+  ProviderFact,
+} from "./facts.generated";
 import { FACTS as BUILD_FACTS } from "./facts.generated";
 
-const RAW_BASE = "https://raw.githubusercontent.com/Hmbown/CodeWhale/main";
+const RAW_ROOT = "https://raw.githubusercontent.com/Hmbown/CodeWhale";
 const KV_KEY = "facts:current";
 const LOG_KEY = "facts:drift-log";
 
@@ -23,13 +28,22 @@ interface KVNamespace {
   put(k: string, v: string, o?: { expirationTtl?: number }): Promise<void>;
 }
 
-async function fetchText(path: string, ghToken?: string): Promise<string | null> {
+interface SourceMarker {
+  revision: string;
+  committedAt: string;
+}
+
+async function fetchText(
+  path: string,
+  revision: string,
+  ghToken?: string,
+): Promise<string | null> {
   const headers: Record<string, string> = {
     "User-Agent": "codewhale-web-drift",
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
-    const r = await fetch(`${RAW_BASE}/${path}`, { headers });
+    const r = await fetch(`${RAW_ROOT}/${revision}/${path}`, { headers });
     if (!r.ok) return null;
     return await r.text();
   } catch {
@@ -37,9 +51,13 @@ async function fetchText(path: string, ghToken?: string): Promise<string | null>
   }
 }
 
-async function fetchListing(dir: string, ghToken?: string): Promise<string[] | null> {
+async function fetchListing(
+  dir: string,
+  revision: string,
+  ghToken?: string,
+): Promise<string[] | null> {
   // Use GitHub Contents API to list a directory.
-  const url = `https://api.github.com/repos/Hmbown/CodeWhale/contents/${dir}?ref=main`;
+  const url = `https://api.github.com/repos/Hmbown/CodeWhale/contents/${dir}?ref=${revision}`;
   const headers: Record<string, string> = {
     "Accept": "application/vnd.github+json",
     "User-Agent": "codewhale-web-drift",
@@ -51,6 +69,39 @@ async function fetchListing(dir: string, ghToken?: string): Promise<string[] | n
     if (!r.ok) return null;
     const arr = (await r.json()) as { name: string; type: string }[];
     return arr.filter((e) => e.type === "file").map((e) => e.name);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchSourceMarker(ghToken?: string): Promise<SourceMarker | null> {
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "codewhale-web-drift",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (ghToken) headers.Authorization = `Bearer ${ghToken}`;
+  try {
+    const response = await fetch(
+      "https://api.github.com/repos/Hmbown/CodeWhale/commits/main",
+      { headers },
+    );
+    if (!response.ok) return null;
+    const json = (await response.json()) as {
+      sha?: string;
+      commit?: { committer?: { date?: string } };
+    };
+    const revision = json.sha;
+    const committedAt = json.commit?.committer?.date;
+    if (
+      !revision ||
+      !/^[0-9a-f]{40}$/i.test(revision) ||
+      !committedAt ||
+      !Number.isFinite(Date.parse(committedAt))
+    ) {
+      return null;
+    }
+    return { revision, committedAt };
   } catch {
     return null;
   }
@@ -107,7 +158,7 @@ function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
     MinimaxAnthropic: { id: "minimax-anthropic", label: "MiniMax (Anthropic-compatible)", env: "MINIMAX_API_KEY" },
     Openmodel: { id: "openmodel", label: "OpenModel", env: "OPENMODEL_API_KEY" },
     Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
-    LongCat: { id: "longcat", label: "LongCat", env: "LONGCAT_API_KEY" },
+    LongCat: { id: "longcat", label: "Meituan LongCat", env: "LONGCAT_API_KEY" },
     Meta: { id: "meta", label: "Meta Model API", env: "META_MODEL_API_KEY / MODEL_API_KEY" },
     Xai: { id: "xai", label: "xAI", env: "XAI_API_KEY" },
   };
@@ -140,12 +191,14 @@ function deriveSandboxBackends(files: string[]): string[] {
   };
   return files
     .map((f) => f.replace(/\.rs$/, ""))
-    .filter((n) => map[n])
+    .filter((name) => !["mod", "policy", "backend", "opensandbox", "windows"].includes(name))
     .sort()
-    .map((n) => map[n]);
+    .map((name) => map[name] ?? name);
 }
 
-async function fetchLatestRelease(ghToken?: string): Promise<string | null> {
+async function fetchLatestPublishedRelease(
+  ghToken?: string,
+): Promise<PublishedReleaseFact | null> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "codewhale-web-drift",
@@ -155,8 +208,26 @@ async function fetchLatestRelease(ghToken?: string): Promise<string | null> {
   try {
     const r = await fetch("https://api.github.com/repos/Hmbown/CodeWhale/releases/latest", { headers });
     if (!r.ok) return null;
-    const j = (await r.json()) as { tag_name?: string };
-    return j.tag_name ?? null;
+    const j = (await r.json()) as {
+      tag_name?: string;
+      published_at?: string;
+      html_url?: string;
+    };
+    if (
+      !j.tag_name ||
+      !/^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(j.tag_name) ||
+      !j.published_at ||
+      !Number.isFinite(Date.parse(j.published_at)) ||
+      !j.html_url
+    ) {
+      return null;
+    }
+    return {
+      tag: j.tag_name,
+      version: j.tag_name.slice(1),
+      publishedAt: j.published_at,
+      url: j.html_url,
+    };
   } catch {
     return null;
   }
@@ -171,15 +242,18 @@ function deriveLicense(licText: string): string | null {
 }
 
 export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts | null> {
-  const [cargo, configRs, configModels, sandboxFiles, npmPkg, licText, toolFiles, latestRelease] = await Promise.all([
-    fetchText("Cargo.toml", ghToken),
-    fetchText("crates/tui/src/config.rs", ghToken),
-    fetchText("crates/tui/src/config/models.rs", ghToken),
-    fetchListing("crates/tui/src/sandbox", ghToken),
-    fetchText("npm/codewhale/package.json", ghToken),
-    fetchText("LICENSE", ghToken),
-    fetchListing("crates/tui/src/tools", ghToken),
-    fetchLatestRelease(ghToken),
+  const source = await fetchSourceMarker(ghToken);
+  if (!source) return null;
+
+  const [cargo, configRs, configModels, sandboxFiles, npmPkg, licText, toolFiles, latestPublishedRelease] = await Promise.all([
+    fetchText("Cargo.toml", source.revision, ghToken),
+    fetchText("crates/tui/src/config.rs", source.revision, ghToken),
+    fetchText("crates/tui/src/config/models.rs", source.revision, ghToken),
+    fetchListing("crates/tui/src/sandbox", source.revision, ghToken),
+    fetchText("npm/codewhale/package.json", source.revision, ghToken),
+    fetchText("LICENSE", source.revision, ghToken),
+    fetchListing("crates/tui/src/tools", source.revision, ghToken),
+    fetchLatestPublishedRelease(ghToken),
   ]);
 
   void toolFiles; // unused now; build-time value is canonical
@@ -187,6 +261,8 @@ export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts
 
   const facts: RepoFacts = {
     generatedAt: new Date().toISOString(),
+    sourceRevision: source.revision,
+    sourceCommittedAt: source.committedAt,
     version: deriveVersion(cargo),
     crates: deriveCrates(cargo),
     sandboxBackends: sandboxFiles ? deriveSandboxBackends(sandboxFiles) : BUILD_FACTS.sandboxBackends,
@@ -200,7 +276,8 @@ export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts
     // build-time value through KV instead of approximating.
     toolCount: BUILD_FACTS.toolCount,
     license: licText ? deriveLicense(licText) : BUILD_FACTS.license,
-    latestRelease,
+    latestPublishedRelease:
+      latestPublishedRelease ?? BUILD_FACTS.latestPublishedRelease,
   };
 
   if (!facts.version || facts.crates.length === 0 || facts.providers.length === 0) {
@@ -216,7 +293,19 @@ interface DriftDiff {
 }
 
 function diff(a: RepoFacts, b: RepoFacts): DriftDiff[] {
-  const fields: (keyof RepoFacts)[] = ["version", "crates", "sandboxBackends", "providers", "defaultModel", "nodeEngines", "toolCount", "license", "latestRelease"];
+  const fields: (keyof RepoFacts)[] = [
+    "sourceRevision",
+    "sourceCommittedAt",
+    "version",
+    "crates",
+    "sandboxBackends",
+    "providers",
+    "defaultModel",
+    "nodeEngines",
+    "toolCount",
+    "license",
+    "latestPublishedRelease",
+  ];
   const out: DriftDiff[] = [];
   for (const f of fields) {
     const av = JSON.stringify(a[f]);
@@ -240,7 +329,17 @@ export async function runFactsDrift(env: { CURATED_KV?: KVNamespace; GITHUB_TOKE
   if (!remote) return { ok: false, reason: "remote derivation failed" };
 
   const cachedRaw = await env.CURATED_KV.get(KV_KEY);
-  const cached: RepoFacts = cachedRaw ? JSON.parse(cachedRaw) : BUILD_FACTS;
+  let cached: RepoFacts = BUILD_FACTS;
+  if (cachedRaw) {
+    try {
+      const parsed = JSON.parse(cachedRaw) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        cached = parsed as RepoFacts;
+      }
+    } catch {
+      // A truncated or legacy cache is replaced by the newly derived snapshot.
+    }
+  }
 
   const diffs = diff(cached, remote);
   if (diffs.length === 0) {

@@ -7,7 +7,13 @@ const root = new URL("../../", import.meta.url);
 const matrix = JSON.parse(
   readFileSync(new URL("docs/public-surface-facts.json", root), "utf8"),
 ) as {
-  release: { version: string; providerCount: number };
+  sourceCandidate: { version: string; providerCount: number; toolCount: number };
+  latestPublishedRelease: {
+    tag: string;
+    version: string;
+    publishedAt: string;
+    url: string;
+  };
   screenshot: {
     readme: string;
     website: string;
@@ -29,9 +35,17 @@ function pngDimensions(image: Buffer): [number, number] {
 }
 
 describe("public surface contracts", () => {
-  it("keeps checked-in release facts aligned with generated repository facts", () => {
-    expect(matrix.release.version).toBe(FACTS.version);
-    expect(matrix.release.providerCount).toBe(FACTS.providers.length);
+  it("keeps source-candidate and published-release facts distinct and aligned", () => {
+    expect(matrix.sourceCandidate.version).toBe(FACTS.version);
+    expect(matrix.sourceCandidate.providerCount).toBe(FACTS.providers.length);
+    expect(matrix.sourceCandidate.toolCount).toBe(FACTS.toolCount);
+    expect({
+      tag: matrix.latestPublishedRelease.tag,
+      version: matrix.latestPublishedRelease.version,
+      publishedAt: matrix.latestPublishedRelease.publishedAt,
+      url: matrix.latestPublishedRelease.url,
+    }).toEqual(FACTS.latestPublishedRelease);
+    expect(matrix.latestPublishedRelease.version).not.toBe(matrix.sourceCandidate.version);
     expect(matrix.screenshot.sourceVersion).toBe(FACTS.version);
     expect(matrix.screenshot.sourceCommit).toMatch(/^[0-9a-f]{40}$/);
     expect(matrix.screenshot.terminal).toBe("106x32");

@@ -16,9 +16,18 @@ interface ProviderFact {
   env: string;
 }
 
+interface PublishedReleaseFact {
+  tag: string;
+  version: string;
+  publishedAt: string;
+  url: string;
+}
+
 interface RepoFacts {
   [key: string]: unknown;
   generatedAt: string;
+  sourceRevision: string | null;
+  sourceCommittedAt: string | null;
   version: string | null;
   crates: string[];
   sandboxBackends: string[];
@@ -27,7 +36,7 @@ interface RepoFacts {
   nodeEngines: string | null;
   toolCount: number | null;
   license: string | null;
-  latestRelease: string | null;
+  latestPublishedRelease: PublishedReleaseFact | null;
 }
 
 function diffFacts(
@@ -43,6 +52,7 @@ function diffFacts(
     "nodeEngines",
     "toolCount",
     "license",
+    "latestPublishedRelease",
   ];
   const diffs: Array<{ field: string; committed: unknown; fresh: unknown }> = [];
   for (const field of checkFields) {
@@ -60,6 +70,8 @@ function diffFacts(
 function freshFacts(overrides: Partial<RepoFacts> = {}): RepoFacts {
   return {
     generatedAt: new Date().toISOString(),
+    sourceRevision: null,
+    sourceCommittedAt: null,
     version: "0.8.64",
     crates: ["cli", "config", "tui"],
     sandboxBackends: ["landlock (Linux)", "seatbelt (macOS)"],
@@ -71,7 +83,12 @@ function freshFacts(overrides: Partial<RepoFacts> = {}): RepoFacts {
     nodeEngines: ">=18",
     toolCount: 78,
     license: "MIT",
-    latestRelease: null,
+    latestPublishedRelease: {
+      tag: "v0.8.63",
+      version: "0.8.63",
+      publishedAt: "2026-06-01T00:00:00Z",
+      url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.63",
+    },
     ...overrides,
   };
 }
@@ -142,12 +159,29 @@ describe("diffFacts (check-facts parity)", () => {
     expect(diffs.map((d) => d.field).sort()).toEqual(["toolCount", "version"]);
   });
 
-  it("ignores generatedAt and latestRelease changes", () => {
+  it("ignores generatedAt and exact-build provenance changes", () => {
     const committed = freshFacts({ generatedAt: "old" });
-    const fresh = freshFacts({ generatedAt: "new", latestRelease: "v0.8.64" });
-    // Both generatedAt and latestRelease are excluded from checkFields.
-    // Version and others match => no diffs.
+    const fresh = freshFacts({
+      generatedAt: "new",
+      sourceRevision: "a".repeat(40),
+      sourceCommittedAt: "2026-07-21T22:00:00Z",
+    });
     expect(diffFacts(committed, fresh)).toEqual([]);
+  });
+
+  it("detects latest-published-release drift", () => {
+    const committed = freshFacts();
+    const fresh = freshFacts({
+      latestPublishedRelease: {
+        tag: "v0.8.64",
+        version: "0.8.64",
+        publishedAt: "2026-06-02T00:00:00Z",
+        url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.64",
+      },
+    });
+    const diffs = diffFacts(committed, fresh);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].field).toBe("latestPublishedRelease");
   });
 
   it("handles null-to-value drift for license", () => {

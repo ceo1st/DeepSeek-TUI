@@ -12,11 +12,11 @@
  *
  * Checked fields:
  *   version, providers, crates, sandboxBackends, defaultModel, nodeEngines,
- *   toolCount, license.
+ *   toolCount, license, latestPublishedRelease.
  *
  * Fields NOT checked (by design):
  *   generatedAt — always different
- *   latestRelease — null at build time, populated by Cloudflare cron
+ *   sourceRevision/sourceCommittedAt — injected from the exact build checkout
  */
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -57,8 +57,7 @@ function parseCommittedFacts() {
  * Compare two facts objects and return a list of field-level diffs.
  */
 function diffFacts(committed, fresh) {
-  // Fields checked for drift. Skip generatedAt (always changes) and
-  // latestRelease (runtime-only, null at build time).
+  // Fields checked for drift. Skip generatedAt and exact-build provenance.
   const checkFields = [
     "version",
     "crates",
@@ -68,6 +67,7 @@ function diffFacts(committed, fresh) {
     "nodeEngines",
     "toolCount",
     "license",
+    "latestPublishedRelease",
   ];
 
   const diffs = [];
@@ -107,15 +107,16 @@ if (unmappedProviders.length > 0) {
 
 const fresh = buildFacts();
 
-// Quick sanity: if fresh facts have critical missing data, warn but still
-// compare — the diff will surface the problem.
+// Quick sanity: critical source facts must never degrade to matching nulls.
 const criticalGaps = [];
 if (!fresh.version) criticalGaps.push("version");
 if (fresh.providers.length === 0) criticalGaps.push("providers");
+if (!fresh.latestPublishedRelease) criticalGaps.push("latestPublishedRelease");
 if (criticalGaps.length > 0) {
-  console.warn(
-    `[check-facts] WARNING: fresh derivation returned empty/missing: ${criticalGaps.join(", ")}`,
+  console.error(
+    `[check-facts] FAIL — fresh derivation returned empty/missing: ${criticalGaps.join(", ")}`,
   );
+  process.exit(1);
 }
 
 const diffs = diffFacts(committed.facts, fresh);

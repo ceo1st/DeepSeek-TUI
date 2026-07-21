@@ -10,6 +10,7 @@
  *   - <repo>/npm/codewhale/package.json         → node engines
  *   - <repo>/crates/tui/src/tools/*.rs          → tool count (ToolSpec impls)
  *   - <repo>/LICENSE                            → license
+ *   - <repo>/web/data/latest-published-release.json → latest published release
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
@@ -181,6 +182,28 @@ export function deriveLicense() {
   return first.trim();
 }
 
+export function deriveLatestPublishedRelease() {
+  const raw = read("web/data/latest-published-release.json");
+  if (!raw) return null;
+  try {
+    const release = JSON.parse(raw);
+    if (
+      typeof release.tag !== "string" ||
+      typeof release.version !== "string" ||
+      release.tag !== `v${release.version}` ||
+      typeof release.publishedAt !== "string" ||
+      !Number.isFinite(Date.parse(release.publishedAt)) ||
+      typeof release.url !== "string" ||
+      release.url !== `https://github.com/Hmbown/CodeWhale/releases/tag/${release.tag}`
+    ) {
+      return null;
+    }
+    return release;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Re-derive all mechanical facts from the current workspace. The returned
  * object is the same shape as web/lib/facts.generated.ts → RepoFacts.
@@ -194,6 +217,11 @@ export function buildFacts() {
 
   const facts = {
     generatedAt: new Date().toISOString(),
+    // next.config.ts injects these from the exact checkout into the built
+    // artifact. They stay null in the tracked snapshot to avoid a
+    // self-referential generated-file diff after every commit.
+    sourceRevision: null,
+    sourceCommittedAt: null,
     version: deriveVersion(),
     crates: deriveCrates(),
     sandboxBackends: deriveSandboxBackends(),
@@ -202,7 +230,7 @@ export function buildFacts() {
     nodeEngines: deriveNodeEngines(),
     toolCount: deriveToolCount(),
     license: deriveLicense(),
-    latestRelease: null, // populated at runtime by facts-drift cron
+    latestPublishedRelease: deriveLatestPublishedRelease(),
   };
 
   return facts;
