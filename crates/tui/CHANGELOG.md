@@ -73,6 +73,16 @@ restart recovery, and the community site's content boundaries.
   module (byte-exact constants replacing 17 layered files);
   composition order, constitution-first binding, and locale/personality
   variants unchanged.
+- Ask, Auto-Review, Full Access, and Never resolve through one permission
+  contract: `resolve_tool_permission` in the engine and
+  `resolve_approval_request_disposition` in the UI share one truth table for
+  session grants/denials, non-bypassable policy holds, and modal prompts
+  (#4412).
+- Collapsed multi-struct tool families into single action-dispatched tools
+  (`AutomationTool`, `TasksTool`, `GithubTool`, `RlmTool`) while keeping
+  legacy tool names as hidden compatibility aliases for transcript replay.
+- Operate-mode children default to leaf depth (`max_depth=0`) unless the
+  caller explicitly grants a deeper budget (#4598).
 
 ### Fixed
 
@@ -198,13 +208,15 @@ restart recovery, and the community site's content boundaries.
   phase (auto-route, preflight, engine send), with submits gated while
   a dispatch is in flight (#4605).
 - Self-hosted routes keep explicit per-model output limits for unknown
-  wire aliases instead of the generic 4K fallback (#4655).
+  wire aliases instead of the generic 4K fallback (#4655 by @h3c-hexin;
+  PR #4656).
 - Chat Completions idle-timeout errors now include received-byte and
   timing telemetry, distinguishing prefill stalls from mid-stream
-  stalls with truncated tool-call arguments.
+  stalls with truncated tool-call arguments (#4657 by @h3c-hexin).
 - `set_config` provider writes now keep the in-memory route in step,
   so a following model write lands in the new provider's table instead
-  of clobbering the previous provider's root default_text_model (#4658).
+  of clobbering the previous provider's root default_text_model (#4658
+  by @gaord, with a follow-up route-sync fix).
 
 ### Security
 

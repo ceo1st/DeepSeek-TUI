@@ -73,6 +73,16 @@ restart recovery, and the community site's content boundaries.
   module (byte-exact constants replacing 17 layered files);
   composition order, constitution-first binding, and locale/personality
   variants unchanged.
+- Ask, Auto-Review, Full Access, and Never resolve through one permission
+  contract: `resolve_tool_permission` in the engine and
+  `resolve_approval_request_disposition` in the UI share one truth table for
+  session grants/denials, non-bypassable policy holds, and modal prompts
+  (#4412).
+- Collapsed multi-struct tool families into single action-dispatched tools
+  (`AutomationTool`, `TasksTool`, `GithubTool`, `RlmTool`) while keeping
+  legacy tool names as hidden compatibility aliases for transcript replay.
+- Operate-mode children default to leaf depth (`max_depth=0`) unless the
+  caller explicitly grants a deeper budget (#4598).
 
 ### Fixed
 
@@ -198,13 +208,15 @@ restart recovery, and the community site's content boundaries.
   phase (auto-route, preflight, engine send), with submits gated while
   a dispatch is in flight (#4605).
 - Self-hosted routes keep explicit per-model output limits for unknown
-  wire aliases instead of the generic 4K fallback (#4655).
+  wire aliases instead of the generic 4K fallback (#4655 by @h3c-hexin;
+  PR #4656).
 - Chat Completions idle-timeout errors now include received-byte and
   timing telemetry, distinguishing prefill stalls from mid-stream
-  stalls with truncated tool-call arguments.
+  stalls with truncated tool-call arguments (#4657 by @h3c-hexin).
 - `set_config` provider writes now keep the in-memory route in step,
   so a following model write lands in the new provider's table instead
-  of clobbering the previous provider's root default_text_model (#4658).
+  of clobbering the previous provider's root default_text_model (#4658
+  by @gaord, with a follow-up route-sync fix).
 
 ### Security
 
@@ -217,8 +229,14 @@ restart recovery, and the community site's content boundaries.
 Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
 
 - [@h3c-hexin](https://github.com/h3c-hexin) — calendar-anchored hourly
-  automation recurrence (PR #4381) and the MCP OAuth cancellation report
-  (#4380).
+  automation recurrence (PR #4381), the MCP OAuth cancellation report
+  (#4380), explicit limits for unknown local models (PR #4656 / #4655),
+  and idle-timeout progress telemetry (PR #4657).
+- [@gaord](https://github.com/gaord) — Runtime API provider registry and
+  atomic provider-switch endpoints (PR #4658).
+- [@SamhandsomeLee](https://github.com/SamhandsomeLee) — Enter-send lag
+  diagnosis and fix direction for #4605 (PR #4654; landed via the release
+  lane async-dispatch split).
 - [@zhangweiii](https://github.com/zhangweiii) and
   [@sternelee](https://github.com/sternelee) — the original first-class
   OpenCode Go implementations (PRs #773 and #1050), harvested into the
@@ -242,15 +260,11 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   report that exposed lossy high-bit process-status handling (#4100).
 - [@w1w218](https://github.com/w1w218) — the Windows ARM64 release request and
   real-device motivation (#4267).
-  reproduction that exposed pre-pager result truncation and conflicting composer
-  shortcut routing (#4482).
 - [@Angel-Hair](https://github.com/Angel-Hair) — session-owned read-before-edit
   tracking and the explicit, backwards-compatible `apply_patch` replacement
   contract (PRs #4475 and #4476).
 - [@dmitri-0](https://github.com/dmitri-0) — configurable cache-hit visibility
   in the phase strip (PR #4474).
-  reproduction and verification that the v0.9.1 input path already contains
-  the needed global binding (PR #4477).
 - [@SparkofSpike](https://github.com/SparkofSpike) — the Windows Ctrl+O
   reproduction that exposed pre-pager result truncation and conflicting composer
   shortcut routing (#4482), and the exact Vim-space regression reproduction
