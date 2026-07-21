@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -39,6 +39,7 @@ const PROFILE_DIR: &str = ".codewhale/agents";
 
 /// A selectable choice in a wizard step: a short identifier `label`, a one-line
 /// `summary`, and a longer `description` shown (wrapped) in the detail pane.
+#[derive(Clone)]
 struct Choice {
     label: Cow<'static, str>,
     summary: Cow<'static, str>,
@@ -422,6 +423,13 @@ pub struct FleetSetupView {
     /// Whether the aligned Model row can be persisted. Missing-auth and
     /// statically invalid routes remain visible with their reason but inert.
     model_selectable: Vec<bool>,
+    /// Typed filter for the Model step (#4639): substring match over
+    /// provider and model id, so provider-heavy catalogs (e.g. OpenRouter)
+    /// stay navigable without a provider→model drill-down.
+    model_query: String,
+    /// Whether the Model step's filter input is capturing keystrokes (`/`
+    /// toggles it; Enter keeps the filter, Esc clears it).
+    model_filter_active: bool,
     /// Selectable rows registered by the latest render. Keeping mouse geometry
     /// in the view gives the Fleet walkthrough the same row ownership as its
     /// keyboard path without coupling the host to this modal's layout.
@@ -470,6 +478,8 @@ impl FleetSetupView {
             model_choices,
             model_routes,
             model_selectable,
+            model_query: String::new(),
+            model_filter_active: false,
             row_hitboxes: RefCell::new(Vec::new()),
         }
     }
@@ -556,10 +566,42 @@ impl FleetSetupView {
     /// independent of the parent/current provider (#4093) — or `None` when
     /// `inherit` is selected (reuse the session route).
     fn selected_route(&self) -> Option<(String, String)> {
-        if self.model_idx == 0 {
+        let real_idx = self.real_model_idx();
+        if real_idx == 0 {
             return None;
         }
-        self.model_routes.get(self.model_idx).cloned()
+        self.model_routes.get(real_idx).cloned()
+    }
+
+    /// Indices into `model_choices` visible under the current typed filter
+    /// (#4639). Empty query shows every row; otherwise substring match over
+    /// provider id/label and model id.
+    fn filtered_model_indices(&self) -> Vec<usize> {
+        let query = self.model_query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return (0..self.model_choices.len()).collect();
+        }
+        (0..self.model_choices.len())
+            .filter(|idx| {
+                let (provider, model) = &self.model_routes[*idx];
+                model.to_ascii_lowercase().contains(&query)
+                    || provider.to_ascii_lowercase().contains(&query)
+                    || provider_display_label(provider)
+                        .to_ascii_lowercase()
+                        .contains(&query)
+                    || (*idx == 0 && "inherit same current".contains(&query))
+            })
+            .collect()
+    }
+
+    /// Map the filtered highlight position back to the real `model_choices`
+    /// index. Selection, persistence, and hitboxes all use the real index.
+    fn real_model_idx(&self) -> usize {
+        let filtered = self.filtered_model_indices();
+        if filtered.is_empty() {
+            return 0;
+        }
+        filtered[self.model_idx.min(filtered.len() - 1)]
     }
 
     fn selected_reasoning_effort(&self) -> Option<String> {
@@ -584,7 +626,7 @@ impl FleetSetupView {
     fn step_len(&self) -> usize {
         match self.step {
             Step::Role => ROLES.len(),
-            Step::Model => self.model_choices.len(),
+            Step::Model => self.filtered_model_indices().len(),
             Step::Review => 0,
         }
     }
@@ -635,7 +677,7 @@ impl FleetSetupView {
             Step::Model => {
                 if self
                     .model_selectable
-                    .get(self.model_idx)
+                    .get(self.real_model_idx())
                     .copied()
                     .unwrap_or(false)
                 {
@@ -725,6 +767,7 @@ impl FleetSetupView {
             }
             Step::Model => {
                 hints.push(ActionHint::new("↑/↓", "choose"));
+                hints.push(ActionHint::new("/", "filter"));
                 hints.push(ActionHint::new("Enter", "next"));
                 hints.push(ActionHint::new("←", "back"));
             }
@@ -772,7 +815,7 @@ impl ModalView for FleetSetupView {
                     match self.step {
                         Step::Role => self.role_idx = row.min(ROLES.len().saturating_sub(1)),
                         Step::Model => {
-                            self.model_idx = row.min(self.model_choices.len().saturating_sub(1));
+                            self.model_idx = row.min(self.step_len().saturating_sub(1));
                         }
                         Step::Review => {}
                     }
@@ -785,8 +828,45 @@ impl ModalView for FleetSetupView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        // Model-step filter input captures keystrokes while active (#4639).
+        if self.step == Step::Model && self.model_filter_active {
+            match key.code {
+                KeyCode::Enter => {
+                    self.model_filter_active = false;
+                }
+                KeyCode::Esc => {
+                    self.model_filter_active = false;
+                    self.model_query.clear();
+                    self.model_idx = 0;
+                }
+                KeyCode::Backspace => {
+                    self.model_query.pop();
+                    self.model_idx = 0;
+                }
+                KeyCode::Up => {
+                    self.move_up();
+                }
+                KeyCode::Down => {
+                    self.move_down();
+                }
+                KeyCode::Char(ch)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.model_query.push(ch);
+                    self.model_idx = 0;
+                }
+                _ => {}
+            }
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
+            KeyCode::Char('/') if self.step == Step::Model => {
+                self.model_filter_active = true;
+                ViewAction::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_up();
                 ViewAction::None
@@ -929,12 +1009,34 @@ impl ModalView for FleetSetupView {
                 register_choice_hitboxes(chunks[1], ROLES.len(), self.role_idx, &self.row_hitboxes);
             }
             Step::Model => {
+                let filtered = self.filtered_model_indices();
+                let filtered_choices: Vec<Choice> = filtered
+                    .iter()
+                    .map(|idx| self.model_choices[*idx].clone())
+                    .collect();
+                let selected = self
+                    .model_idx
+                    .min(filtered.len().saturating_sub(1))
+                    .max(0);
+                let filter_line = if self.model_filter_active {
+                    format!("Filter: {}▏ (Enter keep · Esc clear)", self.model_query)
+                } else if !self.model_query.trim().is_empty() {
+                    format!(
+                        "Filter: {} ({} of {} rows · / edit)",
+                        self.model_query,
+                        filtered.len(),
+                        self.model_choices.len()
+                    )
+                } else {
+                    format!("Type / to filter {} routes by provider or model", self.model_choices.len())
+                };
                 render_choice_step(
                     chunks[1],
                     buf,
-                    &self.model_choices,
-                    self.model_idx,
+                    &filtered_choices,
+                    selected,
                     &[
+                        filter_line,
                         format!(
                             "Current route: {} / {}  ·  reasoning {}",
                             self.snapshot.provider, self.snapshot.model, self.snapshot.reasoning
@@ -947,8 +1049,8 @@ impl ModalView for FleetSetupView {
                 );
                 register_choice_hitboxes(
                     chunks[1],
-                    self.model_choices.len(),
-                    self.model_idx,
+                    filtered_choices.len(),
+                    selected,
                     &self.row_hitboxes,
                 );
             }
@@ -1551,6 +1653,57 @@ mod tests {
         assert_eq!(draft.provider.as_deref(), Some("zai"));
         assert_eq!(draft.model.as_deref(), Some("glm-5.2"));
         assert_eq!(draft.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn model_step_filter_narrows_large_catalogs_by_provider_and_model() {
+        let mut snap = snapshot();
+        // Simulate an OpenRouter-scale catalog: many rows from one provider.
+        for i in 0..120 {
+            snap.available_models.push((
+                "openrouter".to_string(),
+                format!("vendor/model-{i:03}"),
+                "key saved · not checked".to_string(),
+                true,
+            ));
+        }
+        snap.available_models.push((
+            "openrouter".to_string(),
+            "z-ai/glm-5-turbo".to_string(),
+            "key saved · not checked".to_string(),
+            true,
+        ));
+        let mut view = FleetSetupView::from_snapshot(snap);
+        // Role → Model.
+        view.handle_key(key(KeyCode::Enter));
+        let full_len = view.step_len();
+        assert!(full_len > 120, "unfiltered shows the whole catalog");
+
+        // `/` opens the filter; typing narrows by model id substring.
+        view.handle_key(key(KeyCode::Char('/')));
+        for ch in "glm".chars() {
+            view.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(view.step_len(), 1, "only the glm row survives the filter");
+        let route = view.selected_route().expect("filtered selection resolves");
+        assert_eq!(route, ("openrouter".to_string(), "z-ai/glm-5-turbo".to_string()));
+
+        // Provider substring filters too.
+        view.handle_key(key(KeyCode::Esc));
+        view.handle_key(key(KeyCode::Char('/')));
+        for ch in "deepseek".chars() {
+            view.handle_key(key(KeyCode::Char(ch)));
+        }
+        // inherit's route IS the active DeepSeek route, so it matches too.
+        assert_eq!(view.step_len(), 3, "deepseek rows plus the inherit (active deepseek route) match");
+
+        // Enter keeps the filter but releases the input; Esc in filter clears.
+        view.handle_key(key(KeyCode::Enter));
+        assert!(!view.model_filter_active);
+        assert_eq!(view.step_len(), 3);
+        view.handle_key(key(KeyCode::Char('/')));
+        view.handle_key(key(KeyCode::Esc));
+        assert_eq!(view.step_len(), full_len, "clearing restores the full catalog");
     }
 
     #[test]

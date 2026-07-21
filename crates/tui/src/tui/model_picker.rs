@@ -379,9 +379,49 @@ impl ModelPickerView {
                 }
             })
             .collect();
-        // Only re-rank when not filtering by text — keep match order stable while typing.
         if query.is_empty() {
             sort_model_rows_for_view(&mut rows, self.view);
+        } else {
+            // Rank typed results (#4639): rows whose provider matches the
+            // query first (provider drill-down), then exact/prefix id
+            // matches, then the active provider's rows, then alphabetical —
+            // so a provider-heavy catalog (e.g. OpenRouter) surfaces the
+            // intended route in the first few rows, not raw catalog order.
+            let query_lower = query.to_ascii_lowercase();
+            let initial_provider = self.initial_provider;
+            rows.sort_by(|a, b| {
+                let rank = |row: &ModelPickerRow| {
+                    let provider_matches = row.provider.is_some_and(|provider| {
+                        provider.as_str().to_ascii_lowercase().contains(&query_lower)
+                            || provider
+                                .display_name()
+                                .to_ascii_lowercase()
+                                .contains(&query_lower)
+                    });
+                    let id = row.id.to_ascii_lowercase();
+                    let id_rank = if id == query_lower {
+                        0
+                    } else if id.starts_with(&query_lower) {
+                        1
+                    } else {
+                        2
+                    };
+                    let provider_rank = if row.provider.is_none()
+                        || row.provider == Some(initial_provider)
+                    {
+                        0
+                    } else {
+                        1
+                    };
+                    (
+                        if provider_matches { 0 } else { 1 },
+                        id_rank,
+                        provider_rank,
+                        id,
+                    )
+                };
+                rank(a).cmp(&rank(b))
+            });
         }
         rows
     }
@@ -3163,6 +3203,42 @@ mod tests {
             view.resolved_effort(),
             ReasoningEffort::Medium,
             "OpenAI Codex rows should normalize auto to medium"
+        );
+    }
+
+    /// #4639 — typed search ranks provider-matching rows first (drill-down),
+    /// then exact/prefix id matches, so provider-heavy catalogs surface the
+    /// intended route in the first rows instead of raw catalog order.
+    #[test]
+    fn picker_query_ranks_provider_matches_before_id_substrings() {
+        let (mut app, config, _lock) = create_test_app();
+        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.model = "deepseek-v4-pro".to_string();
+        app.auto_model = false;
+
+        let mut view = ModelPickerView::new(&app, &config);
+
+        // A provider-name query lands on that provider's rows first.
+        type_model_query(&mut view, "zai");
+        let rows = view.visible_model_rows();
+        let first = rows.first().expect("zai query should surface rows");
+        assert_eq!(first.provider, Some(ApiProvider::Zai));
+
+        // Prefix matches outrank substrings even when alphabetical order
+        // disagrees: "deepseek-v4-p" prefix-matches pro but only
+        // substring-matches flash, so pro leads although flash < pro.
+        view.update_query(String::new());
+        type_model_query(&mut view, "deepseek-v4-p");
+        let ids: Vec<&str> = view
+            .visible_model_rows()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert!(!ids.is_empty(), "deepseek-v4-p query should match rows");
+        assert_eq!(
+            ids.first().copied(),
+            Some("deepseek-v4-pro"),
+            "prefix match must outrank substring match: {ids:?}"
         );
     }
 
