@@ -214,3 +214,58 @@ pub(crate) fn shell_policy_for_mode(mode: AppMode, allow_shell: bool) -> ShellPo
         AppMode::Agent | AppMode::Auto | AppMode::Operate | AppMode::Yolo => ShellPolicy::Full,
     }
 }
+
+/// Per-tool permission decision from the unified resolver (#4412).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolPermission {
+    /// Tool executes without any approval prompt.
+    Allow,
+    /// Tool requires user approval before execution.
+    Prompt,
+    /// Tool is denied (approval_mode=Never or policy block).
+    Deny,
+}
+
+/// Tool-declared approval requirement (mirrors `codewhale_tools::ApprovalRequirement`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolApprovalRequirement {
+    /// Tool is always auto-approved (most reads).
+    Auto,
+    /// Tool prompts unless the turn has auto-approve authority.
+    Suggest,
+    /// Tool always prompts regardless of auto-approve (non-bypassable).
+    Required,
+}
+
+/// Unified per-tool permission resolver (#4412).
+///
+/// Consolidates the approval decision that was previously scattered across
+/// `registered_tool_approval_required` (turn_loop), `app_auto_approve_enabled`
+/// (ui.rs), and the `Never` short-circuit. One call site, one answer.
+#[must_use]
+pub(crate) fn resolve_tool_permission(
+    authority: &TurnAuthority,
+    requirement: ToolApprovalRequirement,
+    is_non_bypassable: bool,
+) -> ToolPermission {
+    if authority.approval_mode == ApprovalMode::Never {
+        return ToolPermission::Deny;
+    }
+    match requirement {
+        ToolApprovalRequirement::Auto => ToolPermission::Allow,
+        ToolApprovalRequirement::Required => ToolPermission::Prompt,
+        ToolApprovalRequirement::Suggest => {
+            if is_non_bypassable {
+                return ToolPermission::Prompt;
+            }
+            if authority.auto_approve
+                || authority.approval_mode == ApprovalMode::Bypass
+                || authority.mode == AppMode::Yolo
+            {
+                ToolPermission::Allow
+            } else {
+                ToolPermission::Prompt
+            }
+        }
+    }
+}
