@@ -2203,5 +2203,71 @@ fn looks_like_file_path(s: &str) -> bool {
     }
 }
 
+/// Aggregated file activity for compact Work panel display (#4636).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileActivitySummary {
+    pub files_read: u32,
+    pub dirs_listed: u32,
+    pub patterns_searched: u32,
+    pub files_written: u32,
+}
+
+impl FileActivitySummary {
+    pub fn is_empty(&self) -> bool {
+        self.files_read == 0
+            && self.dirs_listed == 0
+            && self.patterns_searched == 0
+            && self.files_written == 0
+    }
+
+    pub fn compact_display(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.files_read > 0 {
+            parts.push(format!("Read {} files", self.files_read));
+        }
+        if self.dirs_listed > 0 {
+            parts.push(format!("Listed {} directories", self.dirs_listed));
+        }
+        if self.patterns_searched > 0 {
+            parts.push(format!("Searched {} patterns", self.patterns_searched));
+        }
+        if self.files_written > 0 {
+            parts.push(format!("Wrote {} files", self.files_written));
+        }
+        parts
+    }
+
+    pub fn from_tool_name(name: &str) -> Option<FileActivityKind> {
+        match name {
+            "read_file" | "Read" | "read" => Some(FileActivityKind::Read),
+            "list_dir" | "list_directory" | "Glob" | "glob" => Some(FileActivityKind::List),
+            "search" | "grep" | "Grep" | "codebase_search" => Some(FileActivityKind::Search),
+            "write_file" | "Write" | "apply_patch" | "Edit" | "edit_file" => {
+                Some(FileActivityKind::Write)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileActivityKind {
+    Read,
+    List,
+    Search,
+    Write,
+}
+
+impl FileActivitySummary {
+    pub fn record(&mut self, kind: FileActivityKind) {
+        match kind {
+            FileActivityKind::Read => self.files_read += 1,
+            FileActivityKind::List => self.dirs_listed += 1,
+            FileActivityKind::Search => self.patterns_searched += 1,
+            FileActivityKind::Write => self.files_written += 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
