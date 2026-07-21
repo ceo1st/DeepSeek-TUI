@@ -31,7 +31,8 @@ def main() -> int:
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     sys.stderr.write(proc.stderr)
 
-    for line in proc.stdout.splitlines():
+    combined = proc.stdout.splitlines() + proc.stderr.splitlines()
+    for line in combined:
         if MARKER in line:
             metrics = json.loads(line.split(MARKER, 1)[1])
             print(json.dumps(metrics, indent=2, sort_keys=True))

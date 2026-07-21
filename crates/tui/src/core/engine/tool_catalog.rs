@@ -43,30 +43,17 @@ pub(super) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     // #4625: the model-facing shell tool is `Bash`; legacy `exec_shell*`
     // names are hidden compat aliases and must not be default-active.
     "Bash",
+    "File",
+    "Git",
+    "Run",
     "agent",
-    "apply_patch",
-    "edit_file",
-    "fetch_url",
-    "file_search",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_status",
-    "grep_files",
-    "list_dir",
-    "read_file",
     "remember",
-    "run_tests",
-    "run_verifiers",
     // Piagent phase B: the model-facing durable-task tool is `tasks`; the
     // legacy `task_create`/`task_list`/`task_read` names it replaces are
     // hidden compat aliases and must not be default-active.
     "tasks",
     "update_plan",
-    "wait_for_dev_server",
-    "web_search",
     "work_update",
-    "write_file",
 ];
 
 const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
@@ -81,19 +68,9 @@ const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
         unavailable_reason: "Not present in the current model-visible catalog. Interactive Agent sessions expose shell by default unless allow_shell = false; noninteractive and durable profiles require allow_shell = true. Plan mode hides shell, and command tool allow/deny gates can also block it.",
     },
     CoreActionToolFallback {
-        name: "write_file",
-        description: "Create or overwrite files in the workspace.",
-        unavailable_reason: "Not present in the current model-visible catalog. File writes require Act mode and no command tool allow/deny gate blocking write_file.",
-    },
-    CoreActionToolFallback {
-        name: "edit_file",
-        description: "Edit existing files by replacing text.",
-        unavailable_reason: "Not present in the current model-visible catalog. File edits require Act mode and no command tool allow/deny gate blocking edit_file.",
-    },
-    CoreActionToolFallback {
-        name: "apply_patch",
-        description: "Apply a patch to one or more workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Patches require Act mode, the apply_patch feature, and no command tool allow/deny gate blocking apply_patch.",
+        name: "File",
+        description: "Read, search, and modify workspace files.",
+        unavailable_reason: "Not present in the current model-visible catalog. File reads are available in Plan and Agent modes; write and edit actions require an executable mode, while patch also requires the apply_patch feature.",
     },
 ];
 
@@ -253,10 +230,7 @@ fn apply_tool_surface_budget(
         if always_load.contains(&tool.name) {
             continue;
         }
-        if matches!(
-            tool.name.as_str(),
-            "agent" | "run_tests" | "run_verifiers" | "tasks" | "web_search"
-        ) {
+        if matches!(tool.name.as_str(), "agent" | "Run" | "tasks" | "Web") {
             tool.defer_loading = Some(true);
         }
     }

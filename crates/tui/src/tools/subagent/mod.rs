@@ -9940,6 +9940,30 @@ struct SubAgentToolRegistry {
 }
 
 impl SubAgentToolRegistry {
+    const ACTION_ALIASES: &'static [(&'static str, &'static str, &'static str)] = &[
+        ("Bash", "run", "exec_shell"),
+        ("Bash", "wait", "exec_shell_wait"),
+        ("Bash", "interact", "exec_shell_interact"),
+        ("Bash", "cancel", "exec_shell_cancel"),
+        ("File", "read", "read_file"),
+        ("File", "list", "list_dir"),
+        ("File", "search_name", "file_search"),
+        ("File", "search_content", "grep_files"),
+        ("File", "write", "write_file"),
+        ("File", "edit", "edit_file"),
+        ("File", "patch", "apply_patch"),
+        ("Git", "status", "git_status"),
+        ("Git", "diff", "git_diff"),
+        ("Git", "log", "git_log"),
+        ("Git", "show", "git_show"),
+        ("Git", "blame", "git_blame"),
+        ("Run", "tests", "run_tests"),
+        ("Run", "verifiers", "run_verifiers"),
+        ("Web", "search", "web_search"),
+        ("Web", "fetch", "fetch_url"),
+        ("Web", "wait", "wait_for_dev_server"),
+    ];
+
     #[cfg(test)]
     fn new(
         runtime: SubAgentRuntime,
@@ -10044,6 +10068,16 @@ impl SubAgentToolRegistry {
                 .get("commands")
                 .map(|commands| commands.as_array().is_some_and(Vec::is_empty))
                 .unwrap_or(true),
+            "Run" => match input.get("action").and_then(Value::as_str) {
+                Some("tests") => input
+                    .get("args")
+                    .is_none_or(|args| args.as_str().is_some_and(|args| args.trim().is_empty())),
+                Some("verifiers") => input
+                    .get("commands")
+                    .map(|commands| commands.as_array().is_some_and(Vec::is_empty))
+                    .unwrap_or(true),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -10052,7 +10086,7 @@ impl SubAgentToolRegistry {
     /// parent auto-approval. Delegates to the pure `role_posture_permits`.
     /// Unregistered names pass through (the allowlist / availability checks
     /// handle those separately).
-    fn posture_permits_tool(&self, name: &str) -> bool {
+    fn posture_permits_tool(&self, name: &str, input: Option<&Value>) -> bool {
         // Delegation (`agent`) is governed by the depth budget and the
         // allowlist (`can_spawn_child` / `is_tool_allowed`), not the write/shell
         // posture — a read-only role may still fan out child work.
@@ -10060,7 +10094,10 @@ impl SubAgentToolRegistry {
             return true;
         }
         match self.registry.get(name) {
-            Some(spec) => match spec.approval_requirement() {
+            Some(spec) => match input.map_or_else(
+                || spec.approval_requirement(),
+                |input| spec.approval_requirement_for(input),
+            ) {
                 ApprovalRequirement::Auto => true,
                 ApprovalRequirement::Suggest => {
                     self.runtime_profile.permissions.write
@@ -10093,6 +10130,28 @@ impl SubAgentToolRegistry {
         })
     }
 
+    fn legacy_action_alias(family: &str, action: &str) -> Option<&'static str> {
+        Self::ACTION_ALIASES
+            .iter()
+            .find_map(|(candidate_family, candidate_action, alias)| {
+                (*candidate_family == family && *candidate_action == action).then_some(*alias)
+            })
+    }
+
+    fn is_action_allowed(&self, family: &str, action: &str) -> bool {
+        let alias = Self::legacy_action_alias(family, action);
+        if self.is_tool_denied(family) || alias.is_some_and(|name| self.is_tool_denied(name)) {
+            return false;
+        }
+        match &self.allowed_tools {
+            None => true,
+            Some(list) => {
+                list.iter().any(|name| name == family)
+                    || alias.is_some_and(|alias| list.iter().any(|name| name == alias))
+            }
+        }
+    }
+
     /// Whether a given tool name is permitted under this child's filter.
     /// `None` filter = everything permitted.
     fn is_tool_allowed(&self, name: &str) -> bool {
@@ -10106,7 +10165,12 @@ impl SubAgentToolRegistry {
         }
         match &self.allowed_tools {
             None => true,
-            Some(list) => list.iter().any(|t| t == name),
+            Some(list) => {
+                list.iter().any(|tool| tool == name)
+                    || Self::ACTION_ALIASES.iter().any(|(family, _, alias)| {
+                        *family == name && list.iter().any(|allowed| allowed == alias)
+                    })
+            }
         }
     }
 
@@ -10117,10 +10181,25 @@ impl SubAgentToolRegistry {
             None => api_tools,
             Some(list) => api_tools
                 .into_iter()
-                .filter(|tool| list.contains(&tool.name))
+                .filter(|tool| {
+                    list.contains(&tool.name)
+                        || ["Bash", "File", "Git", "Run", "Web"].contains(&tool.name.as_str())
+                            && tool.input_schema["properties"]["action"]["enum"]
+                                .as_array()
+                                .is_some_and(|actions| {
+                                    actions.iter().any(|action| {
+                                        action.as_str().is_some_and(|action| {
+                                            Self::legacy_action_alias(&tool.name, action)
+                                                .is_some_and(|alias| {
+                                                    list.iter().any(|n| n == alias)
+                                                })
+                                        })
+                                    })
+                                })
+                })
                 .collect::<Vec<_>>(),
         };
-        filtered
+        let mut tools = filtered
             .into_iter()
             .filter(|tool| tool.name != "agent" || self.can_spawn_child)
             // #4042: hide explicitly disallowed tools so the model never sees
@@ -10130,8 +10209,36 @@ impl SubAgentToolRegistry {
             // #3217: hide tools the role posture forbids so the model never
             // even sees write/edit/patch (read-only roles) or shell (no-shell
             // roles). Defense-in-depth with the `execute` guard below.
-            .filter(|tool| self.posture_permits_tool(&tool.name))
-            .collect()
+            .filter(|tool| tool.name == "File" || self.posture_permits_tool(&tool.name, None))
+            .collect::<Vec<_>>();
+
+        for tool in &mut tools {
+            if !["Bash", "File", "Git", "Run", "Web"].contains(&tool.name.as_str()) {
+                continue;
+            }
+            if let Some(actions) = tool.input_schema["properties"]["action"]["enum"].as_array_mut()
+            {
+                actions.retain(|action| {
+                    let Some(action) = action.as_str() else {
+                        return false;
+                    };
+                    let posture_allows = tool.name != "File"
+                        || (self.runtime_profile.permissions.write
+                            && role_posture_permits(
+                                &self.agent_type,
+                                ApprovalRequirement::Suggest,
+                            ))
+                        || matches!(action, "read" | "list" | "search_name" | "search_content");
+                    posture_allows && self.is_action_allowed(&tool.name, action)
+                });
+            }
+        }
+        tools.retain(|tool| {
+            tool.input_schema["properties"]["action"]["enum"]
+                .as_array()
+                .is_none_or(|actions| !actions.is_empty())
+        });
+        tools
     }
 
     fn unavailable_allowed_tools(&self) -> Vec<String> {
@@ -10146,14 +10253,27 @@ impl SubAgentToolRegistry {
     }
 
     async fn execute(&self, _agent_id: &str, name: &str, input: Value) -> Result<String> {
-        if !self.is_tool_allowed(name) {
+        let action = input.get("action").and_then(Value::as_str);
+        let family_action_allowed = if !Self::ACTION_ALIASES
+            .iter()
+            .any(|(family, _, _)| *family == name)
+        {
+            true
+        } else if let Some(action) = action {
+            self.is_action_allowed(name, action)
+        } else {
+            self.allowed_tools
+                .as_ref()
+                .is_none_or(|list| list.iter().any(|allowed| allowed == name))
+        };
+        if !self.is_tool_allowed(name) || !family_action_allowed {
             return Err(anyhow!("Tool {name} not allowed for this sub-agent"));
         }
         // #3217: authoritative per-role posture — read-only roles cannot mutate
         // and non-`Full`-shell roles cannot run shell, regardless of whether
         // the parent session is auto-approved. This closes the auto-approve
         // bypass where a read-only child could quietly write or shell out.
-        if !self.posture_permits_tool(name) {
+        if !self.posture_permits_tool(name, Some(&input)) {
             return Err(anyhow!(
                 "Tool {name} is not permitted for the read-only `{role}` sub-agent role. Use an `implementer` or `general` role (or a `custom` role with an explicit allowed_tools list) to mutate the workspace or run shell commands.",
                 role = self.agent_type.as_str()
@@ -10163,7 +10283,7 @@ impl SubAgentToolRegistry {
             let Some(spec) = self.registry.get(name) else {
                 return Err(anyhow!("Tool {name} is not registered"));
             };
-            match spec.approval_requirement() {
+            match spec.approval_requirement_for(&input) {
                 ApprovalRequirement::Auto => {}
                 ApprovalRequirement::Suggest => {
                     // Write/edit/patch tools land here. Explicit
@@ -10195,8 +10315,12 @@ impl SubAgentToolRegistry {
         let scope_aware_write = matches!(
             name,
             "write_file" | "edit_file" | "apply_patch" | "fim_edit"
-        ) || (name == "pandoc_convert"
-            && input.get("output_path").is_some());
+        ) || (name == "File"
+            && input
+                .get("action")
+                .and_then(Value::as_str)
+                .is_some_and(|action| matches!(action, "write" | "edit" | "patch")))
+            || (name == "pandoc_convert" && input.get("output_path").is_some());
         if scope_aware_write && self.enforce_write_claim {
             let paths = mutation_paths(name, &input)?;
             if paths.is_empty() {
@@ -10235,8 +10359,14 @@ impl SubAgentToolRegistry {
 }
 
 fn mutation_paths(name: &str, input: &Value) -> Result<Vec<String>> {
-    let raw_paths = if name == "apply_patch" {
-        crate::tools::apply_patch::preflight_apply_patch(input)
+    let raw_paths = if name == "apply_patch"
+        || (name == "File" && input.get("action").and_then(Value::as_str) == Some("patch"))
+    {
+        let mut patch_input = input.clone();
+        if let Some(object) = patch_input.as_object_mut() {
+            object.remove("action");
+        }
+        crate::tools::apply_patch::preflight_apply_patch(&patch_input)
             .map_err(|err| anyhow!(err.to_string()))?
             .touched_files
     } else if let Some(path) = input
@@ -10255,7 +10385,11 @@ fn mutation_paths(name: &str, input: &Value) -> Result<Vec<String>> {
 }
 
 fn reject_subagent_terminal_takeover(name: &str, input: &Value) -> Result<()> {
-    let wants_interactive_shell = name == "exec_shell"
+    let wants_interactive_shell = matches!(name, "exec_shell" | "Bash")
+        && input
+            .get("action")
+            .and_then(Value::as_str)
+            .is_none_or(|action| action == "run")
         && input
             .get("interactive")
             .and_then(Value::as_bool)

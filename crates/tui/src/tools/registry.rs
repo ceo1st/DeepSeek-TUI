@@ -567,19 +567,21 @@ impl ToolRegistryBuilder {
     /// Include file tools (read, write, edit, list).
     #[must_use]
     pub fn with_file_tools(self) -> Self {
-        use super::file::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
-        self.with_tool(Arc::new(ReadFileTool))
-            .with_tool(Arc::new(WriteFileTool))
-            .with_tool(Arc::new(EditFileTool))
-            .with_tool(Arc::new(ListDirTool))
+        use super::file_tool::FileTool;
+        self.with_tool(Arc::new(FileTool::new("File")))
+            .with_tool(Arc::new(FileTool::alias("read_file", "read")))
+            .with_tool(Arc::new(FileTool::alias("write_file", "write")))
+            .with_tool(Arc::new(FileTool::alias("edit_file", "edit")))
+            .with_tool(Arc::new(FileTool::alias("list_dir", "list")))
     }
 
     /// Include only read-only file tools (read, list).
     #[must_use]
     pub fn with_read_only_file_tools(self) -> Self {
-        use super::file::{ListDirTool, ReadFileTool};
-        self.with_tool(Arc::new(ReadFileTool))
-            .with_tool(Arc::new(ListDirTool))
+        use super::file_tool::FileTool;
+        self.with_tool(Arc::new(FileTool::read_only("File")))
+            .with_tool(Arc::new(FileTool::alias("read_file", "read")))
+            .with_tool(Arc::new(FileTool::alias("list_dir", "list")))
             .with_tool(Arc::new(
                 super::tool_result_retrieval::RetrieveToolResultTool,
             ))
@@ -629,27 +631,27 @@ impl ToolRegistryBuilder {
     /// Include search tools (`grep_files`).
     #[must_use]
     pub fn with_search_tools(self) -> Self {
-        use super::file_search::FileSearchTool;
-        use super::search::GrepFilesTool;
-        self.with_tool(Arc::new(GrepFilesTool))
-            .with_tool(Arc::new(FileSearchTool))
+        use super::file_tool::FileTool;
+        self.with_tool(Arc::new(FileTool::alias("grep_files", "search_content")))
+            .with_tool(Arc::new(FileTool::alias("file_search", "search_name")))
     }
 
     /// Include git inspection tools (`git_status`, `git_diff`).
     #[must_use]
     pub fn with_git_tools(self) -> Self {
-        use super::git::{GitDiffTool, GitStatusTool};
-        self.with_tool(Arc::new(GitStatusTool))
-            .with_tool(Arc::new(GitDiffTool))
+        use super::git_tool::GitTool;
+        self.with_tool(Arc::new(GitTool::new("Git")))
+            .with_tool(Arc::new(GitTool::alias("git_status", "status")))
+            .with_tool(Arc::new(GitTool::alias("git_diff", "diff")))
     }
 
     /// Include git history tools (`git_log`, `git_show`, `git_blame`).
     #[must_use]
     pub fn with_git_history_tools(self) -> Self {
-        use super::git_history::{GitBlameTool, GitLogTool, GitShowTool};
-        self.with_tool(Arc::new(GitLogTool))
-            .with_tool(Arc::new(GitShowTool))
-            .with_tool(Arc::new(GitBlameTool))
+        use super::git_tool::GitTool;
+        self.with_tool(Arc::new(GitTool::alias("git_log", "log")))
+            .with_tool(Arc::new(GitTool::alias("git_show", "show")))
+            .with_tool(Arc::new(GitTool::alias("git_blame", "blame")))
     }
 
     /// Include workspace diagnostics tool.
@@ -707,10 +709,10 @@ impl ToolRegistryBuilder {
     /// Include cargo test runner tool.
     #[must_use]
     pub fn with_test_runner_tool(self) -> Self {
-        use super::test_runner::RunTestsTool;
-        use super::verifier::RunVerifiersTool;
-        self.with_tool(Arc::new(RunTestsTool))
-            .with_tool(Arc::new(RunVerifiersTool))
+        use super::run_tool::RunTool;
+        self.with_tool(Arc::new(RunTool::new("Run")))
+            .with_tool(Arc::new(RunTool::alias("run_tests", "tests")))
+            .with_tool(Arc::new(RunTool::alias("run_verifiers", "verifiers")))
     }
 
     /// Include structured data validation tool (`validate_data`).
@@ -860,13 +862,12 @@ impl ToolRegistryBuilder {
     /// NOT gated behind the web-search feature.
     #[must_use]
     pub fn with_web_tools(self) -> Self {
-        use super::dev_server_readiness::WaitForDevServerTool;
-        use super::fetch_url::FetchUrlTool;
         use super::web_run::WebRunTool;
-        use super::web_search::WebSearchTool;
-        self.with_tool(Arc::new(WebSearchTool))
-            .with_tool(Arc::new(FetchUrlTool))
-            .with_tool(Arc::new(WaitForDevServerTool))
+        use super::web_tool::WebTool;
+        self.with_tool(Arc::new(WebTool::new("Web")))
+            .with_tool(Arc::new(WebTool::alias("web_search", "search")))
+            .with_tool(Arc::new(WebTool::alias("fetch_url", "fetch")))
+            .with_tool(Arc::new(WebTool::alias("wait_for_dev_server", "wait")))
             .with_tool(Arc::new(WebRunTool))
     }
 
@@ -911,8 +912,9 @@ impl ToolRegistryBuilder {
     /// Include patch tools (`apply_patch`).
     #[must_use]
     pub fn with_patch_tools(self) -> Self {
-        use super::apply_patch::ApplyPatchTool;
-        self.with_tool(Arc::new(ApplyPatchTool))
+        use super::file_tool::FileTool;
+        self.with_tool(Arc::new(FileTool::with_patch("File")))
+            .with_tool(Arc::new(FileTool::alias("apply_patch", "patch")))
     }
 
     /// Include the `revert_turn` tool. Approval-gated since it mutates
@@ -1974,6 +1976,102 @@ mod tests {
         assert!(registry.contains("wait_for_dev_server"));
         assert!(registry.contains("web.run"));
         assert!(!registry.contains("finance"));
+    }
+
+    #[test]
+    fn canonical_runtime_tools_hide_legacy_aliases() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_file_tools()
+            .with_search_tools()
+            .with_git_tools()
+            .with_git_history_tools()
+            .with_test_runner_tool()
+            .with_web_tools()
+            .with_patch_tools()
+            .build(ctx);
+
+        let api_names = registry
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        for canonical in ["File", "Git", "Run", "Web"] {
+            assert!(api_names.iter().any(|name| name == canonical));
+        }
+        for alias in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "file_search",
+            "grep_files",
+            "apply_patch",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_blame",
+            "run_tests",
+            "run_verifiers",
+            "web_search",
+            "fetch_url",
+            "wait_for_dev_server",
+        ] {
+            assert!(registry.contains(alias), "{alias} should remain callable");
+            assert!(
+                api_names.iter().all(|name| name != alias),
+                "{alias} should be hidden"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_file_aliases_replay_through_canonical_dispatch() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("sample.txt"), "before\n").expect("fixture");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new().with_file_tools().build(ctx);
+
+        registry
+            .execute("read_file", json!({"path": "sample.txt"}))
+            .await
+            .expect("legacy read should execute");
+        registry
+            .execute(
+                "edit_file",
+                json!({"path": "sample.txt", "search": "before", "replace": "after"}),
+            )
+            .await
+            .expect("legacy edit should execute after the replayed read");
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("sample.txt")).expect("edited file"),
+            "after\n"
+        );
+    }
+
+    #[test]
+    fn read_only_file_surface_does_not_advertise_write_actions() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let registry = ToolRegistryBuilder::new()
+            .with_read_only_file_tools()
+            .with_search_tools()
+            .build(ctx);
+        let file = registry
+            .to_api_tools()
+            .into_iter()
+            .find(|tool| tool.name == "File")
+            .expect("canonical File tool");
+        let actions = file.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+
+        for blocked in ["write", "edit", "patch"] {
+            assert!(actions.iter().all(|action| action != blocked));
+        }
     }
 
     #[test]

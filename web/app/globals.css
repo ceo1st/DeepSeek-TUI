@@ -1038,6 +1038,559 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 }
 
 /* ------------------------------------------------------------------ */
+/*  Product-first home                                                */
+/* ------------------------------------------------------------------ */
+
+.product-home {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.product-container {
+  width: min(100% - 2.5rem, 76rem);
+  margin-inline: auto;
+}
+
+.product-hero {
+  position: relative;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(106, 174, 242, 0.2);
+  background: var(--ocean-deep);
+  color: var(--stage-soft);
+}
+
+.product-current {
+  position: absolute;
+  inset: 0;
+  opacity: 0.25;
+  pointer-events: none;
+  background-image: repeating-radial-gradient(
+    ellipse 78% 38% at 68% 108%,
+    transparent 0,
+    transparent 2.2rem,
+    rgba(106, 174, 242, 0.18) 2.26rem,
+    transparent 2.32rem
+  );
+  mask-image: linear-gradient(to bottom, transparent 20%, black);
+}
+
+.product-hero-grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(23rem, 0.82fr) minmax(34rem, 1.18fr);
+  gap: clamp(2rem, 4vw, 4rem);
+  align-items: center;
+  min-height: calc(100svh - 4.25rem);
+  padding-block: clamp(3rem, 6vw, 5.5rem);
+}
+
+.product-hero-copy h1 {
+  color: #fff;
+  font-size: clamp(3rem, 6vw, 5.7rem);
+  line-height: 0.97;
+  letter-spacing: -0.055em;
+}
+
+.product-hero-copy,
+.product-install {
+  min-width: 0;
+}
+
+.product-hero-copy h1 span {
+  color: var(--action-on-dark);
+}
+
+.product-hero-copy > p {
+  max-width: 38rem;
+  margin-top: 1.5rem;
+  color: rgb(var(--c-stage-soft) / 0.84);
+  font-size: clamp(1rem, 1.6vw, 1.18rem);
+  line-height: 1.68;
+}
+
+.product-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.7rem;
+}
+
+.product-button {
+  display: inline-flex;
+  min-width: 6.4rem;
+  min-height: 2.85rem;
+  align-items: center;
+  justify-content: center;
+  padding: 0.7rem 1rem;
+  border: 1px solid rgba(209, 235, 244, 0.42);
+  border-radius: 4px;
+  color: var(--stage-text);
+  font-size: 0.82rem;
+  font-weight: 600;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.product-button:hover {
+  border-color: var(--action-on-dark);
+  background: rgba(106, 174, 242, 0.08);
+}
+
+.product-button-primary {
+  border-color: var(--action-on-dark);
+  background: var(--action-on-dark);
+  color: var(--ocean-deep);
+}
+
+.product-button-primary:hover {
+  border-color: #94c9f8;
+  background: #94c9f8;
+}
+
+.product-install {
+  max-width: 32rem;
+  margin-top: 1.4rem;
+}
+
+.product-install pre.code-block {
+  border-color: rgba(209, 235, 244, 0.22);
+  background: rgba(2, 8, 18, 0.64);
+}
+
+.product-facts {
+  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-size: 0.75rem !important;
+}
+
+.product-facts span {
+  padding-inline: 0.35rem;
+  color: var(--stage-muted);
+}
+
+.product-shot {
+  position: relative;
+  margin: 0;
+}
+
+.product-shot::before {
+  content: "";
+  position: absolute;
+  inset: -1rem;
+  border: 1px solid rgba(106, 174, 242, 0.18);
+  pointer-events: none;
+}
+
+.product-shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid rgba(182, 192, 212, 0.42);
+  background: var(--ocean-deep);
+  box-shadow: 0 1.5rem 4rem rgba(0, 0, 0, 0.34);
+}
+
+.product-shot figcaption {
+  margin-top: 0.75rem;
+  color: var(--stage-muted);
+  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-size: 0.66rem;
+  text-align: right;
+}
+
+.product-proof {
+  border-bottom: 1px solid var(--hairline);
+  background: #fff;
+}
+
+.product-proof-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(18rem, 0.85fr);
+  gap: clamp(2rem, 6vw, 6rem);
+  align-items: center;
+  padding-block: clamp(2.7rem, 5vw, 4.5rem);
+}
+
+.product-proof h2 {
+  font-size: clamp(1.8rem, 3.3vw, 3rem);
+}
+
+.product-proof p {
+  padding-left: clamp(1.5rem, 4vw, 3rem);
+  border-left: 1px solid var(--paper-edge);
+  color: var(--ink-soft);
+  line-height: 1.75;
+}
+
+.product-workflow {
+  position: relative;
+  overflow: hidden;
+  padding-block: clamp(4rem, 8vw, 7rem);
+  background:
+    radial-gradient(circle at 78% 8%, rgba(49, 95, 216, 0.18), transparent 30rem),
+    var(--ocean-deep);
+}
+
+.product-workflow h2,
+.product-surfaces h2 {
+  max-width: 54rem;
+  color: var(--stage-text);
+  font-size: clamp(2rem, 4.5vw, 4rem);
+}
+
+.product-workflow-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: clamp(2.5rem, 5vw, 4.5rem);
+  border-top: 1px solid rgba(106, 174, 242, 0.36);
+}
+
+.product-workflow-steps li {
+  position: relative;
+  min-height: 12rem;
+  padding: 1.35rem 1.5rem 1.5rem 0;
+  border-bottom: 1px solid rgba(106, 174, 242, 0.2);
+}
+
+.product-workflow-steps li + li {
+  padding-left: 1.5rem;
+  border-left: 1px solid rgba(106, 174, 242, 0.2);
+}
+
+.product-workflow-steps li > span {
+  color: var(--action-on-dark);
+  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+}
+
+.product-workflow-steps h3 {
+  margin-top: 2.5rem;
+  color: var(--stage-text);
+  font-size: 1.12rem;
+}
+
+.product-workflow-steps p {
+  margin-top: 0.65rem;
+  color: rgb(var(--c-stage-soft) / 0.7);
+  font-size: 0.84rem;
+  line-height: 1.65;
+}
+
+.product-receipt {
+  display: grid;
+  gap: 0.45rem;
+  max-width: 58rem;
+  margin-top: 2.5rem;
+  padding: 1.35rem 1.5rem;
+  border: 1px solid rgba(106, 174, 242, 0.36);
+  background: rgba(14, 23, 41, 0.72);
+  color: var(--stage-soft);
+  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-size: clamp(0.68rem, 1.2vw, 0.8rem);
+  line-height: 1.45;
+}
+
+.product-receipt span:first-child {
+  padding-bottom: 0.65rem;
+  border-bottom: 1px solid rgba(182, 192, 212, 0.18);
+  color: var(--stage-text);
+}
+
+.product-receipt strong {
+  color: var(--signal-gold);
+  font-weight: 500;
+}
+
+.product-boundaries {
+  padding-block: clamp(4rem, 8vw, 7rem);
+  border-bottom: 1px solid var(--hairline);
+  background: #fff;
+}
+
+.product-boundaries-grid {
+  display: grid;
+  grid-template-columns: minmax(16rem, 0.8fr) minmax(0, 1.2fr);
+  gap: clamp(3rem, 8vw, 8rem);
+}
+
+.product-boundaries h2 {
+  font-size: clamp(2.5rem, 5vw, 4.7rem);
+}
+
+.product-boundaries h2 span {
+  color: var(--indigo);
+}
+
+.product-boundaries-grid > div > p {
+  max-width: 31rem;
+  margin-top: 1.25rem;
+  color: var(--ink-soft);
+  line-height: 1.75;
+}
+
+.product-boundary-list {
+  border-top: 1px solid var(--paper-edge);
+}
+
+.product-boundary-list > div {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.85fr) minmax(0, 1.15fr);
+  gap: 1.5rem;
+  padding-block: 1.4rem;
+  border-bottom: 1px solid var(--paper-edge);
+}
+
+.product-boundary-list dt {
+  font-weight: 700;
+}
+
+.product-boundary-list dd {
+  color: var(--ink-soft);
+  font-size: 0.88rem;
+}
+
+.product-surfaces {
+  padding-block: clamp(4rem, 8vw, 7rem);
+  background:
+    radial-gradient(circle at 90% 0%, rgba(79, 209, 197, 0.1), transparent 28rem),
+    var(--ocean-deep);
+}
+
+.product-surface-list {
+  margin-top: 2.5rem;
+  border-top: 1px solid rgba(106, 174, 242, 0.28);
+}
+
+.product-surface-list > div {
+  display: grid;
+  grid-template-columns: minmax(13rem, 0.7fr) minmax(0, 1.3fr);
+  gap: 2rem;
+  padding: 1.2rem 0;
+  border-bottom: 1px solid rgba(106, 174, 242, 0.22);
+}
+
+.product-surface-list strong {
+  color: var(--stage-text);
+  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-size: 1rem;
+}
+
+.product-surface-list span {
+  color: var(--stage-soft);
+}
+
+.product-surfaces > .product-container > a {
+  display: inline-block;
+  margin-top: 1.5rem;
+  color: var(--action-on-dark);
+  font-size: 0.82rem;
+}
+
+.product-install-band {
+  padding-block: clamp(3rem, 6vw, 5rem);
+  background: var(--indigo-deep);
+  color: #fff;
+}
+
+.product-install-grid {
+  display: grid;
+  grid-template-columns: minmax(15rem, 0.65fr) minmax(0, 1.35fr);
+  gap: clamp(2rem, 7vw, 7rem);
+  align-items: start;
+}
+
+.product-install-band h2 {
+  color: #fff;
+  font-size: clamp(2.2rem, 4.5vw, 4rem);
+}
+
+.product-install-band pre.code-block {
+  margin: 0;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.product-install-band p {
+  margin-top: 1rem;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 0.78rem;
+  line-height: 1.7;
+}
+
+.product-install-band a {
+  display: inline-block;
+  margin-top: 1.2rem;
+  padding-bottom: 0.2rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.5);
+  color: #fff;
+  font-size: 0.82rem;
+}
+
+.product-community {
+  padding-block: clamp(3.5rem, 7vw, 6rem);
+  border-bottom: 1px solid var(--hairline);
+  background:
+    radial-gradient(circle at 12% 50%, rgba(246, 196, 83, 0.14), transparent 20rem),
+    var(--paper);
+}
+
+.product-community-grid {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.42fr) minmax(0, 1.08fr) minmax(16rem, 0.75fr);
+  gap: clamp(2rem, 5vw, 5rem);
+  align-items: end;
+}
+
+.product-community-illustration {
+  position: relative;
+  display: grid;
+  min-height: 10rem;
+  place-items: end center;
+  color: var(--indigo-deep);
+}
+
+.product-community-illustration span {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 50%;
+  background: var(--signal-gold);
+  transform: translateX(-50%);
+}
+
+.product-community-illustration svg {
+  position: relative;
+  z-index: 1;
+  max-width: 100%;
+}
+
+.product-community h2 {
+  font-size: clamp(2.4rem, 5vw, 4.8rem);
+}
+
+.product-community h2::after {
+  content: ".";
+  color: var(--signal-gold);
+}
+
+.product-community p {
+  max-width: 42rem;
+  margin-top: 1rem;
+  color: var(--ink-soft);
+  font-size: 1rem;
+  line-height: 1.75;
+}
+
+.product-community nav {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--paper-edge);
+}
+
+.product-community nav a {
+  color: var(--indigo-deep);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.product-home a:focus-visible {
+  outline: 3px solid var(--signal-gold);
+  outline-offset: 4px;
+}
+
+@media (max-width: 1050px) {
+  .product-hero-grid {
+    grid-template-columns: 1fr;
+    min-height: auto;
+  }
+
+  .product-hero-copy {
+    max-width: 48rem;
+  }
+
+  .product-shot {
+    width: min(100%, 56rem);
+  }
+}
+
+@media (max-width: 760px) {
+  .product-container {
+    width: min(100% - 2rem, 76rem);
+  }
+
+  .product-proof-grid,
+  .product-boundaries-grid,
+  .product-install-grid,
+  .product-community-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .product-proof p {
+    padding-top: 1.5rem;
+    padding-left: 0;
+    border-top: 1px solid var(--paper-edge);
+    border-left: 0;
+  }
+
+  .product-workflow-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .product-workflow-steps li:nth-child(3) {
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .product-boundary-list > div,
+  .product-surface-list > div {
+    grid-template-columns: 1fr;
+    gap: 0.45rem;
+  }
+}
+
+@media (max-width: 520px) {
+  .product-hero-grid {
+    padding-block: 2.75rem 3.5rem;
+  }
+
+  .product-hero-copy h1 {
+    max-width: 100%;
+    font-size: clamp(2.4rem, 13vw, 3.25rem);
+  }
+
+  .product-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .product-workflow-steps {
+    grid-template-columns: 1fr;
+  }
+
+  .product-workflow-steps li,
+  .product-workflow-steps li + li,
+  .product-workflow-steps li:nth-child(3) {
+    min-height: 0;
+    padding: 1.25rem 0;
+    border-left: 0;
+  }
+
+  .product-workflow-steps h3 {
+    margin-top: 1.25rem;
+  }
+
+  .product-receipt {
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .product-community nav {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Documentation portal                                              */
 /* ------------------------------------------------------------------ */
 

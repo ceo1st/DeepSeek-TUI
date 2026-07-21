@@ -94,6 +94,10 @@ impl ToolSpec for ReadFileTool {
         "read_file"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. CodeWhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
@@ -675,6 +679,10 @@ impl ToolSpec for WriteFileTool {
         "write_file"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Write content to a UTF-8 file in the workspace. Use this instead of heredocs (`cat <<EOF > file`) or `echo > file` in `exec_shell` — diffs render inline and approval is handled cleanly. Creates or overwrites; parent directories are auto-created."
     }
@@ -773,6 +781,10 @@ pub struct EditFileTool;
 impl ToolSpec for EditFileTool {
     fn name(&self) -> &'static str {
         "edit_file"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
@@ -1074,6 +1086,10 @@ const LIST_DIR_MAX_ENTRIES: usize = 500;
 impl ToolSpec for ListDirTool {
     fn name(&self) -> &'static str {
         "list_dir"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {

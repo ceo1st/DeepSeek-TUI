@@ -938,9 +938,9 @@ fn apply_model_template(
     prompt.replace("{model_id}", model_id)
 }
 
-const TOOL_TAXONOMY_DISCOVERY: &[&str] = &["grep_files", "file_search"];
-const TOOL_TAXONOMY_GIT: &[&str] = &["git_status", "git_diff"];
-const TOOL_TAXONOMY_VERIFICATION: &[&str] = &["run_tests", "run_verifiers"];
+const TOOL_TAXONOMY_DISCOVERY: &[&str] = &["File"];
+const TOOL_TAXONOMY_GIT: &[&str] = &["Git"];
+const TOOL_TAXONOMY_VERIFICATION: &[&str] = &["Run"];
 
 /// Return the core tool taxonomy body **without** a markdown heading.
 /// Suitable for embedding under a mode-specific sub-heading in the
@@ -958,9 +958,9 @@ pub(crate) fn render_core_tool_taxonomy_body(mode: AppMode) -> String {
     if let Some(verification) = render_core_tool_group(TOOL_TAXONOMY_VERIFICATION, &core_tools) {
         sentences.push(format!("Use {verification} for verification."));
     }
-    if core_tools.contains(&"run_verifiers") {
+    if core_tools.contains(&"Run") {
         sentences.push(
-            "For long build/test/lint verifier suites, call `run_verifiers` with `background: true` or use `task_shell_start`, then poll while continuing independent inspection."
+            "For long build/test/lint suites, call `Run` with `action: \"verifiers\"` and `background: true`, then continue independent inspection."
                 .to_string(),
         );
     }
@@ -977,7 +977,7 @@ fn core_taxonomy_tools_for_mode(mode: AppMode) -> Vec<&'static str> {
     core_tools
         .iter()
         .copied()
-        .filter(|tool| mode != AppMode::Plan || !matches!(*tool, "run_tests" | "run_verifiers"))
+        .filter(|tool| mode != AppMode::Plan || *tool != "Run")
         .collect()
 }
 
@@ -1628,11 +1628,10 @@ mod tests {
     #[test]
     fn agent_mode_carries_execution_discipline_block() {
         for phrase in [
-            "Execution Discipline",
-            "Do not end with \"I'll check\"",
-            "After spawning a background shell or sub-agent",
-            "<codewhale:subagent.done>",
-            "verify load-bearing claims",
+            "Execute the user's task autonomously",
+            "Keep `work_update` current",
+            "verify load-bearing child",
+            "never manufacture completion sentinels",
         ] {
             assert!(
                 AGENT_MODE.contains(phrase),
@@ -2039,16 +2038,8 @@ mod tests {
 
     #[test]
     fn execution_discipline_lives_in_agent_mode_after_core_constitution() {
-        let discipline_at = AGENT_MODE
-            .find("###### Execution Discipline")
-            .expect("Execution Discipline anchor present");
-        let longevity_at = AGENT_MODE
-            .find("###### Session Longevity")
-            .expect("Session Longevity anchor present");
-        assert!(
-            longevity_at < discipline_at,
-            "agent-mode execution discipline should follow the shorter mode/longevity delta"
-        );
+        assert!(AGENT_MODE.contains("Execute the user's task autonomously"));
+        assert!(AGENT_MODE.contains("verify load-bearing child"));
         assert!(
             !BASE_PROMPT.contains("Execution Discipline")
                 && !BASE_PROMPT.contains("<tool_persistence>"),
@@ -2063,7 +2054,7 @@ mod tests {
             "Plan mode must tell the model to finish plans through update_plan"
         );
         assert!(
-            PLAN_MODE.contains("accept / revise / exit prompt"),
+            PLAN_MODE.contains("accept, revise, or exit decision"),
             "Plan mode must explain why update_plan is the UI handoff signal"
         );
     }
@@ -2897,18 +2888,15 @@ mod tests {
     fn agent_mode_prompt_keeps_safety_invariants_after_compression() {
         let prompt = AGENT_MODE.replace("\r\n", "\n").replace('\r', "\n");
         for must in [
-            "Agent mode",
+            "autonomously",
+            "`File`",
+            "`Git`",
+            "`Run`",
+            "`Bash`",
             "work_update",
             "update_plan",
-            "workflow",
-            "request_user_input",
-            "agent(action=\"wait\")",
-            "type: \"explore\"",
-            "fork_context",
-            "rlm_open",
-            "Bare `/workflow` means orchestrate current work without re-asking",
-            "stop and synthesize",
-            "Do NOT explain, announce, or mention to the user that you are running in Agent mode",
+            "Delegate independent work",
+            "Do not announce the mode",
         ] {
             assert!(
                 prompt.contains(must),
@@ -2937,14 +2925,10 @@ mod tests {
             let word_count = normalized.split_whitespace().count();
             let estimated_tokens =
                 crate::compaction::estimate_text_tokens_conservative(&normalized);
-            // 2026-07-20: agent mode compressed (661 -> ~560 words) while
-            // preserving every tested approval, orchestration, subagent-brief,
-            // sentinel, workflow, and fork-context invariant. Keep the budget
-            // tight so procedural detail stays out of the system prefix.
-            let max_words = if name == "agent" { 580 } else { 350 };
-            // The auto-fork contract sentence (#4599-adjacent cache work)
-            // costs a handful of tokens over the original compression target.
-            let max_tokens = if name == "agent" { 1360 } else { 700 };
+            // 2026-07-21: mode deltas contain permissions and durable behavior
+            // only. Action recipes belong to the canonical tool schemas.
+            let max_words = 120;
+            let max_tokens = 320;
 
             assert!(
                 word_count <= max_words,
@@ -2990,7 +2974,7 @@ mod tests {
         }
 
         assert!(
-            PLAN_MODE.contains("All writes and patches are blocked"),
+            PLAN_MODE.contains("All writes, patches, shell commands"),
             "Plan may summarize the user-facing mode delta"
         );
         assert!(
@@ -3109,8 +3093,12 @@ mod tests {
     fn agent_mode_tool_guidance_avoids_defensive_tool_suppression() {
         let prompt = compose_prompt(Personality::Calm);
         assert!(!prompt.contains("Tool Selection Guide"));
-        assert!(AGENT_MODE.contains("Delegate only independent, fire-and-forget work"));
-        assert!(AGENT_MODE.contains("Use `rlm_open`"));
+        for tool in ["`File`", "`Git`", "`Run`", "`Bash`"] {
+            assert!(AGENT_MODE.contains(tool));
+        }
+        for legacy in ["read_file", "git_status", "run_tests", "exec_shell"] {
+            assert!(!AGENT_MODE.contains(legacy));
+        }
         assert!(
             !AGENT_MODE.contains("When NOT to use certain tools"),
             "agent mode should steer tool choice without training the model to avoid available tools"
@@ -3228,19 +3216,7 @@ mod tests {
 
     #[test]
     fn rlm_specialty_tool_guidance_present() {
-        assert!(AGENT_MODE.contains("Large Context Tools"));
-        for tool in [
-            "rlm_open",
-            "rlm_eval",
-            "rlm_configure",
-            "rlm_close",
-            "handle_read",
-        ] {
-            assert!(
-                AGENT_MODE.contains(tool),
-                "AGENT_MODE should mention `{tool}`"
-            );
-        }
+        assert!(!AGENT_MODE.contains("Large Context Tools"));
 
         let descriptions = [
             RlmTool::alias("rlm_open", "open", None)
@@ -3301,17 +3277,8 @@ mod tests {
 
     #[test]
     fn prompt_uses_single_agent_and_rlm_surface() {
-        for tool in [
-            "rlm_open",
-            "rlm_eval",
-            "rlm_configure",
-            "rlm_close",
-            "handle_read",
-        ] {
-            assert!(
-                AGENT_MODE.contains(tool),
-                "AGENT_MODE should mention tool `{tool}`"
-            );
+        for tool in ["rlm_open", "rlm_eval", "rlm_configure", "rlm_close"] {
+            assert!(!AGENT_MODE.contains(tool));
         }
         assert!(AGENT_MODE.contains("sub-agent"));
     }
@@ -3319,104 +3286,60 @@ mod tests {
     #[test]
     fn prompt_documents_fork_context_prefix_cache_contract() {
         let source = include_str!("tools/subagent/mod.rs");
-        for haystack in [AGENT_MODE, source] {
-            assert!(haystack.contains("fork_context"));
-            assert!(haystack.contains("byte-identical"));
-            assert!(haystack.contains("DeepSeek prefix-cache reuse"));
-        }
-        assert!(AGENT_MODE.contains("`fork_context` is auto-chosen"));
-        assert!(AGENT_MODE.contains("write-capable, isolated, or re-routed children start fresh"));
+        assert!(source.contains("fork_context"));
+        assert!(!AGENT_MODE.contains("fork_context"));
     }
 
     #[test]
     fn prompt_documents_explicit_subagent_model_strength() {
-        let prompt = AGENT_MODE;
-        assert!(prompt.contains("model_strength: \"same\""));
-        assert!(prompt.contains("model_strength: \"faster\""));
-        assert!(prompt.contains("type: \"explore\""));
-        assert!(include_str!("tools/subagent/mod.rs").contains("Overrides model_strength"));
-        assert!(prompt.contains("defaults to `model_strength: \"faster\"`"));
-        assert!(prompt.contains("2-4 `type: \"explore\"` sub-agents"));
-        assert!(prompt.contains("self-reports"));
+        let source = include_str!("tools/subagent/mod.rs");
+        assert!(source.contains("model_strength"));
+        assert!(!AGENT_MODE.contains("model_strength"));
     }
 
     #[test]
     fn prompt_documents_structured_subagent_briefs() {
-        let prompt = AGENT_MODE;
-        for field in [
-            "Subagent Brief",
-            "QUESTION",
-            "SCOPE",
-            "ALREADY_KNOWN",
-            "EFFORT",
-            "STOP_CONDITION",
-            "VERDICT",
-            "EVIDENCE",
-            "GAPS",
-            "NEXT",
+        assert!(!AGENT_MODE.contains("Subagent Brief"));
+        for heading in [
+            "### SUMMARY",
+            "### EVIDENCE",
+            "### CHANGES",
+            "### RISKS",
+            "### BLOCKERS",
         ] {
-            assert!(
-                prompt.contains(field),
-                "main prompt should include Subagent Brief field `{field}`"
-            );
+            assert!(text::SUBAGENT_OUTPUT_FORMAT.contains(heading));
         }
-        assert!(prompt.contains("Brief sub-agents with a compact Subagent Brief"));
     }
 
     #[test]
     fn prompt_bounds_explore_without_tiny_cap_for_implementers() {
-        let prompt = AGENT_MODE;
-        assert!(prompt.contains("Explore briefs default to `quick`"));
-        assert!(prompt.contains("read-only"));
-        assert!(prompt.contains("3-5 tool calls"));
-        assert!(prompt.contains("Review/verifier children stop after decisive evidence"));
-        assert!(prompt.contains("No fan-out without a fan-in owner"));
+        assert!(AGENT_MODE.contains("Delegate independent work"));
+        assert!(!AGENT_MODE.contains("3-5 tool calls"));
+        assert!(!AGENT_MODE.contains("No fan-out without a fan-in owner"));
     }
 
     #[test]
     fn agent_mode_prompt_teaches_automatic_workflow_use() {
-        // #4125: parent decides Workflow without the user saying the word;
-        // indicates the shape and may ask setup questions before launch.
-        let prompt = AGENT_MODE;
-        for phrase in [
-            "You decide when to use Workflow",
-            "need **not** say \"workflow\"",
-            "broad, independent, or staged",
-            "This looks set up for a Workflow",
-            "`request_user_input`",
-            "TUI question modal",
-            "Pass **paths**, not file contents",
-            "Prefer `responseSchema`",
-            "one compact summary",
+        for recipe in [
+            "Workflow",
+            "responseSchema",
+            "request_user_input",
+            ".workflow.js",
         ] {
-            assert!(
-                prompt.contains(phrase),
-                "AGENT_MODE missing automatic-workflow phrase {phrase:?}"
-            );
+            assert!(!AGENT_MODE.contains(recipe));
         }
-        // Explicitly not the old opt-in-only framing.
-        assert!(
-            !prompt.contains("The `workflow` tool is opt-in"),
-            "AGENT_MODE must not describe Workflow as opt-in only"
-        );
     }
 
     #[test]
     fn operate_mode_prompt_keeps_multitask_simple_and_async() {
         for phrase in [
-            "ordinary user messages",
-            "Answer conversation",
-            "honor that request even for read-only work",
-            "silently collapse it into parent-local discovery",
-            "Use ordinary tools directly",
-            "same approval posture, sandbox, shell configuration",
-            "Prefer one or more `agent` workers",
-            "Delegation is not mandatory",
-            "background",
-            "Treat each queued user message as another task",
-            "Use `workflow` only when",
-            "scheduling emphasis, not tool authority",
-            "Keep internal mechanics internal",
+            "ordinary messages",
+            "small or tightly coupled tasks directly",
+            "dispatch workers",
+            "queued user messages",
+            "approval, sandbox, and repository policies",
+            "lifecycle claims exact",
+            "internal control-plane mechanics",
         ] {
             assert!(
                 OPERATE_MODE.contains(phrase),
@@ -3437,11 +3360,10 @@ mod tests {
 
     #[test]
     fn subagent_done_sentinel_section_present() {
-        assert!(AGENT_MODE.contains("<codewhale:subagent.done>"));
-        assert!(AGENT_MODE.contains("not user input"));
-        assert!(AGENT_MODE.contains("verify load-bearing claims"));
-        assert!(AGENT_MODE.contains("never generate fake sentinels"));
-        assert!(AGENT_MODE.contains("Do not tell the user they pasted sentinels"));
+        assert!(AGENT_MODE.contains("completion events as internal evidence"));
+        assert!(AGENT_MODE.contains("verify load-bearing child"));
+        assert!(AGENT_MODE.contains("never manufacture completion sentinels"));
+        assert!(!AGENT_MODE.contains("<codewhale:subagent.done>"));
     }
 
     #[test]
@@ -3981,9 +3903,9 @@ mod tests {
 fn core_execution_profile_is_runtime_only() {
     for required in [
         "repository instructions",
-        "smallest coherent change",
-        "relevant verification",
-        "typed outcome",
+        "inspect the narrow owner",
+        "verify it",
+        "Report changed files",
     ] {
         assert!(CORE_EXECUTION_PROFILE_PROMPT.contains(required));
     }

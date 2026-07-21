@@ -37,6 +37,10 @@ impl ToolSpec for RunTestsTool {
         "run_tests"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Run `cargo test` in the workspace root with optional extra arguments."
     }

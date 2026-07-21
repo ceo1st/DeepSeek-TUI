@@ -34,6 +34,10 @@ impl ToolSpec for FileSearchTool {
         "file_search"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Find files by name using fuzzy matching with score-based ranking. Use this instead of `find -name` or `fd` in `exec_shell` for filename search. Pass `extensions` to filter by suffix."
     }

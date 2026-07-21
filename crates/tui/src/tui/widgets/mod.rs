@@ -36,7 +36,8 @@ use crate::palette;
 use crate::provider_lake::all_catalog_models_for_provider;
 use crate::tui::app::{App, AppMode, ComposerDensity, VimMode};
 use crate::tui::approval::{
-    ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel, ToolCategory,
+    ApprovalMode, ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel,
+    ToolCategory,
 };
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::scrolling::TranscriptLineMeta;
@@ -1165,9 +1166,6 @@ impl<'a> ComposerWidget<'a> {
 
     fn wants_enclosed_panel(&self) -> bool {
         self.app.composer_border
-            && (self.app.is_history_search_active()
-                || self.app.composer_display_input().contains('\n')
-                || self.active_menu_row_count() > 0)
     }
 
     pub(crate) fn has_panel(&self, area: Rect) -> bool {
@@ -1238,11 +1236,6 @@ impl Renderable for ComposerWidget<'_> {
             );
         let is_draft_mode = input_text.contains('\n') || visible_lines.len() > 1;
         if has_panel {
-            let border_color = if input_text.trim().is_empty() {
-                palette::BORDER_COLOR
-            } else {
-                self.mode_color()
-            };
             let hint_line = if self.app.is_history_search_active() {
                 Some(Line::from(vec![
                     Span::styled(
@@ -1339,19 +1332,24 @@ impl Renderable for ComposerWidget<'_> {
                 None
             };
 
-            let mut block = Block::default()
-                .borders(Borders::TOP | Borders::BOTTOM)
-                .border_style(Style::default().fg(border_color))
+            let permission_color = match self.app.approval_mode {
+                ApprovalMode::Suggest | ApprovalMode::Never => palette::WHALE_HUMAN,
+                ApprovalMode::Auto => palette::TEXT_REASONING,
+                ApprovalMode::Bypass => palette::STATUS_WARNING,
+            };
+            let mut top_border = Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(permission_color))
                 .style(background);
             if self.app.is_history_search_active() || is_draft_mode {
-                block = if self.app.is_history_search_active() {
-                    block.title(Line::from(Span::styled(
+                top_border = if self.app.is_history_search_active() {
+                    top_border.title(Line::from(Span::styled(
                         self.app
                             .tr(crate::localization::MessageId::HistorySearchTitle),
                         Style::default().fg(palette::TEXT_MUTED),
                     )))
                 } else {
-                    block.title(Line::from(Span::styled(
+                    top_border.title(Line::from(Span::styled(
                         "Draft",
                         Style::default().fg(palette::TEXT_MUTED),
                     )))
@@ -1363,12 +1361,18 @@ impl Renderable for ComposerWidget<'_> {
             if self.app.ocean_treatment.is_classic()
                 && let Some(chrome) = composer_top_right_chrome(self.app, area.width)
             {
-                block = block.title_top(chrome.right_aligned());
+                top_border = top_border.title_top(chrome.right_aligned());
             }
+            top_border.render(area, buf);
+
+            let mut bottom_border = Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(self.mode_color()))
+                .style(background);
             if let Some(hint_line) = hint_line {
-                block = block.title_bottom(hint_line);
+                bottom_border = bottom_border.title_bottom(hint_line);
             }
-            block.render(area, buf);
+            bottom_border.render(area, buf);
         } else if area.height >= 2 {
             let mut block = Block::default()
                 .borders(Borders::TOP)
@@ -4255,17 +4259,17 @@ fn line_spans_with_selection<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
-        ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_entry_revision,
-        ambient_ping_pong, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, approval_palette, approval_truncation_hint, build_empty_state_lines,
-        composer_content_geometry, composer_empty_hint_text, composer_height, composer_max_height,
-        composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
-        fish_flee_offset, fish_heading, fish_mark, history_entry_revision, layout_input,
-        layout_input_with_scroll, pad_lines_to_bottom, placeholder_visual_lines,
-        push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
-        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
-        wrap_input_lines_for_mouse, wrap_text,
+        ACTIVE_REVISION_DOMAIN, ApprovalMode, ApprovalWidget, COMPOSER_PANEL_HEIGHT,
+        COMPOSER_PLACEHOLDER, ChatWidget, ComposerWidget, Renderable, SlashMenuEntry,
+        active_entry_revision, ambient_ping_pong, apply_detail_target_highlight,
+        apply_selection_to_line, apply_send_flash, approval_palette, approval_truncation_hint,
+        build_empty_state_lines, composer_content_geometry, composer_empty_hint_text,
+        composer_height, composer_max_height, composer_min_input_rows, composer_top_padding,
+        cursor_row_col, empty_composer_visual_rows, fish_flee_offset, fish_heading, fish_mark,
+        history_entry_revision, layout_input, layout_input_with_scroll, pad_lines_to_bottom,
+        placeholder_visual_lines, push_command_entry, receipt_is_settling, revision_in_domain,
+        should_render_empty_state, slash_completion_hints, tool_run_summary_revision,
+        wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
@@ -5417,6 +5421,19 @@ mod tests {
     }
 
     #[test]
+    fn composer_expands_for_multiline_input_and_collapses_again() {
+        let height_for =
+            |input| composer_height(input, 40, 12, 0, ComposerDensity::Comfortable, true);
+
+        let collapsed = height_for("short");
+        let expanded = height_for("one\ntwo\nthree\nfour\nfive\nsix");
+        let collapsed_again = height_for("short");
+
+        assert!(expanded > collapsed);
+        assert_eq!(collapsed_again, collapsed);
+    }
+
+    #[test]
     fn composer_height_uses_quiet_rule_when_panel_is_not_needed() {
         let with_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, true);
         let without_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, false);
@@ -5492,16 +5509,15 @@ mod tests {
             height: 5,
         };
 
-        // Normal one-line composition uses only the top rule, preserving the
-        // reference's continuous water field instead of drawing a full box.
-        // inner_area: {x:0, y:1, w:40, h:4}
-        // input_rows_budget = 4
+        // The two border rows carry independent permission/mode signals.
+        // inner_area: {x:0, y:1, w:40, h:3}
+        // input_rows_budget = 3
         // The prompt and hint share one quiet row.
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 40, 4),
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 40, 3),
             1
         );
-        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 2)));
     }
 
     #[test]
@@ -5520,17 +5536,17 @@ mod tests {
             height: 5,
         };
 
-        // inner_area: {x:0, y:1, w:14, h:4}
-        // input_rows_budget = 4
+        // inner_area: {x:0, y:1, w:14, h:3}
+        // input_rows_budget = 3
         // placeholder_visual_lines(14) = 2
         // The narrow fallback still reserves one composer row; Paragraph
         // clipping keeps it from growing the shell.
         assert_eq!(placeholder_visual_lines(14), 2);
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 14, 4),
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 14, 3),
             1
         );
-        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 2)));
     }
 
     #[test]
@@ -5640,6 +5656,47 @@ mod tests {
         assert!(!rendered.contains("Composer"));
         assert!(rendered.contains("turn completed"));
         assert!(rendered.contains("tool(s) used"));
+    }
+
+    #[test]
+    fn composer_border_edges_encode_permission_and_mode() {
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let area = Rect::new(0, 0, 40, 5);
+
+        for (approval_mode, expected) in [
+            (ApprovalMode::Suggest, palette::WHALE_HUMAN),
+            (ApprovalMode::Auto, palette::TEXT_REASONING),
+            (ApprovalMode::Bypass, palette::STATUS_WARNING),
+        ] {
+            let mut app = create_test_app();
+            app.approval_mode = approval_mode;
+            let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+            let mut buf = Buffer::empty(area);
+
+            widget.render(area, &mut buf);
+
+            assert_eq!(buf[(1, area.top())].fg, expected, "{approval_mode:?}");
+        }
+
+        for (mode, expected) in [
+            (AppMode::Plan, palette::MODE_PLAN),
+            (AppMode::Agent, palette::MODE_AGENT),
+            (AppMode::Operate, palette::MODE_OPERATE),
+        ] {
+            let mut app = create_test_app();
+            app.mode = mode;
+            let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+            let mut buf = Buffer::empty(area);
+
+            widget.render(area, &mut buf);
+
+            assert_eq!(
+                buf[(1, area.bottom().saturating_sub(1))].fg,
+                expected,
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

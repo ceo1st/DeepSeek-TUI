@@ -19,6 +19,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::localization::{Locale, MessageId, tr};
+use crate::palette;
 use crate::tui::{
     app::{App, AppMode, OnboardingState},
     approval::ApprovalMode,
@@ -654,6 +655,16 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     let (effective_provider, effective_model) = app.effective_route_identity_display();
     let route_label = format!("{effective_provider} · {effective_model}");
     let effort_label = app.reasoning_effort_display_label();
+    let mode_color = match app.mode {
+        AppMode::Plan => app.ui_theme.mode_plan,
+        AppMode::Operate => app.ui_theme.mode_operate,
+        _ => app.ui_theme.mode_agent,
+    };
+    let permission_color = match app.approval_mode {
+        ApprovalMode::Suggest | ApprovalMode::Never => palette::WHALE_HUMAN,
+        ApprovalMode::Auto => palette::TEXT_REASONING,
+        ApprovalMode::Bypass => palette::STATUS_WARNING,
+    };
     let status_indicator = crate::tui::widgets::header_status_indicator_frame(
         (!app.low_motion && app.fancy_animations)
             .then_some(app.turn_started_at)
@@ -673,11 +684,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
         Span::styled(
             mode_label(app.ui_locale, app.mode),
-            Style::default().fg(match app.mode {
-                AppMode::Plan => app.ui_theme.mode_plan,
-                AppMode::Operate => app.ui_theme.mode_operate,
-                _ => app.ui_theme.mode_agent,
-            }),
+            Style::default().fg(mode_color),
         ),
         Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
         Span::styled(effort_label.clone(), Style::default().fg(app.ui_theme.info)),
@@ -703,7 +710,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     ));
     left.push(Span::styled(
         permission_label(app),
-        Style::default().fg(app.ui_theme.text_muted),
+        Style::default().fg(permission_color),
     ));
 
     let mut right = Vec::new();
@@ -746,11 +753,11 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         };
         let suffix = vec![
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
-            Span::styled(mode, Style::default().fg(app.ui_theme.accent_primary)),
+            Span::styled(mode, Style::default().fg(mode_color)),
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
             Span::styled(effort, Style::default().fg(app.ui_theme.info)),
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
-            Span::styled(permission, Style::default().fg(app.ui_theme.text_muted)),
+            Span::styled(permission, Style::default().fg(permission_color)),
         ];
         let indicator_width = status_indicator.map_or(0, |indicator| 1 + indicator.width());
         let fixed_width = 4usize
@@ -1115,6 +1122,32 @@ mod tests {
             header.contains(" · h · Full Access"),
             "effective effort missing: {header:?}"
         );
+    }
+
+    #[test]
+    fn header_permission_color_matches_the_composer_warm_ramp() {
+        for width in [40, 100] {
+            for (approval_mode, expected) in [
+                (ApprovalMode::Suggest, palette::WHALE_HUMAN),
+                (ApprovalMode::Auto, palette::TEXT_REASONING),
+                (ApprovalMode::Bypass, palette::STATUS_WARNING),
+            ] {
+                let mut app = test_app();
+                app.approval_mode = approval_mode;
+                let label = permission_label(&app).into_owned();
+                let area = Rect::new(0, 0, width, 1);
+                let mut buf = Buffer::empty(area);
+
+                render_header(area, &mut buf, &app);
+
+                let rendered = (0..width).map(|x| buf[(x, 0)].symbol()).collect::<String>();
+                let label_byte = rendered
+                    .find(&label)
+                    .expect("permission label should render");
+                let label_x = rendered[..label_byte].width() as u16;
+                assert_eq!(buf[(label_x, 0)].fg, expected, "{approval_mode:?}");
+            }
+        }
     }
 
     #[test]

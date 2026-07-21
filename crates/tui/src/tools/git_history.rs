@@ -34,6 +34,10 @@ impl ToolSpec for GitLogTool {
         "git_log"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Run `git log` in the workspace with optional path and author/date filters."
     }
@@ -149,6 +153,10 @@ pub struct GitShowTool;
 impl ToolSpec for GitShowTool {
     fn name(&self) -> &'static str {
         "git_show"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
@@ -267,6 +275,10 @@ pub struct GitBlameTool;
 impl ToolSpec for GitBlameTool {
     fn name(&self) -> &'static str {
         "git_blame"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {

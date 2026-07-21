@@ -3443,11 +3443,14 @@ fn explore_catalog_inherits_web_but_hides_write_shell_and_fim_tools() {
         crate::tools::plan::new_shared_plan_state(),
     );
 
-    let names = tool_names(registry.tools_for_model(&SubAgentType::Explore));
-    for name in ["web_search", "fetch_url", "web.run", "wait_for_dev_server"] {
+    let tools = registry.tools_for_model(&SubAgentType::Explore);
+    let names = tool_names(tools.clone());
+    for name in ["File", "Git", "Web", "web.run"] {
         assert!(names.contains(name), "Explore should inherit {name}");
     }
     for name in [
+        "Bash",
+        "Run",
         "write_file",
         "edit_file",
         "apply_patch",
@@ -3457,6 +3460,11 @@ fn explore_catalog_inherits_web_but_hides_write_shell_and_fim_tools() {
     ] {
         assert!(!names.contains(name), "Explore must hide {name}");
     }
+    let file = tools.iter().find(|tool| tool.name == "File").unwrap();
+    assert_eq!(
+        file.input_schema["properties"]["action"]["enum"],
+        json!(["read", "list", "search_name", "search_content"])
+    );
 }
 
 #[test]
@@ -3473,12 +3481,20 @@ fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
         crate::tools::plan::new_shared_plan_state(),
     );
 
-    let names = tool_names(registry.tools_for_model(&SubAgentType::Implementer));
-    for name in ["apply_patch", "fim_edit", "write_file", "edit_file"] {
+    let tools = registry.tools_for_model(&SubAgentType::Implementer);
+    let names = tool_names(tools.clone());
+    for name in ["File", "fim_edit"] {
         assert!(
             names.contains(name),
             "Implementer should inherit write-capable tool {name}"
         );
+    }
+    let file = tools.iter().find(|tool| tool.name == "File").unwrap();
+    let actions = file.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    for action in ["write", "edit", "patch"] {
+        assert!(actions.iter().any(|value| value.as_str() == Some(action)));
     }
 }
 
@@ -6019,11 +6035,22 @@ async fn explore_role_blocks_writes_even_under_parent_auto_approve() {
         Arc::new(Mutex::new(PlanState::default())),
     );
 
+    std::fs::write(tmp.path().join("allowed.txt"), "visible").unwrap();
+    let read = registry
+        .execute(
+            "agent_test",
+            "File",
+            json!({"action": "read", "path": "allowed.txt"}),
+        )
+        .await
+        .expect("Explore should retain canonical read access");
+    assert!(read.contains("visible"));
+
     let err = registry
         .execute(
             "agent_test",
-            "write_file",
-            json!({"path": "nope.txt", "content": "denied"}),
+            "File",
+            json!({"action": "write", "path": "nope.txt", "content": "denied"}),
         )
         .await
         .expect_err("explore must not write even under parent auto-approve");
@@ -9655,10 +9682,19 @@ fn test_disallowed_tools_inheritance_denies_tool() {
     );
 
     let tools = registry.tools_for_model(&SubAgentType::General);
-    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    let names: HashSet<_> = tools.iter().map(|t| t.name.clone()).collect();
     assert!(!names.contains("exec_shell"), "catalog excludes exec_shell");
     assert!(!names.contains("write_file"), "catalog excludes write_file");
-    assert!(names.contains("read_file"), "catalog includes read_file");
+    assert!(names.contains("File"), "catalog includes canonical File");
+    let file = tools.into_iter().find(|tool| tool.name == "File").unwrap();
+    let actions = file.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.as_str() == Some("write"))
+    );
 }
 
 #[test]
@@ -9682,12 +9718,16 @@ fn test_disallowed_tools_deny_wins_over_allow() {
     );
 
     let tools = registry.tools_for_model(&SubAgentType::General);
-    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    let names: HashSet<_> = tools.iter().map(|t| t.name.clone()).collect();
     assert!(
         !names.contains("exec_shell"),
         "catalog must exclude denied tool even when allowlisted"
     );
-    assert!(names.contains("read_file"), "catalog includes allowed tool");
+    assert!(
+        names.contains("File"),
+        "legacy read allow exposes canonical File"
+    );
+    assert!(!names.contains("Bash"), "denied shell alias removes Bash");
 }
 
 #[test]
@@ -9761,7 +9801,7 @@ fn test_disallowed_tools_tools_for_model_excludes_denied() {
     let registry = new_registry_with_disallowed(runtime, None);
 
     let tools = registry.tools_for_model(&SubAgentType::General);
-    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    let names: HashSet<_> = tools.iter().map(|t| t.name.clone()).collect();
 
     assert!(!names.contains("exec_shell"), "catalog excludes exec_shell");
     assert!(!names.contains("write_file"), "catalog excludes write_file");
@@ -9769,8 +9809,14 @@ fn test_disallowed_tools_tools_for_model_excludes_denied() {
         !names.contains("apply_patch"),
         "catalog excludes apply_patch"
     );
-    assert!(names.contains("read_file"), "catalog includes read_file");
-    assert!(names.contains("grep_files"), "catalog includes grep_files");
+    assert!(names.contains("File"), "catalog includes canonical File");
+    let file = tools.into_iter().find(|tool| tool.name == "File").unwrap();
+    let actions = file.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    for denied in ["write", "patch"] {
+        assert!(!actions.iter().any(|action| action.as_str() == Some(denied)));
+    }
 }
 
 #[tokio::test]

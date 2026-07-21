@@ -242,6 +242,10 @@ impl ToolSpec for RunVerifiersTool {
         "run_verifiers"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Run independent verifier gates in parallel across detected Rust, Node, Python, and Go projects. Supports explicit custom verifier commands as program+args without requiring Bash."
     }

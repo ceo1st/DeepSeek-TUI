@@ -3519,8 +3519,9 @@ fn resolve_tool_definition<'a>(
         .iter()
         .find(|def| def.name.as_str() == tool_name.as_str());
 
-    // Resolve hallucinated tool names before policy gates run, so aliases like
-    // ReadFile are checked against the canonical registered tool name.
+    // Resolve hallucinated tool names before policy gates run. Hidden legacy
+    // handlers keep their executable name, while policy uses the canonical
+    // model-facing family definition.
     if tool_def.is_none()
         && let Some(registry) = tool_registry
         && let Some(canonical) = registry.resolve(tool_name.as_str())
@@ -3528,7 +3529,15 @@ fn resolve_tool_definition<'a>(
         crate::logging::info(format!(
             "Resolved hallucinated tool name '{tool_name}' -> '{canonical}'"
         ));
-        tool_def = tool_catalog.iter().find(|d| d.name == canonical);
+        let catalog_name = match canonical {
+            "read_file" | "write_file" | "edit_file" | "list_dir" | "grep_files"
+            | "file_search" | "apply_patch" => "File",
+            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" => "Git",
+            "run_tests" | "run_verifiers" => "Run",
+            "web_search" | "fetch_url" | "wait_for_dev_server" => "Web",
+            _ => canonical,
+        };
+        tool_def = tool_catalog.iter().find(|d| d.name == catalog_name);
         if tool_def.is_some() {
             *tool_name = canonical.to_string();
         }

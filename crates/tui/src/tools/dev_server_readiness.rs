@@ -58,6 +58,10 @@ impl ToolSpec for WaitForDevServerTool {
         "wait_for_dev_server"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Wait for a local dev server to become ready. Polls a loopback TCP port, optionally then an HTTP(S) health URL on the same port, with bounded timeout and structured success/failure output."
     }

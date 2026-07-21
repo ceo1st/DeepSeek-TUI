@@ -31,6 +31,10 @@ impl ToolSpec for GitStatusTool {
         "git_status"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Run `git status --porcelain=v1 -b` in the workspace (optionally scoped to a path)."
     }
@@ -110,6 +114,10 @@ pub struct GitDiffTool;
 impl ToolSpec for GitDiffTool {
     fn name(&self) -> &'static str {
         "git_diff"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
