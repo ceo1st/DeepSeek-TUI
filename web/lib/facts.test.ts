@@ -113,4 +113,61 @@ describe("resolveFacts", () => {
     expect(result.reason).toBe("invalid-kv-snapshot");
     expect(result.facts.toolCount).toBe(66);
   });
+
+  it.each([
+    [
+      "a malformed source revision",
+      snapshot({
+        sourceRevision: "not-a-git-sha",
+        sourceCommittedAt: "2026-07-21T23:00:00Z",
+        toolCount: 67,
+      }),
+    ],
+    [
+      "an unparseable source timestamp",
+      snapshot({
+        sourceRevision: "a".repeat(40),
+        sourceCommittedAt: "not-a-timestamp",
+        toolCount: 67,
+      }),
+    ],
+    [
+      "a source revision without its timestamp",
+      snapshot({
+        sourceRevision: "a".repeat(40),
+        sourceCommittedAt: null,
+        toolCount: 67,
+      }),
+    ],
+    [
+      "a source timestamp without its revision",
+      snapshot({
+        sourceRevision: null,
+        sourceCommittedAt: "2026-07-21T23:00:00Z",
+        toolCount: 67,
+      }),
+    ],
+  ])("rejects %s before source precedence is evaluated", (_description, cached) => {
+    const result = resolveFacts(snapshot(), cached);
+
+    expect(result.source).toBe("build");
+    expect(result.reason).toBe("invalid-kv-snapshot");
+    expect(result.facts.toolCount).toBe(66);
+  });
+
+  it("rejects a published release whose URL is not canonical for its tag", () => {
+    const cached = snapshot({
+      latestPublishedRelease: {
+        ...release090,
+        url: "https://example.com/releases/tag/v0.9.0",
+      },
+      toolCount: 67,
+    });
+
+    const result = resolveFacts(snapshot(), cached);
+
+    expect(result.source).toBe("build");
+    expect(result.reason).toBe("invalid-kv-snapshot");
+    expect(result.facts.toolCount).toBe(66);
+  });
 });

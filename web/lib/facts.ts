@@ -52,16 +52,27 @@ function isPublishedRelease(value: unknown): value is PublishedReleaseFact {
     value.tag === `v${value.version}` &&
     typeof value.publishedAt === "string" &&
     Number.isFinite(Date.parse(value.publishedAt)) &&
-    typeof value.url === "string"
+    value.url === `https://github.com/Hmbown/CodeWhale/releases/tag/${value.tag}`
   );
 }
 
 export function isRepoFacts(value: unknown): value is RepoFacts {
   if (!isRecord(value)) return false;
+  const sourceRevisionValid =
+    value.sourceRevision === null ||
+    (typeof value.sourceRevision === "string" && /^[0-9a-f]{40}$/i.test(value.sourceRevision));
+  const sourceCommittedAtValid =
+    value.sourceCommittedAt === null ||
+    (typeof value.sourceCommittedAt === "string" &&
+      Number.isFinite(Date.parse(value.sourceCommittedAt)));
+  const sourceProvenancePaired =
+    (value.sourceRevision === null) === (value.sourceCommittedAt === null);
+
   return (
     typeof value.generatedAt === "string" &&
-    (value.sourceRevision === null || typeof value.sourceRevision === "string") &&
-    (value.sourceCommittedAt === null || typeof value.sourceCommittedAt === "string") &&
+    sourceRevisionValid &&
+    sourceCommittedAtValid &&
+    sourceProvenancePaired &&
     typeof value.version === "string" &&
     Array.isArray(value.crates) &&
     Array.isArray(value.sandboxBackends) &&
