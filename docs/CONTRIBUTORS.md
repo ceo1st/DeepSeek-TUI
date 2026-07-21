@@ -31,7 +31,14 @@ notes, and relevant issue/PR comments.
 <summary><strong>v0.9.1 — provider and runtime hardening</strong></summary>
 
 - **[h3c-hexin](https://github.com/h3c-hexin)** — calendar-anchored hourly
-  automation recurrence across DST and lifecycle transitions (PR #4381)
+  automation recurrence across DST and lifecycle transitions (PR #4381),
+  explicit limits for unknown local models (PR #4656 / #4655), and
+  idle-timeout progress telemetry (PR #4657)
+- **[gaord](https://github.com/gaord)** — Runtime API provider registry and
+  atomic provider-switch endpoints (PR #4658)
+- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — Enter-send lag
+  diagnosis and fix direction for #4605 (PR #4654; landed through the
+  release-lane async-dispatch split)
 - **[zhangweiii](https://github.com/zhangweiii)** and
   **[Sterne Lee / sternelee](https://github.com/sternelee)** — the original
   first-class OpenCode Go implementations in PRs #773 and #1050, harvested

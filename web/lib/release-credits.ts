@@ -21,6 +21,7 @@
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
   "@h3c-hexin",
+  "@gaord",
   "@shenjackyuanjie",
   "@shenyongqing",
   "@sternelee",
@@ -36,6 +37,7 @@ export const RELEASE_CONTRIBUTORS: string[] = [
 /** Contributors who helped with reports, reproductions, and verification. */
 export const RELEASE_HELPERS: string[] = [
   "@AiurArtanis",
+  "@SamhandsomeLee",
   "@seanthefuturegorilla",
   "@SparkofSpike",
 ];
