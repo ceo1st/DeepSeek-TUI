@@ -1,8 +1,7 @@
-# v0.9.1 empty Work-surface and product-capture receipt
+# v0.9.1 empty Work-surface receipt
 
-This receipt backs the canonical v0.9.1 image used by the root README and
-website. The image was captured from the real TUI built from the empty-surface
-fix, not composed from a product mockup.
+This receipt verifies the empty-surface behavior from the real TUI binary. It
+is not based on a product mockup.
 
 ## Source
 
@@ -14,7 +13,7 @@ fix, not composed from a product mockup.
 - Workspace: clean public fixture shown as `~/codewhale-demo`
 - Theme: Blue Stage dark
 
-## Capture
+## Capture method
 
 The binary was built with:
 
@@ -25,37 +24,27 @@ cargo build -p codewhale-tui --bin codewhale-tui --locked
 It was launched in a 106-column by 32-row PTY with isolated state:
 
 ```bash
-CODEWHALE_HOME=/tmp/codewhale-v091-receipt/home \\
-CODEWHALE_CONFIG_PATH=/tmp/codewhale-v091-receipt/home/config.toml \\
-target/debug/codewhale-tui \\
-  --skip-onboarding \\
-  --fresh \\
-  --no-project-config \\
-  --no-mouse-capture \\
+CODEWHALE_HOME=/tmp/codewhale-v091-receipt/home \
+CODEWHALE_CONFIG_PATH=/tmp/codewhale-v091-receipt/home/config.toml \
+target/debug/codewhale-tui \
+  --skip-onboarding \
+  --fresh \
+  --no-project-config \
+  --no-mouse-capture \
   --workspace /tmp/codewhale-v091-receipt/codewhale-demo
 ```
 
-The PTY frame was rendered at 1280x720 without changing its content. A small
-receipt label records the version, source SHA, and terminal dimensions. The
-frame contains no username, credential, account identifier, private repository
+The resulting 1280x720 capture has SHA-256
+`69c81df8a641cdad500d985973546db0a91c138e2c82e0de9586cdea7be85170`.
+It contains no username, credential, account identifier, private repository
 path, error state, or unsupported product claim.
-
-Canonical copies:
-
-- `assets/screenshot.png`
-- `web/public/codewhale-tui.png`
-
-An automated web contract requires the two PNG files to remain byte-identical,
-1280x720, and below 500 KiB.
 
 ## Acceptance
 
-The fresh active session contains the header, idle canvas, composer, and footer.
-It does not contain `Work · empty`, a Work heading, or reserved Work rows.
-Active, error, and disconnected Work projections remain covered separately by
-the TUI unit suite.
-
-Verification at capture:
+The fresh active session contains the header, idle canvas, composer, and
+footer. It does not contain `Work · empty`, a Work heading, or reserved Work
+rows. Active, error, and disconnected Work projections remain covered by the
+TUI unit suite.
 
 ```text
 cargo test -p codewhale-tui --bin codewhale-tui --locked
