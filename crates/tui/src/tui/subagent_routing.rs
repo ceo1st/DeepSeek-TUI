@@ -8,8 +8,9 @@ use crate::tools::subagent::{
     subagent_progress_tool_display_name,
 };
 use crate::tui::app::{
-    AgentCurrentActivity, AgentCurrentActivityStatus, AgentProgressMeta, App, AppMode,
-    SidebarFocus, TaskPanelEntry, TaskPanelEntryKind, bound_agent_activity_text,
+    AgentCurrentActivity, AgentCurrentActivityStatus, AgentProgressMeta, AgentRecentAction, App,
+    AppMode, MAX_AGENT_RECENT_ACTIONS, SidebarFocus, TaskPanelEntry, TaskPanelEntryKind,
+    bound_agent_activity_text,
 };
 use crate::tui::history::{HistoryCell, SubAgentCell, summarize_tool_output};
 use crate::tui::pager::PagerView;
@@ -454,6 +455,10 @@ pub(super) fn handle_subagent_mailbox(app: &mut App, seq: u64, message: &Mailbox
         ..
     } = message
     {
+        // Preserve the effective child route for Agent Details. This is the
+        // only provider source used by that projection: configured/default
+        // parent routes are not evidence that the child actually used them.
+        record_agent_current_activity(app, message);
         let billing = crate::route_billing::for_child_route(
             app.api_provider,
             app.billing_presentation,
@@ -608,6 +613,31 @@ fn bounded_mailbox_message(message: &MailboxMessage) -> MailboxMessage {
 fn record_agent_current_activity(app: &mut App, message: &MailboxMessage) {
     let agent_id = message.agent_id().to_string();
     let meta = app.agent_progress_meta.entry(agent_id).or_default();
+    if let MailboxMessage::TokenUsage {
+        provider, model, ..
+    } = message
+    {
+        meta.resolved_provider = Some(provider.as_str().to_string());
+        meta.resolved_model =
+            Some(bound_agent_activity_text(model)).filter(|model| !model.trim().is_empty());
+        return;
+    }
+    if let MailboxMessage::ToolCallCompleted {
+        tool_name,
+        step,
+        ok,
+        ..
+    } = message
+    {
+        if meta.recent_actions.len() == MAX_AGENT_RECENT_ACTIONS {
+            meta.recent_actions.pop_front();
+        }
+        meta.recent_actions.push_back(AgentRecentAction::bounded(
+            subagent_progress_tool_display_name(tool_name),
+            *step,
+            *ok,
+        ));
+    }
     let previous = meta.current_activity.clone();
 
     let (status, detail, current_tool, step) = match message {
@@ -681,7 +711,7 @@ fn record_agent_current_activity(app: &mut App, message: &MailboxMessage) {
             None,
             previous.as_ref().and_then(|activity| activity.step),
         ),
-        MailboxMessage::TokenUsage { .. } => return,
+        MailboxMessage::TokenUsage { .. } => unreachable!("token usage handled above"),
     };
 
     meta.current_activity = Some(AgentCurrentActivity::bounded(
@@ -1127,6 +1157,61 @@ mod tests {
             },
         );
         assert_eq!(app.agent_progress_meta["agent_files"].files_touched, 3);
+    }
+
+    #[test]
+    fn recent_actions_are_three_bounded_structured_tool_outcomes() {
+        let mut app = App::new(test_options(), &Config::default());
+        let agent_id = "agent_recent";
+        for step in 1..=5 {
+            record_agent_current_activity(
+                &mut app,
+                &MailboxMessage::ToolCallCompleted {
+                    agent_id: agent_id.to_string(),
+                    tool_name: format!("\u{1b}[31mtool_{step}\u{1b}[0m"),
+                    step,
+                    ok: step != 4,
+                },
+            );
+        }
+        record_agent_current_activity(
+            &mut app,
+            &MailboxMessage::Progress {
+                agent_id: agent_id.to_string(),
+                status: "tool_99 completed".to_string(),
+            },
+        );
+
+        let actions = &app.agent_progress_meta[agent_id].recent_actions;
+        assert_eq!(actions.len(), MAX_AGENT_RECENT_ACTIONS);
+        assert_eq!(
+            actions.iter().map(|action| action.step).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert!(!actions.iter().any(|action| action.step == 99));
+        assert!(actions.iter().all(|action| !action.tool.contains('\u{1b}')));
+        assert!(!actions[1].ok);
+    }
+
+    #[test]
+    fn token_usage_records_only_the_effective_child_route_facts() {
+        let mut app = App::new(test_options(), &Config::default());
+        let changed = handle_subagent_mailbox(
+            &mut app,
+            91,
+            &MailboxMessage::TokenUsage {
+                agent_id: "agent_route".to_string(),
+                provider: crate::config::ApiProvider::Openrouter,
+                model: "vendor/model-real".to_string(),
+                usage: crate::models::Usage::default(),
+            },
+        );
+
+        assert!(!changed, "route facts do not allocate a transcript card");
+        let meta = &app.agent_progress_meta["agent_route"];
+        assert_eq!(meta.resolved_provider.as_deref(), Some("openrouter"));
+        assert_eq!(meta.resolved_model.as_deref(), Some("vendor/model-real"));
+        assert!(meta.current_activity.is_none());
     }
 
     #[test]

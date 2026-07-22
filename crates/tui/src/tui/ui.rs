@@ -13361,6 +13361,15 @@ async fn handle_view_events(
                     app.status_message = Some(format!("Could not cancel {agent_id}"));
                 }
             }
+            ViewEvent::OpenAgentTranscript { agent_id } => {
+                if !crate::tui::mouse_ui::open_agent_chat_pager(app, &agent_id) {
+                    app.status_message = Some("Exact agent transcript is unavailable".to_string());
+                }
+                app.needs_redraw = true;
+            }
+            ViewEvent::AgentDetailsClosed { agent_id } => {
+                crate::tui::work_surface::agent_details_closed(app, &agent_id);
+            }
             ViewEvent::FilePickerSelected { path } => {
                 // Insert `@<path>` at the composer's cursor with surrounding
                 // whitespace so the existing `@`-mention parser picks it up.

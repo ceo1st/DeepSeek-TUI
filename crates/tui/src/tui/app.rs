@@ -584,6 +584,30 @@ pub(crate) fn bound_agent_activity_text(value: &str) -> String {
     crate::tui::history::summarize_tool_output(&redacted)
 }
 
+/// One bounded, structured tool outcome for the Agent Details projection.
+///
+/// This is populated only from `ToolCallCompleted` mailbox envelopes. It is
+/// deliberately not inferred from free-form progress text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecentAction {
+    pub tool: String,
+    pub step: u32,
+    pub ok: bool,
+}
+
+impl AgentRecentAction {
+    #[must_use]
+    pub fn bounded(tool: &str, step: u32, ok: bool) -> Self {
+        Self {
+            tool: bound_agent_activity_text(tool),
+            step,
+            ok,
+        }
+    }
+}
+
+pub(crate) const MAX_AGENT_RECENT_ACTIONS: usize = 3;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProgressMeta {
     pub parent_run_id: Option<String>,
@@ -595,6 +619,13 @@ pub struct AgentProgressMeta {
     pub current_tool: Option<String>,
     /// Successful file mutations observed for this child in this session.
     pub files_touched: u32,
+    /// At most three tool outcomes observed through structured lifecycle
+    /// envelopes, oldest to newest.
+    pub recent_actions: VecDeque<AgentRecentAction>,
+    /// Effective route facts observed from a real child token-usage envelope.
+    /// These stay absent until the provider actually reports usage.
+    pub resolved_provider: Option<String>,
+    pub resolved_model: Option<String>,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
@@ -1782,10 +1813,14 @@ pub enum SidebarRowAction {
     ToggleAgentDetails {
         agent_id: String,
     },
-    /// Drill into the child's transcript card (action tree, status, summary)
-    /// in the detail pager — registered on the expanded dossier rows (#2889
-    /// slice, dogfood A3).
+    /// Open the child's bounded, safe status projection. Exact transcript
+    /// evidence is a separate explicit action (#2889).
     OpenAgentDetail {
+        agent_id: String,
+    },
+    /// Open the child's artifact-first exact transcript. This is separate
+    /// from the safe default details projection (#2889).
+    OpenAgentTranscript {
         agent_id: String,
     },
     CancelAgent {
@@ -1809,6 +1844,7 @@ impl SidebarRowAction {
             | Self::HotbarSlot(_)
             | Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
+            | Self::OpenAgentTranscript { .. }
             | Self::CancelAgent { .. }
             | Self::InspectWork { .. } => None,
         }
@@ -1822,6 +1858,7 @@ impl SidebarRowAction {
             Self::CancelAgent { .. } => true,
             Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
+            | Self::OpenAgentTranscript { .. }
             | Self::InspectWork { .. }
             | Self::HotbarSlot(_) => false,
         }

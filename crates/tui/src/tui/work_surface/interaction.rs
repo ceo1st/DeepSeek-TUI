@@ -60,6 +60,16 @@ pub fn close_opened(app: &mut App) {
     app.needs_redraw = true;
 }
 
+/// Release a closed Agent Details owner without disturbing Work selection.
+/// The modal has already popped itself before this event is handled.
+pub(crate) fn agent_details_closed(app: &mut App, agent_id: &str) {
+    let owner = WorkRowId(format!("worker:{agent_id}"));
+    if app.work_surface.opened.as_ref() == Some(&owner) {
+        app.work_surface.opened = None;
+        app.needs_redraw = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,6 +12,7 @@
 // === Submodules ===
 
 pub mod active_cell;
+pub(crate) mod agent_details;
 pub mod app;
 pub mod approval;
 pub mod auto_review;

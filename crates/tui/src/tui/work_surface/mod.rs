@@ -9,6 +9,7 @@ mod model;
 mod render;
 
 pub use input::{handle_key, handle_mouse};
+pub(crate) use interaction::agent_details_closed;
 pub use model::{WorkSurfacePlacement, WorkSurfaceState};
 pub use render::{height, render, split_chat};
 
@@ -412,6 +413,90 @@ mod tests {
         assert!(row.detail.contains("waiting for input"), "{}", row.detail);
         assert!(row.detail.contains("approval required"), "{}", row.detail);
         assert!(row.detail.contains("step 5"), "{}", row.detail);
+    }
+
+    #[test]
+    fn agent_details_keyboard_mouse_and_return_selection_converge() {
+        fn add_worker(app: &mut App) {
+            app.current_session_id = Some(SESSION.to_string());
+            app.subagent_cache.push(SubAgentResult {
+                name: "agent_converge".to_string(),
+                agent_id: "agent_converge".to_string(),
+                context_mode: "fresh".to_string(),
+                fork_context: false,
+                workspace: None,
+                git_branch: Some("codex/details".to_string()),
+                agent_type: SubAgentType::Implementer,
+                assignment: SubAgentAssignment {
+                    objective: "Verify keyboard and mouse convergence".to_string(),
+                    role: Some("worker".to_string()),
+                },
+                model: "test-model".to_string(),
+                nickname: Some("Blue Whale".to_string()),
+                status: SubAgentStatus::Running,
+                worker_status: Some(AgentWorkerStatus::Running),
+                parent_run_id: None,
+                spawn_depth: 1,
+                result: None,
+                steps_taken: 1,
+                checkpoint: None,
+                needs_input: None,
+                duration_ms: 100,
+                from_prior_session: false,
+            });
+        }
+
+        let mut keyboard = app();
+        add_worker(&mut keyboard);
+        let _ = render_text(&mut keyboard, 100, 6);
+        let _ = super::handle_key(
+            &mut keyboard,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        let keyboard_action = super::handle_key(
+            &mut keyboard,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .expect("Work key handled")
+        .expect("agent details action");
+        let keyboard_selection = keyboard.work_surface.selected.clone();
+
+        let mut mouse = app();
+        add_worker(&mut mouse);
+        let _ = render_text(&mut mouse, 100, 6);
+        let row_y = mouse
+            .work_surface
+            .hitboxes
+            .iter()
+            .find(|hit| hit.id.0 == "worker:agent_converge")
+            .expect("agent hitbox")
+            .row_y;
+        let mouse_action = super::handle_mouse(
+            &mut mouse,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: row_y,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .action
+        .expect("mouse agent details action");
+        assert_eq!(mouse_action, keyboard_action);
+        assert_eq!(mouse.work_surface.selected, keyboard_selection);
+
+        crate::tui::mouse_ui::apply_sidebar_row_action(&mut mouse, mouse_action);
+        let selected_before_close = mouse.work_surface.selected.clone();
+        let events = mouse
+            .view_stack
+            .handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let [crate::tui::views::ViewEvent::AgentDetailsClosed { agent_id }] = events.as_slice()
+        else {
+            panic!("Left should close Agent Details with a receipt: {events:?}");
+        };
+        super::interaction::agent_details_closed(&mut mouse, agent_id);
+        assert_eq!(mouse.work_surface.selected, selected_before_close);
+        assert!(mouse.work_surface.opened.is_none());
     }
 
     #[test]

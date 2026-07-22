@@ -2586,6 +2586,9 @@ pub struct SidebarAgentRow {
     pub progress: Option<String>,
     pub steps_taken: u32,
     pub duration_ms: Option<u64>,
+    /// A resident transcript currently contains visible exact evidence. This
+    /// conservative signal prevents the sidebar from advertising a dead Open.
+    pub transcript_available: bool,
     pub expanded: bool,
 }
 
@@ -2650,6 +2653,10 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                 progress,
                 steps_taken: agent.steps_taken,
                 duration_ms: Some(agent.duration_ms),
+                transcript_available: crate::tui::mouse_ui::resident_agent_transcript_available(
+                    app,
+                    &agent.agent_id,
+                ),
                 expanded: app.expanded_sidebar_agents.contains(&agent.agent_id),
             }
         })
@@ -2691,6 +2698,9 @@ fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
                     progress: current_activity.map(sidebar_current_activity_text),
                     steps_taken: 0,
                     duration_ms: None,
+                    transcript_available: crate::tui::mouse_ui::resident_agent_transcript_available(
+                        app, id,
+                    ),
                     expanded: app.expanded_sidebar_agents.contains(id),
                 }
             }),
@@ -2890,8 +2900,7 @@ fn indented_detail_line(indent: &str, body: &str, content_width: usize) -> Strin
 /// is a functional, copyable handle on its own dedicated line, not incidental
 /// id noise mixed into the dossier.
 fn subagent_output_handle(row: &SidebarAgentRow) -> Option<String> {
-    let has_output = sidebar_agent_status_is_terminal(row.status.as_str()) || row.steps_taken > 0;
-    if !has_output {
+    if !row.transcript_available {
         return None;
     }
     Some(format!("agent:{}/full_transcript", row.id))
@@ -3048,9 +3057,8 @@ fn subagent_panel_rows(
             indented_detail_line("  ", &detail_parts.join(" \u{00B7} "), content_width.max(1)),
             Style::default().fg(theme.text_dim),
         )));
-        // Clicking the expanded dossier drills into the child's transcript
-        // card in the detail pager (#2889 slice, dogfood A3). The label row
-        // above keeps its expand/collapse toggle.
+        // Clicking the expanded dossier opens the bounded Agent Details
+        // projection. The label row above keeps its expand/collapse toggle.
         actions.push(Some(SidebarRowAction::OpenAgentDetail {
             agent_id: row.id.clone(),
         }));
@@ -3073,7 +3081,7 @@ fn subagent_panel_rows(
                 ),
                 Style::default().fg(theme.text_muted),
             )));
-            actions.push(Some(SidebarRowAction::OpenAgentDetail {
+            actions.push(Some(SidebarRowAction::OpenAgentTranscript {
                 agent_id: row.id.clone(),
             }));
         }
@@ -3578,6 +3586,7 @@ fn agent_stop_action_for_click(action: &SidebarRowAction) -> Option<SidebarRowAc
         | SidebarRowAction::PrefillCommand(_)
         | SidebarRowAction::HotbarSlot(_)
         | SidebarRowAction::OpenAgentDetail { .. }
+        | SidebarRowAction::OpenAgentTranscript { .. }
         | SidebarRowAction::CancelAgent { .. }
         | SidebarRowAction::InspectWork { .. } => None,
     }
@@ -5612,6 +5621,7 @@ mod tests {
             progress: Some("scanning".to_string()),
             steps_taken: 2,
             duration_ms: Some(1_000),
+            transcript_available: false,
             expanded: true,
         }];
 
@@ -5640,7 +5650,7 @@ mod tests {
             Some(SidebarRowAction::OpenAgentDetail {
                 agent_id: "agent_0123456789".to_string(),
             }),
-            "expanded detail row drills into the child's transcript card (#2889); \
+            "expanded detail row opens the safe Agent Details projection (#2889); \
              the stop target stays on the label row"
         );
     }
@@ -5667,6 +5677,7 @@ mod tests {
             progress: Some("reading".to_string()),
             steps_taken: 1,
             duration_ms: None,
+            transcript_available: false,
             expanded: false,
         }];
 
@@ -5714,6 +5725,7 @@ mod tests {
                 progress: Some(format!("{status} with a long stale-looking detail")),
                 steps_taken: 7,
                 duration_ms: Some(1_000),
+                transcript_available: false,
                 expanded: false,
             })
             .collect::<Vec<_>>();
@@ -5765,6 +5777,7 @@ mod tests {
             progress: Some("cancelled by user".to_string()),
             steps_taken: 2,
             duration_ms: Some(2_000),
+            transcript_available: false,
             expanded: false,
         }];
 
@@ -5813,6 +5826,7 @@ mod tests {
             progress: None,
             steps_taken: 1,
             duration_ms: None,
+            transcript_available: false,
             expanded: false,
         };
         // Parent + child + a two-node parent cycle: the cycle has no root, so
@@ -5860,6 +5874,7 @@ mod tests {
                 progress: None,
                 steps_taken: 1,
                 duration_ms: Some(250),
+                transcript_available: false,
                 expanded: false,
             },
             SidebarAgentRow {
@@ -5875,6 +5890,7 @@ mod tests {
                 progress: Some("waiting on child".to_string()),
                 steps_taken: 2,
                 duration_ms: Some(500),
+                transcript_available: false,
                 expanded: false,
             },
         ];
@@ -6304,6 +6320,7 @@ mod tests {
                 progress: Some("step 2/3: running tool 'read_file'".to_string()),
                 steps_taken: 2,
                 duration_ms: Some(22_000),
+                transcript_available: false,
                 expanded: true,
             },
             SidebarAgentRow {
@@ -6319,6 +6336,7 @@ mod tests {
                 progress: Some("SUMMARY: docs checked".to_string()),
                 steps_taken: 5,
                 duration_ms: Some(21_000),
+                transcript_available: false,
                 expanded: false,
             },
         ];
@@ -6619,6 +6637,7 @@ mod tests {
             progress: Some(long_progress.to_string()),
             steps_taken: 9,
             duration_ms: Some(12_345),
+            transcript_available: false,
             expanded: false,
         }];
 
@@ -6655,6 +6674,7 @@ mod tests {
             progress: Some("working".to_string()),
             steps_taken: 3,
             duration_ms: Some(1_000),
+            transcript_available: false,
             expanded: true,
         }];
 
@@ -6690,6 +6710,7 @@ mod tests {
             progress: Some("step 3".to_string()),
             steps_taken: 3,
             duration_ms: Some(2_000),
+            transcript_available: false,
             expanded: true,
         }];
 
@@ -6736,6 +6757,7 @@ mod tests {
             progress: None,
             steps_taken: 0,
             duration_ms: Some(4_000),
+            transcript_available: false,
             expanded: true,
         }];
 
@@ -6781,6 +6803,7 @@ mod tests {
             progress: None,
             steps_taken: 0,
             duration_ms: None,
+            transcript_available: false,
             expanded: true,
         }];
 
@@ -6828,6 +6851,7 @@ mod tests {
                 progress: Some(format!("step {i}: finished tool 'grep_files'")),
                 steps_taken: i + 1,
                 duration_ms: Some(1_000 + u64::from(i) * 500),
+                transcript_available: false,
                 expanded: true,
             })
             .collect();
@@ -6905,6 +6929,7 @@ mod tests {
             progress: Some("step 247: finished tool grep_files ok".to_string()),
             steps_taken: 247,
             duration_ms: Some(96_000),
+            transcript_available: true,
             expanded: true,
             ..SidebarAgentRow::default()
         }];
@@ -7086,6 +7111,7 @@ mod tests {
             progress: Some("Wrote findings and staged a patch".to_string()),
             steps_taken: 12,
             duration_ms: Some(42_000),
+            transcript_available: true,
             expanded: true,
             ..SidebarAgentRow::default()
         }];
@@ -7119,19 +7145,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             actions[handle_idx],
-            Some(SidebarRowAction::OpenAgentDetail {
+            Some(SidebarRowAction::OpenAgentTranscript {
                 agent_id: "agent_7f3c".to_string(),
             }),
-            "handle line should open the child's detail card on click"
+            "handle line should open the child's exact transcript on click"
         );
     }
 
     #[test]
     fn subagent_output_handle_gated_on_inspectable_output() {
-        // #4094 item 4: the handle only appears once there is something to
-        // inspect — a fresh, zero-step, non-terminal worker advertises no
-        // handle (so we never point at an empty transcript), while a running
-        // worker with steps does get the "inspect more" affordance.
+        // #4094/#2889: lifecycle and step counts are not exact transcript
+        // evidence. Only a successfully inspected resident transcript may
+        // advertise the explicit Open route.
         let fresh = SidebarAgentRow {
             id: "agent_fresh".to_string(),
             name: "scout".to_string(),
@@ -7149,24 +7174,24 @@ mod tests {
         let working = SidebarAgentRow {
             steps_taken: 4,
             status: "running".to_string(),
+            transcript_available: true,
             ..fresh.clone()
         };
         assert_eq!(
             subagent_output_handle(&working).as_deref(),
             Some("agent:agent_fresh/full_transcript"),
-            "a running worker with steps should expose the inspect-more handle"
+            "a worker with exact resident evidence should expose the transcript handle"
         );
 
-        // A terminal worker exposes the handle even with zero recorded steps.
+        // A terminal state without exact evidence must not look actionable.
         let failed_immediately = SidebarAgentRow {
             steps_taken: 0,
             status: "failed".to_string(),
             ..fresh.clone()
         };
-        assert_eq!(
-            subagent_output_handle(&failed_immediately).as_deref(),
-            Some("agent:agent_fresh/full_transcript"),
-            "a terminal worker should expose its transcript handle"
+        assert!(
+            subagent_output_handle(&failed_immediately).is_none(),
+            "a terminal worker without exact evidence must not advertise Open"
         );
     }
 
@@ -7186,6 +7211,7 @@ mod tests {
             progress: Some("reading".to_string()),
             steps_taken: 1,
             duration_ms: Some(500),
+            transcript_available: false,
             expanded: false,
         };
         let hover = agent_row_hover_text(&row);
@@ -7218,6 +7244,7 @@ mod tests {
             progress: Some("step 2/3: running tool 'read_file'".to_string()),
             steps_taken: 2,
             duration_ms: Some(22_000),
+            transcript_available: false,
             expanded: false,
         }];
 
@@ -7585,6 +7612,7 @@ mod tests {
             progress: Some("step 10: finished tool edit_file ok".to_string()),
             steps_taken: 10,
             duration_ms: Some(124_838),
+            transcript_available: false,
             expanded: true,
         }
     }

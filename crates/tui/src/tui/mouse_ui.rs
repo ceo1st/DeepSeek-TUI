@@ -710,38 +710,16 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             Vec::new()
         }
         SidebarRowAction::OpenAgentDetail { agent_id } => {
-            // Prefer the worker's actual message transcript over the compact
-            // status card. The card intentionally keeps only a few activity
-            // lines; Open must show the conversation the worker had.
-            if open_agent_chat_pager(app, &agent_id) {
-                app.needs_redraw = true;
-                return Vec::new();
+            if !crate::tui::agent_details::open_agent_details(app, &agent_id) {
+                crate::tui::work_surface::agent_details_closed(app, &agent_id);
+                app.status_message = Some("Agent details are unavailable".to_string());
             }
-            let cell_index = app.history.iter().position(|cell| {
-                matches!(
-                    cell,
-                    HistoryCell::SubAgent(crate::tui::history::SubAgentCell::Delegate(card))
-                        if card.agent_id == agent_id
-                )
-            });
-            match cell_index {
-                Some(cell_index) => {
-                    open_details_pager_for_cell(app, cell_index);
-                }
-                None => {
-                    // Open failed — do not leave a stale detail-open owner.
-                    if app
-                        .work_surface
-                        .opened
-                        .as_ref()
-                        .is_some_and(|id| id.0 == format!("worker:{agent_id}"))
-                    {
-                        app.work_surface.opened = None;
-                    }
-                    app.status_message = Some(format!(
-                        "No transcript card for {agent_id} yet — use handle_read agent:{agent_id}/full_transcript"
-                    ));
-                }
+            app.needs_redraw = true;
+            Vec::new()
+        }
+        SidebarRowAction::OpenAgentTranscript { agent_id } => {
+            if !open_agent_chat_pager(app, &agent_id) {
+                app.status_message = Some("Exact agent transcript is unavailable".to_string());
             }
             app.needs_redraw = true;
             Vec::new()
@@ -789,7 +767,15 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
     }
 }
 
-fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
+pub(crate) fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
+    let Some(text) = resolve_agent_transcript_text(app, agent_id) else {
+        return false;
+    };
+    push_agent_chat_pager(app, agent_id, &text);
+    true
+}
+
+fn resolve_agent_transcript_text(app: &App, agent_id: &str) -> Option<String> {
     use crate::tools::handle::{HandleValue, VarHandle};
 
     let lookup = VarHandle {
@@ -809,7 +795,7 @@ fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
             },
             None => None,
         },
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     // The handle is a deliberately bounded live projection. Prefer the private
@@ -837,21 +823,47 @@ fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
         if matches_resident_count {
             let text = agent_messages_text(&messages);
             if !text.trim().is_empty() {
-                push_agent_chat_pager(app, agent_id, &text);
-                return true;
+                return Some(text);
             }
         }
     }
 
     let Some(payload) = payload else {
-        return false;
+        return None;
     };
     let text = agent_transcript_text(&payload);
     if text.trim().is_empty() {
-        return false;
+        return None;
     }
-    push_agent_chat_pager(app, agent_id, &text);
-    true
+    Some(text)
+}
+
+pub(crate) fn resident_agent_transcript_available(app: &App, agent_id: &str) -> bool {
+    use crate::tools::handle::{HandleValue, VarHandle};
+
+    let lookup = VarHandle {
+        kind: "var_handle".to_string(),
+        session_id: format!("agent:{agent_id}"),
+        name: "full_transcript".to_string(),
+        type_name: String::new(),
+        length: 0,
+        repr_preview: String::new(),
+        sha256: String::new(),
+    };
+    let Ok(store) = app.runtime_services.handle_store.try_lock() else {
+        return false;
+    };
+    let Some(record) = store.get(&lookup) else {
+        return false;
+    };
+    match &record.value {
+        HandleValue::Json(payload) => !agent_transcript_text(payload).trim().is_empty(),
+        HandleValue::Text(_) => false,
+    }
+}
+
+pub(crate) fn agent_transcript_evidence_available(app: &App, agent_id: &str) -> bool {
+    resolve_agent_transcript_text(app, agent_id).is_some()
 }
 
 fn push_agent_chat_pager(app: &mut App, agent_id: &str, text: &str) {
@@ -860,8 +872,9 @@ fn push_agent_chat_pager(app: &mut App, agent_id: &str, text: &str) {
         .last_transcript_area
         .map(|area| area.width)
         .unwrap_or(80);
+    let display_name = crate::tui::agent_details::safe_agent_display_name(app, agent_id);
     app.view_stack.push(PagerView::from_text(
-        format!("Agent chat — {agent_id}"),
+        format!("Agent transcript — {display_name}"),
         text,
         width.saturating_sub(2),
     ));

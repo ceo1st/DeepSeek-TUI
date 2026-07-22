@@ -665,6 +665,15 @@ pub enum ViewEvent {
     SidebarAgentCancel {
         agent_id: String,
     },
+    /// Agent Details requests the existing artifact-first exact transcript.
+    OpenAgentTranscript {
+        agent_id: String,
+    },
+    /// Agent Details was popped with Esc/q/Left. The Work surface uses this
+    /// to release only its detail-open owner while retaining selection.
+    AgentDetailsClosed {
+        agent_id: String,
+    },
     /// Emitted by the file picker (`Ctrl+P`) when the user presses Enter on a
     /// candidate. The handler should insert `@<path>` at the composer's cursor
     /// position.
