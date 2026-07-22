@@ -2751,7 +2751,11 @@ fn spawn_semantic_activity_motion_fixture(
     let read_tail = pty_tool_call_sse(
         "call_read_motion",
         "File",
-        serde_json::json!({"action": "read", "path": fifo_name}),
+        // Pin the read to the streaming path. The small-file fast path opens
+        // a FIFO once for metadata and then opens it again for content, which
+        // makes a real PTY fixture depend on a race-prone third reader. An
+        // explicit range keeps the content read on the already-open file.
+        serde_json::json!({"action": "read", "path": fifo_name, "start_line": 1}),
     );
     let shell_command = format!(
         "printf 'MOTION-BASH-START\\n'; while [ ! -f {bash_release_name} ]; do sleep 0.05; done; printf 'MOTION-BASH-END\\n'"
@@ -2940,26 +2944,61 @@ fn spawn_semantic_activity_motion_fixture(
     Ok((format!("http://{address}"), handle))
 }
 
+fn open_semantic_fifo_writer(
+    path: &std::path::Path,
+    deadline: Instant,
+) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(writer) => return Ok(writer),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::ENXIO) | Some(libc::EINTR))
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                anyhow::bail!("timed out waiting for FIFO reader at {}", path.display());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn release_semantic_read_fifo(
     path: std::path::PathBuf,
 ) -> std::thread::JoinHandle<anyhow::Result<()>> {
     std::thread::spawn(move || -> anyhow::Result<()> {
-        // ReadFileTool opens once to sniff PDF magic, once for metadata, and
-        // once for the actual UTF-8 read. Pair each real FIFO reader with a
-        // writer so the final pass receives the evidence payload.
-        {
-            let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
-            writer.write_all(b"TEXT")?;
-            writer.flush()?;
-        }
-        {
-            let _metadata_handshake = std::fs::OpenOptions::new().write(true).open(&path)?;
-        }
-        {
-            let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
-            writer.write_all(b"MOTION-FIFO-CONTENT\n")?;
-            writer.flush()?;
-        }
+        // ReadFileTool opens once to sniff PDF magic, then keeps the main
+        // explicit-range read on one already-open descriptor. Move the FIFO
+        // after the sniff writer and recreate it at the requested path so the
+        // content writer cannot attach to the short-lived sniff reader. The
+        // nonblocking, deadline-bounded opens turn product exit into a useful
+        // test error instead of an unbounded join.
+        let sniff_path = path.with_extension("sniff");
+        let mut sniff_writer =
+            open_semantic_fifo_writer(&path, Instant::now() + Duration::from_secs(20))?;
+        std::fs::rename(&path, &sniff_path)?;
+        let mkfifo = Command::new("mkfifo").arg(&path).status()?;
+        anyhow::ensure!(
+            mkfifo.success(),
+            "mkfifo failed while rotating {}",
+            path.display()
+        );
+        sniff_writer.write_all(b"TEXT")?;
+        sniff_writer.flush()?;
+        drop(sniff_writer);
+
+        let mut content_writer =
+            open_semantic_fifo_writer(&path, Instant::now() + Duration::from_secs(20))?;
+        content_writer.write_all(b"MOTION-FIFO-CONTENT\n")?;
+        content_writer.flush()?;
         Ok(())
     })
 }
@@ -3013,18 +3052,28 @@ fn phase_marker_for_label(frame: &qa_harness::Frame, label: &str) -> char {
         .expect("phase row should contain a marker")
 }
 
-fn transcript_marker_before_icon(frame: &qa_harness::Frame, needle: &str, icon: &str) -> char {
-    let row = visible_row_with_text(frame, needle)
-        .unwrap_or_else(|| panic!("transcript row {needle:?} missing:\n{}", frame.debug_dump()));
+fn maybe_transcript_marker_before_icon(
+    frame: &qa_harness::Frame,
+    needle: &str,
+    icon: &str,
+) -> Option<char> {
+    let row = visible_row_with_text(frame, needle)?;
     frame
         .row(row)
-        .split_once(icon)
-        .unwrap_or_else(|| panic!("tool icon {icon:?} missing from {:?}", frame.row(row)))
+        .split_once(icon)?
         .0
         .chars()
         .rev()
         .find(|ch| !ch.is_whitespace())
-        .expect("live transcript row should carry a status marker")
+}
+
+fn transcript_marker_before_icon(frame: &qa_harness::Frame, needle: &str, icon: &str) -> char {
+    maybe_transcript_marker_before_icon(frame, needle, icon).unwrap_or_else(|| {
+        panic!(
+            "transcript marker before {icon:?} on row {needle:?} missing:\n{}",
+            frame.debug_dump()
+        )
+    })
 }
 
 fn horizontal_rule_fills(frame: &qa_harness::Frame, row: u16, cols: u16) -> bool {
@@ -4023,8 +4072,10 @@ fn semantic_activity_motion_crosses_reasoning_reading_and_tool_use_in_a_real_uni
             while Instant::now() < deadline && first_animated.is_none() {
                 std::thread::sleep(Duration::from_millis(80));
                 h.pump();
-                let marker = transcript_marker_before_icon(h.frame(), "run running", "▶");
-                if marker != '›' {
+                if let Some(marker) =
+                    maybe_transcript_marker_before_icon(h.frame(), "run running", "▶")
+                    && marker != '›'
+                {
                     first_animated = Some(marker);
                 }
             }
@@ -4041,8 +4092,11 @@ fn semantic_activity_motion_crosses_reasoning_reading_and_tool_use_in_a_real_uni
             while Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(80));
                 h.pump();
-                let marker = transcript_marker_before_icon(h.frame(), "run running", "▶");
-                if marker != '›' && marker != first_animated {
+                if let Some(marker) =
+                    maybe_transcript_marker_before_icon(h.frame(), "run running", "▶")
+                    && marker != '›'
+                    && marker != first_animated
+                {
                     advanced_after_delay = true;
                     break;
                 }
