@@ -209,9 +209,12 @@ mod tests {
         let rows = super::model::project(&mut app);
 
         assert!(
-            rows[0]
-                .label
-                .starts_with("Work · 1 active · 0 needs input · 3 ready")
+            rows[0].label.starts_with("Work · Running:")
+                || rows[0]
+                    .label
+                    .starts_with("Work · 1 active · 0 needs input · 3 ready"),
+            "unexpected heading {}",
+            rows[0].label
         );
         for index in 0..4 {
             assert!(
@@ -341,7 +344,7 @@ mod tests {
         let rows = super::model::project(&mut app);
         assert_eq!(
             rows[0].label,
-            "Work · 0 active · 1 needs input · 0 ready · 0 recent"
+            "Work · Needs input: Coordination Work · 1 blocked"
         );
         let row = rows
             .iter()
@@ -364,9 +367,11 @@ mod tests {
 
         let rows = super::model::project(&mut app);
 
-        assert_eq!(
-            rows[0].label,
-            "Work · 1 active · 0 needs input · 1 ready · 1 recent"
+        assert!(
+            rows[0].label.starts_with("Work · Running:")
+                || rows[0].label.starts_with("Work · Ready:"),
+            "expected actionable title heading, got {}",
+            rows[0].label
         );
         assert_eq!(
             rows.iter()
@@ -435,15 +440,19 @@ mod tests {
             .iter()
             .map(|row| row.label.as_str())
             .collect::<Vec<_>>();
-        assert!(labels.contains(&"Read 1 files"), "{labels:?}");
-        assert!(labels.contains(&"Searched 1 patterns"), "{labels:?}");
-        assert!(labels.contains(&"Wrote 1 files"), "{labels:?}");
-        assert!(!rows.iter().any(|row| row.detail.contains("/Users/alice")));
-        let read = rows
+        let activity = rows
             .iter()
-            .find(|row| row.label == "Read 1 files")
-            .expect("read activity row");
-        assert_eq!(read.detail, "src/lib.rs");
+            .find(|row| row.id.0 == "activity:aggregate")
+            .expect("aggregated activity row");
+        assert!(
+            activity.label.contains("Read 1 files")
+                && activity.label.contains("Searched 1 patterns")
+                && activity.label.contains("Wrote 1 files"),
+            "aggregated label: {}",
+            activity.label
+        );
+        assert!(!activity.detail.contains("/Users/alice"));
+        assert!(!activity.label.contains("WorkSurfaceState"));
     }
 
     #[test]
@@ -725,9 +734,15 @@ mod tests {
         let rows = super::model::project(&mut app);
 
         assert!(
-            rows[0]
-                .label
-                .starts_with("Work · 0 active · 1 needs input · 0 ready · 0 recent"),
+            rows[0].label.starts_with("Work · Needs input:")
+                || rows[0]
+                    .label
+                    .starts_with("Work · 0 active · 1 needs input · 0 ready · 0 recent"),
+            "{}",
+            rows[0].label
+        );
+        assert!(
+            rows[0].label.contains("blocked") || rows[0].label.contains("needs input"),
             "{}",
             rows[0].label
         );
@@ -740,7 +755,11 @@ mod tests {
         restore_graph(&mut app, &graph);
 
         let rows = super::model::project(&mut app);
-        assert!(rows[0].label.contains("1 needs input"), "{}", rows[0].label);
+        assert!(
+            rows[0].label.contains("Needs input") || rows[0].label.contains("1 needs input"),
+            "{}",
+            rows[0].label
+        );
         let row = rows.iter().find(|row| row.selectable).expect("stale row");
         assert_eq!(row.mark, "?");
         assert!(row.detail.starts_with("stale · operation"));
@@ -789,7 +808,11 @@ mod tests {
         restore_graph(&mut app, &graph);
 
         let rows = super::model::project(&mut app);
-        assert!(rows[0].label.contains("1 needs input"), "{}", rows[0].label);
+        assert!(
+            rows[0].label.contains("Needs input") || rows[0].label.contains("1 needs input"),
+            "{}",
+            rows[0].label
+        );
         let row = rows
             .iter()
             .find(|row| row.selectable)

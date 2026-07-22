@@ -52,18 +52,13 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, classic_shell: bo
     if app.work_surface.effective_placement != WorkSurfacePlacement::Top {
         return 0;
     }
-    let cap = match terminal_height {
-        0..=12 => 3,
-        13..=16 => 5,
-        17..=23 => 6,
-        _ => 8,
-    };
-    // Reserve only the rows the projection can actually paint, plus the
-    // panel-owned divider. The old fixed cap left three or four empty rows
-    // behind a small/completed Fleet, taking transcript space without adding
-    // any information (especially visible in an 89x50 Cursor terminal).
-    let content_height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-    content_height.saturating_add(1).min(cap)
+    // Live top-area budget: at most two auxiliary content rows below the
+    // fixed route header (#4690), plus the panel-owned divider.
+    let content_cap = u16::try_from(super::model::LIVE_AUX_ROW_BUDGET).unwrap_or(2);
+    let content_height = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .min(content_cap);
+    content_height.saturating_add(1)
 }
 
 /// Split the transcript slot for a side rail. Top placement consumes its own

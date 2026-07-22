@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Instant;
 use std::fmt::Write as _;
 use std::path::{Component, Path};
 
@@ -97,6 +98,13 @@ impl WorkSourceState {
     }
 }
 
+/// Live Work summary recent-only presentation lifetime (#4688).
+pub(super) const RECENT_ONLY_TTL_MS: u64 = 4_000;
+/// Settled file/search/write receipt lifetime in the live strip (#4690).
+pub(super) const ACTIVITY_RECEIPT_TTL_MS: u64 = 3_000;
+/// Bound live top-area content rows below the fixed route header (#4690).
+pub(super) const LIVE_AUX_ROW_BUDGET: usize = 2;
+
 #[derive(Debug, Clone)]
 pub struct WorkSurfaceState {
     pub placement: WorkSurfacePlacement,
@@ -115,6 +123,25 @@ pub struct WorkSurfaceState {
     pub(super) hitboxes: Vec<WorkHitbox>,
     pub(super) cached_graph: Option<WorkGraphSnapshot>,
     pub(super) latest_rows: Vec<WorkRow>,
+    /// Full ranked catalog retained for inspector/history after live chrome expires.
+    pub(super) catalog_rows: Vec<WorkRow>,
+    /// Monotonic origin for presentation lifetimes (not wall-clock epoch).
+    presentation_origin: Instant,
+    /// Optional injected clock (ms since origin) for deterministic tests.
+    presentation_now_ms: Option<u64>,
+    /// When the projection last became recent-only (ms since origin).
+    recent_only_since_ms: Option<u64>,
+    /// Fingerprint of the recent-only set so a new completion can re-surface once.
+    recent_only_fingerprint: u64,
+    /// After TTL or user-turn, keep the live summary collapsed until new actionable work.
+    recent_only_suppressed: bool,
+    /// When the current activity receipt fingerprint first became live.
+    activity_since_ms: Option<u64>,
+    activity_fingerprint: u64,
+    activity_suppressed: bool,
+    /// Bumped on accepted user turns / newly started operations.
+    user_turn_epoch: u64,
+    last_handled_user_turn_epoch: u64,
 }
 
 impl Default for WorkSurfaceState {
@@ -140,7 +167,36 @@ impl WorkSurfaceState {
             hitboxes: Vec::new(),
             cached_graph: None,
             latest_rows: Vec::new(),
+            catalog_rows: Vec::new(),
+            presentation_origin: Instant::now(),
+            presentation_now_ms: None,
+            recent_only_since_ms: None,
+            recent_only_fingerprint: 0,
+            recent_only_suppressed: false,
+            activity_since_ms: None,
+            activity_fingerprint: 0,
+            activity_suppressed: false,
+            user_turn_epoch: 0,
+            last_handled_user_turn_epoch: 0,
         }
+    }
+
+    /// Inject a monotonic clock for presentation-lifetime tests.
+    #[cfg(test)]
+    pub(super) fn set_presentation_now_ms(&mut self, now_ms: u64) {
+        self.presentation_now_ms = Some(now_ms);
+    }
+
+    /// Signal that the user accepted a turn or a new operation started.
+    /// Recent-only live chrome collapses immediately (#4688).
+    pub fn note_user_turn_or_new_operation(&mut self) {
+        self.user_turn_epoch = self.user_turn_epoch.wrapping_add(1);
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.presentation_now_ms.unwrap_or_else(|| {
+            u64::try_from(self.presentation_origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
     }
 
     pub(super) fn selected_index(&self, rows: &[WorkRow]) -> Option<usize> {
@@ -224,6 +280,7 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
 
     let rows = match graph {
         Some(graph) => graph_rows(
+            &mut app.work_surface,
             &graph,
             source_state.as_ref(),
             agents,
@@ -231,7 +288,14 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
             activity,
         ),
         None if !agents.is_empty() || coordination.is_some() || !activity.is_empty() => {
-            ordered_rows(None, source_state.as_ref(), agents, coordination, activity)
+            ordered_rows(
+                &mut app.work_surface,
+                None,
+                source_state.as_ref(),
+                agents,
+                coordination,
+                activity,
+            )
         }
         None => source_state.map_or_else(Vec::new, |state| {
             vec![section_heading(
@@ -244,6 +308,11 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
     app.work_surface.latest_rows = rows.clone();
     if let Some(opened) = app.work_surface.opened.as_ref()
         && !rows.iter().any(|row| &row.id == opened)
+        && !app
+            .work_surface
+            .catalog_rows
+            .iter()
+            .any(|row| &row.id == opened)
     {
         app.work_surface.opened = None;
     }
@@ -251,13 +320,21 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
 }
 
 fn graph_rows(
+    surface: &mut WorkSurfaceState,
     snapshot: &WorkGraphSnapshot,
     source_state: Option<&WorkSourceState>,
     agents: Vec<RankedWorkRow>,
     coordination: Option<RankedWorkRow>,
     activity: SettledFileActivity,
 ) -> Vec<WorkRow> {
-    ordered_rows(Some(snapshot), source_state, agents, coordination, activity)
+    ordered_rows(
+        surface,
+        Some(snapshot),
+        source_state,
+        agents,
+        coordination,
+        activity,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,23 +346,29 @@ enum WorkBucket {
 }
 
 impl WorkBucket {
+    /// Presentation priority: needs-input outranks running work (#4689).
     const fn rank(self) -> u8 {
         match self {
-            Self::Active => 0,
-            Self::Attention => 1,
+            Self::Attention => 0,
+            Self::Active => 1,
             Self::Ready => 2,
             Self::Recent => 3,
         }
     }
+
+    const fn is_actionable(self) -> bool {
+        !matches!(self, Self::Recent)
+    }
 }
 
+#[derive(Clone)]
 struct RankedWorkRow {
     bucket: WorkBucket,
     order: usize,
     row: WorkRow,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SettledFileActivity {
     summary: FileActivitySummary,
     read: Vec<String>,
@@ -303,6 +386,7 @@ impl SettledFileActivity {
 }
 
 fn ordered_rows(
+    surface: &mut WorkSurfaceState,
     snapshot: Option<&WorkGraphSnapshot>,
     source_state: Option<&WorkSourceState>,
     mut ranked: Vec<RankedWorkRow>,
@@ -330,7 +414,14 @@ fn ordered_rows(
                 }),
         );
     }
-    ranked.extend(activity_rows(activity));
+
+    // Activity is projected separately so we can apply a single aggregated
+    // transient receipt instead of one live row per tool kind (#4690).
+    let activity_row = aggregate_activity_row(&activity);
+    if let Some(row) = activity_row.clone() {
+        ranked.push(row);
+    }
+
     ranked.sort_by_key(|item| (item.bucket.rank(), item.order));
 
     let active = ranked
@@ -349,6 +440,7 @@ fn ordered_rows(
         .iter()
         .filter(|item| item.bucket == WorkBucket::Recent)
         .count();
+    let actionable = attention + active + ready;
     let source = source_state
         .map(|state| format!(" · {}", state.label()))
         .unwrap_or_default();
@@ -360,16 +452,171 @@ fn ordered_rows(
         (None, Some(state)) => state.detail().to_string(),
         (None, None) => "Current session activity".to_string(),
     };
-    let mut rows = vec![section_heading(
-        "work",
-        &format!(
+
+    let now = surface.now_ms();
+    let user_turn_force_hide =
+        surface.user_turn_epoch != surface.last_handled_user_turn_epoch;
+    if user_turn_force_hide {
+        surface.last_handled_user_turn_epoch = surface.user_turn_epoch;
+        if actionable == 0 {
+            surface.recent_only_suppressed = true;
+        }
+        surface.activity_suppressed = true;
+    }
+
+    // Recent-only lifecycle (#4688): show a brief completion, then collapse.
+    let recent_fp = fingerprint_rows(
+        ranked
+            .iter()
+            .filter(|item| item.bucket == WorkBucket::Recent)
+            .map(|item| item.row.id.0.as_str()),
+    );
+    if actionable > 0 {
+        surface.recent_only_since_ms = None;
+        surface.recent_only_suppressed = false;
+        surface.recent_only_fingerprint = recent_fp;
+    } else if recent > 0 {
+        if surface.recent_only_fingerprint != recent_fp {
+            // A new completion after expiry may surface once.
+            surface.recent_only_fingerprint = recent_fp;
+            surface.recent_only_since_ms = Some(now);
+            surface.recent_only_suppressed = false;
+        } else if surface.recent_only_since_ms.is_none() && !surface.recent_only_suppressed {
+            surface.recent_only_since_ms = Some(now);
+        }
+        if let Some(since) = surface.recent_only_since_ms
+            && now.saturating_sub(since) >= RECENT_ONLY_TTL_MS
+        {
+            surface.recent_only_suppressed = true;
+        }
+    } else {
+        surface.recent_only_since_ms = None;
+        surface.recent_only_suppressed = false;
+        surface.recent_only_fingerprint = 0;
+    }
+
+    // Activity receipt lifetime (#4690): one aggregated row, 3s, no raw payloads.
+    let activity_fp = activity_row
+        .as_ref()
+        .map(|row| fingerprint_rows(std::iter::once(row.row.label.as_str())))
+        .unwrap_or(0);
+    let show_activity = if activity_row.is_none() {
+        surface.activity_since_ms = None;
+        surface.activity_fingerprint = 0;
+        surface.activity_suppressed = false;
+        false
+    } else {
+        if surface.activity_fingerprint != activity_fp {
+            surface.activity_fingerprint = activity_fp;
+            surface.activity_since_ms = Some(now);
+            surface.activity_suppressed = false;
+        } else if surface.activity_since_ms.is_none() && !surface.activity_suppressed {
+            surface.activity_since_ms = Some(now);
+        }
+        if let Some(since) = surface.activity_since_ms
+            && now.saturating_sub(since) >= ACTIVITY_RECEIPT_TTL_MS
+        {
+            surface.activity_suppressed = true;
+        }
+        !surface.activity_suppressed
+    };
+
+    let subject = ranked
+        .iter()
+        .find(|item| item.bucket.is_actionable())
+        .map(|item| (item.bucket, sanitize_summary_title(&item.row.label)));
+
+    let heading_label = match (actionable > 0, subject.as_ref()) {
+        (true, Some((WorkBucket::Attention, title))) => {
+            format!(
+                "Work · Needs input: {title} · {attention} blocked{source}"
+            )
+        }
+        (true, Some((WorkBucket::Active, title))) => {
+            format!("Work · Running: {title} · {active} active{source}")
+        }
+        (true, Some((WorkBucket::Ready, title))) => {
+            format!("Work · Ready: {title} · {ready} ready{source}")
+        }
+        (true, _) => format!(
             "Work · {active} active · {attention} needs input · {ready} ready · {recent} recent{source}"
         ),
-        &detail,
-    )];
-    rows.extend(ranked.into_iter().map(|item| item.row));
-    rows
+        (false, _) => format!(
+            "Work · {active} active · {attention} needs input · {ready} ready · {recent} recent{source}"
+        ),
+    };
+
+    // Full catalog for inspector/history even when live chrome collapses.
+    let mut catalog = vec![section_heading("work", &heading_label, &detail)];
+    catalog.extend(ranked.iter().map(|item| item.row.clone()));
+    surface.catalog_rows = catalog.clone();
+
+    // Live chrome policy:
+    // - actionable: heading + (optional) single activity receipt
+    // - recent-only: heading briefly, then empty
+    // - empty: no heading
+    if ranked.is_empty() && source_state.is_none() {
+        return Vec::new();
+    }
+    if actionable == 0 && recent == 0 {
+        // Source-only error/disconnected heading is still useful.
+        return if source_state.is_some() {
+            vec![section_heading("work", &heading_label, &detail)]
+        } else {
+            Vec::new()
+        };
+    }
+    if actionable == 0 && surface.recent_only_suppressed {
+        return Vec::new();
+    }
+
+    // Full ordered children remain in the projection for side rails, inspector
+    // selection, and durable recent visibility. Live Top height is capped in
+    // render (#4690). Recent-only *summary* lifetime is handled above (#4688).
+    let mut live = vec![section_heading("work", &heading_label, &detail)];
+    for item in ranked {
+        if item.row.id.0 == "activity:aggregate" && !show_activity {
+            continue;
+        }
+        live.push(item.row);
+    }
+    live
 }
+
+fn fingerprint_rows<'a>(ids: impl Iterator<Item = &'a str>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for id in ids {
+        id.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn sanitize_summary_title(raw: &str) -> String {
+    let single_line = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || ch == '\n' || ch == '\r' || ch == '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let collapsed = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return "work item".to_string();
+    }
+    let mut chars = trimmed.chars();
+    let prefix = chars.by_ref().take(72).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
 
 fn coordination_row(app: &App) -> Option<RankedWorkRow> {
     let projection = app.coordination_detail.as_ref()?;
@@ -729,8 +976,20 @@ fn settled_file_activity(app: &App) -> SettledFileActivity {
     activity
 }
 
-fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
+fn aggregate_activity_row(activity: &SettledFileActivity) -> Option<RankedWorkRow> {
+    if activity.is_empty() {
+        return None;
+    }
     let summaries = activity.summary.compact_display();
+    if summaries.is_empty() {
+        return None;
+    }
+    // Single aggregated live receipt; never inline raw patterns/commands (#4690).
+    let label = if summaries.len() == 1 {
+        summaries[0].clone()
+    } else {
+        summaries.join(" · ")
+    };
     let mutation_detail = activity.mutations.last().map(|receipt| {
         if activity.inline_diff_mode == InlineDiffMode::Off {
             receipt.outcome_label()
@@ -739,49 +998,58 @@ fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
         }
     });
     let mutation_body = settled_mutation_body(&activity.mutations, activity.inline_diff_mode);
-    let categories = [
-        (activity.summary.files_read, activity.read, false),
-        (activity.summary.dirs_listed, activity.list, false),
-        (activity.summary.patterns_searched, activity.search, false),
-        (activity.summary.files_written, activity.write, true),
-    ];
-    categories
-        .into_iter()
-        .filter(|(count, _, _)| *count > 0)
-        .zip(summaries)
-        .enumerate()
-        .map(|(order, ((_, details, is_write), label))| {
-            let body = if is_write && !mutation_body.is_empty() {
-                mutation_body.clone()
-            } else if details.is_empty() {
-                "No safe target detail retained".to_string()
-            } else {
-                details.join("\n")
-            };
-            RankedWorkRow {
-                bucket: WorkBucket::Recent,
-                order: 20_000usize.saturating_add(order),
-                row: WorkRow {
-                    id: WorkRowId(format!("activity:{order}")),
-                    mark: crate::tui::glyphs::DONE,
-                    label: label.clone(),
-                    detail: if is_write {
-                        mutation_detail.clone().or_else(|| details.first().cloned())
-                    } else {
-                        details.first().cloned()
-                    }
-                    .unwrap_or_else(|| "settled".to_string()),
-                    tone: WorkTone::Success,
-                    selectable: true,
-                    primary_action: Some(SidebarRowAction::InspectWork {
-                        title: format!("Work · {label}"),
-                        body,
-                        stop_action: None,
-                    }),
-                },
-            }
+    let mut body_parts = Vec::new();
+    if !mutation_body.is_empty() {
+        body_parts.push(mutation_body);
+    }
+    for (kind, details) in [
+        ("Read", &activity.read),
+        ("List", &activity.list),
+        ("Search", &activity.search),
+        ("Write", &activity.write),
+    ] {
+        if details.is_empty() {
+            continue;
+        }
+        body_parts.push(format!("{kind}:\n{}", details.join("\n")));
+    }
+    if body_parts.is_empty() {
+        body_parts.push("No safe target detail retained".to_string());
+    }
+    let detail = mutation_detail
+        .or_else(|| {
+            activity
+                .write
+                .first()
+                .cloned()
+                .or_else(|| activity.read.first().cloned())
+                .or_else(|| activity.search.first().map(|_| "patterns".to_string()))
+                .or_else(|| activity.list.first().cloned())
         })
-        .collect()
+        .unwrap_or_else(|| "settled".to_string());
+    let detail = sanitize_summary_title(&detail);
+    Some(RankedWorkRow {
+        bucket: WorkBucket::Recent,
+        order: 20_000,
+        row: WorkRow {
+            id: WorkRowId("activity:aggregate".to_string()),
+            mark: crate::tui::glyphs::DONE,
+            label,
+            detail,
+            tone: WorkTone::Success,
+            selectable: true,
+            primary_action: Some(SidebarRowAction::InspectWork {
+                title: "Work · file activity".to_string(),
+                body: body_parts.join("\n\n"),
+                stop_action: None,
+            }),
+        },
+    })
+}
+
+#[cfg(test)]
+fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
+    aggregate_activity_row(&activity).into_iter().collect()
 }
 
 fn settled_mutation_body(receipts: &[FileMutationReceipt], mode: InlineDiffMode) -> String {
@@ -1360,6 +1628,10 @@ mod tests {
         )
     }
 
+    fn surface() -> WorkSurfaceState {
+        WorkSurfaceState::default()
+    }
+
     fn operation(state: NodeState, suffix: &str) -> WorkNode {
         WorkNode {
             id: WorkNodeId::derive("work-surface-test", suffix),
@@ -1392,6 +1664,7 @@ mod tests {
         ];
 
         let rows = graph_rows(
+            &mut surface(),
             &snapshot,
             None,
             Vec::new(),
@@ -1401,7 +1674,7 @@ mod tests {
 
         assert_eq!(
             rows.first().map(|row| row.label.as_str()),
-            Some("Work · 2 active · 0 needs input · 1 ready · 0 recent")
+            Some("Work · Running: operation initializing · 2 active")
         );
     }
 
@@ -1436,6 +1709,7 @@ mod tests {
         });
 
         let rows = graph_rows(
+            &mut surface(),
             &snapshot,
             None,
             Vec::new(),
@@ -1487,6 +1761,7 @@ mod tests {
         snapshot.nodes = vec![durable, failed, evidence_pending];
 
         let rows = graph_rows(
+            &mut surface(),
             &snapshot,
             None,
             Vec::new(),
@@ -1520,6 +1795,7 @@ mod tests {
         ];
 
         let labels = graph_rows(
+            &mut surface(),
             &snapshot,
             None,
             Vec::new(),
@@ -1533,9 +1809,9 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "Work · 1 active · 1 needs input · 1 ready · 1 recent",
-                "operation active",
+                "Work · Needs input: operation blocked · 1 blocked",
                 "operation blocked",
+                "operation active",
                 "operation ready",
                 "operation recent",
             ]
@@ -1716,5 +1992,191 @@ mod tests {
         assert!(!off.contains("-old"), "{off}");
         assert!(!off.contains("alice"), "{off}");
         assert!(off.contains("exact change evidence"), "{off}");
+    }
+
+    #[test]
+    fn recent_only_summary_expires_after_ttl_and_user_turn() {
+        let mut recent = operation(NodeState::Completed, "recent");
+        recent.binding.as_mut().expect("binding").durable = true;
+        let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.nodes = vec![recent];
+
+        let mut surface = surface();
+        surface.set_presentation_now_ms(0);
+        let rows = graph_rows(
+            &mut surface,
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
+        assert!(
+            rows.iter().any(|row| row.id.0.starts_with("section:")),
+            "recent-only should surface briefly: {rows:?}"
+        );
+
+        surface.set_presentation_now_ms(RECENT_ONLY_TTL_MS);
+        let expired = graph_rows(
+            &mut surface,
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
+        assert!(
+            expired.is_empty(),
+            "recent-only must collapse after TTL: {expired:?}"
+        );
+        // Catalog retains durable history for inspector/history.
+        assert!(
+            surface
+                .catalog_rows
+                .iter()
+                .any(|row| row.label == "operation recent"),
+            "catalog must keep recent work after live expiry"
+        );
+
+        // New completion fingerprint re-surfaces once.
+        let mut newer = operation(NodeState::Completed, "newer");
+        newer.binding.as_mut().expect("binding").durable = true;
+        snapshot.nodes.push(newer);
+        surface.set_presentation_now_ms(RECENT_ONLY_TTL_MS + 10);
+        let resurfaced = graph_rows(
+            &mut surface,
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
+        assert!(
+            !resurfaced.is_empty(),
+            "a new completion may surface once after expiry"
+        );
+
+        // User turn hides immediately while still recent-only.
+        surface.note_user_turn_or_new_operation();
+        surface.set_presentation_now_ms(RECENT_ONLY_TTL_MS + 11);
+        let after_turn = graph_rows(
+            &mut surface,
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
+        assert!(
+            after_turn.is_empty(),
+            "user turn must hide recent-only immediately: {after_turn:?}"
+        );
+    }
+
+    #[test]
+    fn needs_input_and_ready_never_expire_with_clock() {
+        let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.nodes = vec![
+            operation(NodeState::Blocked, "blocked"),
+            operation(NodeState::Ready, "ready"),
+        ];
+        let mut surface = surface();
+        surface.set_presentation_now_ms(0);
+        let _ = graph_rows(
+            &mut surface,
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
+        surface.set_presentation_now_ms(60_000);
+        let rows = graph_rows(
+            &mut surface,
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
+        assert!(
+            rows[0].label.starts_with("Work · Needs input:"),
+            "{}",
+            rows[0].label
+        );
+        assert!(rows.iter().any(|row| row.label == "operation blocked"));
+        assert!(rows.iter().any(|row| row.label == "operation ready"));
+    }
+
+    #[test]
+    fn activity_receipts_aggregate_and_expire_without_raw_payloads() {
+        let activity = SettledFileActivity {
+            summary: FileActivitySummary {
+                files_read: 1,
+                patterns_searched: 2,
+                files_written: 1,
+                ..FileActivitySummary::default()
+            },
+            read: vec!["src/lib.rs".to_string()],
+            search: vec!["(?i)super_secret_pattern_xyz".to_string()],
+            write: vec!["src/main.rs".to_string()],
+            ..SettledFileActivity::default()
+        };
+        let mut surface = surface();
+        surface.set_presentation_now_ms(0);
+        let rows = ordered_rows(
+            &mut surface,
+            None,
+            None,
+            Vec::new(),
+            None,
+            activity.clone(),
+        );
+        let activity_row = rows
+            .iter()
+            .find(|row| row.id.0 == "activity:aggregate")
+            .expect("aggregate activity");
+        assert!(activity_row.label.contains("Read 1 files"));
+        assert!(activity_row.label.contains("Searched 2 patterns"));
+        assert!(!activity_row.label.contains("super_secret_pattern_xyz"));
+        assert!(!activity_row.detail.contains("super_secret_pattern_xyz"));
+
+        surface.set_presentation_now_ms(ACTIVITY_RECEIPT_TTL_MS);
+        let expired = ordered_rows(
+            &mut surface,
+            None,
+            None,
+            Vec::new(),
+            None,
+            activity,
+        );
+        assert!(
+            expired
+                .iter()
+                .all(|row| row.id.0 != "activity:aggregate"),
+            "activity receipt must expire after TTL: {expired:?}"
+        );
+    }
+
+    #[test]
+    fn summary_subject_prefers_attention_over_active_and_ready() {
+        let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.nodes = vec![
+            operation(NodeState::Active, "running"),
+            operation(NodeState::Blocked, "choose a release target"),
+            operation(NodeState::Ready, "review rebuilt binary"),
+        ];
+        let rows = graph_rows(
+            &mut surface(),
+            &snapshot,
+            None,
+            Vec::new(),
+            None,
+            SettledFileActivity::default(),
+        );
+        assert_eq!(
+            rows[0].label,
+            "Work · Needs input: operation choose a release target · 1 blocked"
+        );
     }
 }

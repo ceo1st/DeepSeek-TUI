@@ -6687,6 +6687,8 @@ impl App {
         self.history_index = None;
         self.history_navigation_draft = None;
         self.clear_input();
+        // Collapse recent-only Work chrome on the next accepted turn (#4688).
+        self.work_surface.note_user_turn_or_new_operation();
         Some(input)
     }
 
