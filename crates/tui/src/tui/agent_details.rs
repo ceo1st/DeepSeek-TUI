@@ -160,10 +160,10 @@ pub(crate) fn project_agent_details(app: &App, agent_id: &str) -> Option<AgentDe
     ));
     lines.push(format!("State: {}", state.join(" · ")));
 
-    if let Some(meta) = meta {
-        if let Some(provider) = meta.resolved_provider.as_deref() {
-            push_safe_line(app, &mut lines, "Provider", provider);
-        }
+    if let Some(meta) = meta
+        && let Some(provider) = meta.resolved_provider.as_deref()
+    {
+        push_safe_line(app, &mut lines, "Provider", provider);
     }
     let model = meta
         .and_then(|meta| meta.resolved_model.as_deref())

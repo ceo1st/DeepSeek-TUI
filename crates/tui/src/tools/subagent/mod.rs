@@ -2884,6 +2884,7 @@ impl SubAgentManager {
             .update_decision_status(decision_id, status, owner, expected_version)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile_coordination(
         &mut self,
         subject: String,

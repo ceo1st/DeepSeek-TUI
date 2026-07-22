@@ -49,7 +49,7 @@ fn boot_minimal_without_retry() -> anyhow::Result<(qa_harness::harness::SealedWo
     let ws = make_sealed_workspace()?;
     std::fs::write(
         ws.home().join(".deepseek").join("config.toml"),
-        "[retry]\nenabled = false\n",
+        "[retry]\nenabled = false\n\n[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n",
     )?;
     spawn_minimal_with_env(ws, &[])
 }
@@ -465,7 +465,7 @@ fn v091_real_pty_visual_matrix_preserves_control_grammar() -> anyhow::Result<()>
         std::fs::create_dir_all(&codex_home)?;
         std::fs::write(
             codewhale_home.join("config.toml"),
-            "reasoning_effort = \"low\"\n\n[update]\ncheck_for_updates = false\n",
+            "reasoning_effort = \"low\"\n\n[update]\ncheck_for_updates = false\n\n[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n",
         )?;
         std::fs::write(
             codewhale_home.join("settings.toml"),
@@ -1155,17 +1155,21 @@ fn real_coordination_details_use_typed_persisted_receipts_in_a_unix_pty() -> any
         }))?,
     )?;
 
-    let (_ws, mut h) = spawn_minimal_with_env(ws, &[])?;
-    let ambient = wait_for_frame_dump(
-        &mut h,
-        |frame| frame.contains("Coordination Work"),
-        KEY_TIMEOUT,
-    )?;
+    let (ws, mut h) = spawn_minimal_with_env(ws, &[])?;
+    h.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
+    let ambient = h.frame().debug_dump();
     assert!(
-        !ambient.contains("PRIVATE-TRANSCRIPT-MARKER"),
-        "decision constraints leaked into ambient Work chrome:\n{ambient}"
+        !ambient.contains("Coordination Work") && !ambient.contains("PRIVATE-TRANSCRIPT-MARKER"),
+        "coordination details leaked into ambient chrome:\n{ambient}"
     );
+    let _ = h.shutdown();
 
+    std::fs::write(
+        ws.home().join(".codewhale").join("settings.toml"),
+        "work_surface_placement = \"right\"\n",
+    )?;
+    let (_ws, mut h) = spawn_minimal_with_env(ws, &[])?;
+    h.wait_for_text("Coordination Work", KEY_TIMEOUT)?;
     h.send(keys::key::alt('w'))?;
     h.wait_for_idle(Duration::from_millis(80), Duration::from_secs(2))?;
     h.send(keys::key::enter())?;
@@ -1193,7 +1197,7 @@ fn real_coordination_details_use_typed_persisted_receipts_in_a_unix_pty() -> any
     assert!(!wide.contains("PRIVATE-TRANSCRIPT-MARKER"), "{wide}");
     write_real_pty_evidence_dump(
         "coordination-details-wide-140x40",
-        "size=140x40\nstate=persisted-coordination\naction=Alt+W then Enter\nprivate_marker_rendered=false",
+        "size=140x40\nstate=persisted-coordination\nplacement=right\naction=Alt+W then Enter\nprivate_marker_rendered=false",
         &wide,
     )?;
 
@@ -1303,8 +1307,8 @@ fn approval_modal_keeps_wheel_for_review_and_denies_without_side_effect() -> any
     Ok(())
 }
 
-/// Release stopship coverage: a real built TUI restores durable Work state and
-/// keeps both Work and the effective permission posture visible at each
+/// Release stopship coverage: a real built TUI restores durable To-do state and
+/// keeps both active To-dos and the effective permission posture visible at each
 /// supported compact evidence size. No model turn is sent.
 #[test]
 fn work_and_permission_are_visible_at_release_terminal_sizes() -> anyhow::Result<()> {
@@ -1317,7 +1321,7 @@ fn work_and_permission_are_visible_at_release_terminal_sizes() -> anyhow::Result
         std::fs::create_dir_all(&codex_home)?;
         std::fs::write(
             codewhale_home.join("config.toml"),
-            "allow_shell = true\nreasoning_effort = \"low\"\n",
+            "allow_shell = true\nreasoning_effort = \"low\"\n\n[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n",
         )?;
         std::fs::write(
             codewhale_home.join("settings.toml"),
@@ -1402,19 +1406,19 @@ fn work_and_permission_are_visible_at_release_terminal_sizes() -> anyhow::Result
         h.wait_for_text("/load", KEY_TIMEOUT)?;
         h.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
         h.send(keys::key::enter())?;
-        h.wait_for_text("Work", KEY_TIMEOUT)?;
+        h.wait_for_text("To-do ·", KEY_TIMEOUT)?;
         h.wait_for_text("Full Access", KEY_TIMEOUT)?;
         h.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
 
         let frame = h.frame();
         let dump = frame.debug_dump();
         assert!(
-            frame.contains("Work"),
-            "Work missing at {cols}x{rows}:\n{dump}"
+            frame.contains("To-do ·"),
+            "active To-do chrome missing at {cols}x{rows}:\n{dump}"
         );
         assert!(
             frame.contains("persisted") || frame.contains("2 items"),
-            "Work state missing at {cols}x{rows}:\n{dump}"
+            "To-do state missing at {cols}x{rows}:\n{dump}"
         );
         assert!(
             frame.contains("Full Access"),
@@ -1458,7 +1462,7 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
     std::fs::create_dir_all(&codex_home)?;
     std::fs::write(
         codewhale_home.join("config.toml"),
-        "allow_shell = true\nreasoning_effort = \"low\"\n",
+        "allow_shell = true\nreasoning_effort = \"low\"\n\n[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n",
     )?;
     std::fs::write(
         codewhale_home.join("settings.toml"),
@@ -1544,7 +1548,7 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
     h.wait_for_text("/load", KEY_TIMEOUT)?;
     h.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
     h.send(keys::key::enter())?;
-    h.wait_for_text("Work", KEY_TIMEOUT)?;
+    h.wait_for_text("To-do ·", KEY_TIMEOUT)?;
     h.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
     assert!(
         h.frame().contains("persisted"),
@@ -1561,7 +1565,7 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
         "Ctrl+T effort missing from narrow header:\n{}",
         cycled.debug_dump()
     );
-    assert!(cycled.contains("Work"), "{}", cycled.debug_dump());
+    assert!(cycled.contains("To-do ·"), "{}", cycled.debug_dump());
 
     let before_path = ws.workspace().join("wg6-before-export.json");
     h.send(keys::key::text("/save wg6-before-export.json"))?;
@@ -1641,7 +1645,7 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
     restored.wait_for_text("/load", KEY_TIMEOUT)?;
     restored.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
     restored.send(keys::key::enter())?;
-    restored.wait_for_text("Work", KEY_TIMEOUT)?;
+    restored.wait_for_text("To-do ·", KEY_TIMEOUT)?;
     restored.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
     let frame = restored.frame();
     assert!(frame.contains("persisted"), "{}", frame.debug_dump());
@@ -2391,7 +2395,7 @@ fn work_surface_file_mutation_modes_are_truthful_in_real_pty_frames() -> anyhow:
         std::fs::create_dir_all(&codex_home)?;
         std::fs::write(
             codewhale_home.join("config.toml"),
-            "reasoning_effort = \"low\"\n\n[retry]\nenabled = false\n\n[update]\ncheck_for_updates = false\n",
+            "reasoning_effort = \"low\"\n\n[retry]\nenabled = false\n\n[update]\ncheck_for_updates = false\n\n[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n",
         )?;
         let initial_mode = if persist_through_restart {
             "full"
@@ -2447,10 +2451,15 @@ fn work_surface_file_mutation_modes_are_truthful_in_real_pty_frames() -> anyhow:
         }
         h.wait_for_text("FILE-MUTATION-FIXTURE-DONE", Duration::from_secs(20))?;
         h.wait_for(
-            |frame| frame.contains("Wrote 4 files") && frame.contains("done"),
+            |frame| frame.contains("4 files") && frame.contains("done"),
             Duration::from_secs(10),
         )?;
         h.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
+        assert!(
+            !h.frame().contains("Wrote 4 files"),
+            "completed file-operation summary leaked into ambient chrome:\n{}",
+            h.frame().debug_dump()
+        );
 
         assert_eq!(
             std::fs::read_to_string(ws.workspace().join("new-name.txt"))?,
@@ -2671,10 +2680,10 @@ fn spawn_tool_lifecycle_screen_fixture(
                             .and_then(|message| message.get("content"))
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default();
-                        if !(bash_result.contains("Exact evidence retained")
-                            && bash_result.contains("art_call_bash_pty")
-                            && !bash_result.contains("PTY-EVIDENCE-DEEP-SENTINEL")
-                            && !bash_result.contains("/artifacts/"))
+                        if !bash_result.contains("Exact evidence retained")
+                            || !bash_result.contains("art_call_bash_pty")
+                            || bash_result.contains("PTY-EVIDENCE-DEEP-SENTINEL")
+                            || bash_result.contains("/artifacts/")
                         {
                             contract_errors.push(format!(
                                     "final request omitted the bounded session-owned Bash receipt (receipt={}, handle={}, deep_sentinel={}, artifact_path={})",
@@ -3156,8 +3165,8 @@ fn assert_running_tool_lifecycle_frame(
         "effective Full Access missing from header:\n{dump}"
     );
     assert!(
-        frame.contains("Work ·"),
-        "canonical Work surface missing:\n{dump}"
+        frame.contains("To-do ·"),
+        "active To-do chrome missing:\n{dump}"
     );
     assert!(
         frame.contains("PTY lifecycle"),
@@ -3338,7 +3347,7 @@ fn long_output_scrolls_and_restores_follow_tail() -> anyhow::Result<()> {
 }
 
 /// #2886: drive the actual shipped TUI through a Unix PTY and a sealed
-/// provider fixture. The first real tool establishes canonical To-do/Work;
+/// provider fixture. The first real tool establishes canonical To-do state;
 /// the second is a real Bash process held live by a workspace sentinel so the
 /// running card and statusline can be inspected without a timing race.
 /// Captures, when requested, are parsed PTY frames emitted by the product.
@@ -3361,7 +3370,7 @@ fn real_tool_lifecycle_crosses_work_status_resize_and_scroll_in_a_unix_pty() -> 
     std::fs::create_dir_all(&codex_home)?;
     std::fs::write(
         codewhale_home.join("config.toml"),
-        "allow_shell = true\nreasoning_effort = \"low\"\n\n[retry]\nenabled = false\n\n[update]\ncheck_for_updates = false\n",
+        "allow_shell = true\nreasoning_effort = \"low\"\n\n[retry]\nenabled = false\n\n[update]\ncheck_for_updates = false\n\n[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n",
     )?;
     std::fs::write(
         codewhale_home.join("settings.toml"),
@@ -3533,7 +3542,7 @@ fn real_tool_lifecycle_crosses_work_status_resize_and_scroll_in_a_unix_pty() -> 
         }
         write_real_pty_evidence(
             &format!("tool-lifecycle-running-{cols}x{rows}"),
-            &format!("size={cols}x{rows}\nphase=using-tool\nreal_tool=Bash\nwork_surface=Work"),
+            &format!("size={cols}x{rows}\nphase=using-tool\nreal_tool=Bash\nlive_chrome=To-do"),
             frame,
         )?;
     }
@@ -3558,8 +3567,8 @@ fn real_tool_lifecycle_crosses_work_status_resize_and_scroll_in_a_unix_pty() -> 
             "long settled transcript did not exceed the viewport:\n{dump}"
         );
         assert!(
-            frame.contains("Work ·"),
-            "Work vanished after settlement:\n{dump}"
+            frame.contains("To-do ·"),
+            "active To-do vanished after settlement:\n{dump}"
         );
         let done_row = visible_row_with_text(frame, "✓ done").expect("done phase row");
         let done_color = foreground_at_text(frame, done_row, "done");
@@ -3686,7 +3695,10 @@ fn real_tool_lifecycle_crosses_work_status_resize_and_scroll_in_a_unix_pty() -> 
         );
         let frame = h.frame();
         assert_real_pty_frame_geometry(frame, cols, rows);
-        assert!(frame.contains("Work ·"), "Work missing at {cols}x{rows}");
+        assert!(
+            frame.contains("To-do ·"),
+            "active To-do missing at {cols}x{rows}"
+        );
     }
 
     let artifact_dir = std::fs::read_dir(ws.home().join(".codewhale/sessions"))?
@@ -3827,7 +3839,7 @@ fn semantic_activity_motion_crosses_reasoning_reading_and_tool_use_in_a_real_uni
         std::fs::create_dir_all(&codex_home)?;
         std::fs::write(
             codewhale_home.join("config.toml"),
-            "allow_shell = true\nreasoning_effort = \"low\"\n\n[retry]\nenabled = false\n\n[update]\ncheck_for_updates = false\n",
+            "allow_shell = true\nreasoning_effort = \"low\"\n\n[retry]\nenabled = false\n\n[update]\ncheck_for_updates = false\n\n[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n",
         )?;
         std::fs::write(
             codewhale_home.join("settings.toml"),

@@ -1665,8 +1665,8 @@ impl CoordinationLedger {
             ));
         }
         let subject = self.decisions[index].subject.clone();
-        if status == DecisionStatus::Accepted {
-            if let Some(existing) =
+        if status == DecisionStatus::Accepted
+            && let Some(existing) =
                 self.decisions
                     .iter()
                     .enumerate()
@@ -1676,12 +1676,11 @@ impl CoordinationLedger {
                             && existing.status == DecisionStatus::Accepted)
                             .then_some(existing)
                     })
-            {
-                return Err(format!(
-                    "subject '{subject}' already has accepted decision '{}' owned by '{}'; preserve both candidates and use neutral reconciliation",
-                    existing.decision_id, existing.owner
-                ));
-            }
+        {
+            return Err(format!(
+                "subject '{subject}' already has accepted decision '{}' owned by '{}'; preserve both candidates and use neutral reconciliation",
+                existing.decision_id, existing.owner
+            ));
         }
         let sequence = self.next_sequence();
         let decision = &mut self.decisions[index];
@@ -1736,8 +1735,8 @@ impl CoordinationLedger {
                 ));
             }
         }
-        if !isolated_worktree {
-            if let Some(existing) = self
+        if !isolated_worktree
+            && let Some(existing) = self
                 .write_claims
                 .iter()
                 .find(|existing| {
@@ -1747,27 +1746,26 @@ impl CoordinationLedger {
                         && existing.claim.overlaps(&claim)
                 })
                 .cloned()
-            {
-                let receipt = WriteContentionReceipt {
-                    claimant: claim.owner.clone(),
-                    conflicting_owner: existing.claim.owner.clone(),
-                    roots: claim.roots.clone(),
-                    exact_files: claim.exact_files.clone(),
-                    contracts: claim.contracts.clone(),
-                    disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
-                    resolution_sequence: None,
-                    sequence: self.next_sequence(),
-                };
-                self.contentions.push(receipt);
-                trim_front(&mut self.contentions, COORDINATION_RECORD_LIMIT);
-                return Err(format!(
-                    "write-scope contention with {} (roots: {:?}, files: {:?}, contracts: {:?}); serialize the work, narrow the claim, or use worktree isolation",
-                    existing.claim.owner,
-                    existing.claim.roots,
-                    existing.claim.exact_files,
-                    existing.claim.contracts
-                ));
-            }
+        {
+            let receipt = WriteContentionReceipt {
+                claimant: claim.owner.clone(),
+                conflicting_owner: existing.claim.owner.clone(),
+                roots: claim.roots.clone(),
+                exact_files: claim.exact_files.clone(),
+                contracts: claim.contracts.clone(),
+                disposition: WriteContentionDisposition::BlockedPendingIsolationOrSerialization,
+                resolution_sequence: None,
+                sequence: self.next_sequence(),
+            };
+            self.contentions.push(receipt);
+            trim_front(&mut self.contentions, COORDINATION_RECORD_LIMIT);
+            return Err(format!(
+                "write-scope contention with {} (roots: {:?}, files: {:?}, contracts: {:?}); serialize the work, narrow the claim, or use worktree isolation",
+                existing.claim.owner,
+                existing.claim.roots,
+                existing.claim.exact_files,
+                existing.claim.contracts
+            ));
         }
         self.write_claims
             .retain(|existing| existing.claim.owner != claim.owner);
@@ -1788,6 +1786,7 @@ impl CoordinationLedger {
         Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile(
         &mut self,
         subject: String,

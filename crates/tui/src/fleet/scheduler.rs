@@ -312,6 +312,7 @@ impl FleetScheduler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn retry_or_fail(
         &self,
         state: &FleetLedgerState,

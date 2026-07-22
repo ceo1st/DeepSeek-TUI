@@ -463,12 +463,11 @@ fn resolve_spillover_reference(
     }
 
     // Compatibility lookup: `art_<id>` may name the historical `<id>.txt`.
-    if let Some(stripped_art) = stripped.strip_prefix("art_") {
-        if let Some(p) = crate::tools::truncate::spillover_path(stripped_art)
-            && let Some(found) = try_path(p, &mut tried)
-        {
-            return Ok(found);
-        }
+    if let Some(stripped_art) = stripped.strip_prefix("art_")
+        && let Some(p) = crate::tools::truncate::spillover_path(stripped_art)
+        && let Some(found) = try_path(p, &mut tried)
+    {
+        return Ok(found);
     }
 
     if let Some(path) = crate::tools::truncate::spillover_path(stripped)

@@ -257,6 +257,17 @@ pub fn make_sealed_workspace() -> Result<SealedWorkspace> {
     std::fs::create_dir_all(&workspace).context("mkdir workspace")?;
     std::fs::create_dir_all(home.join(".codewhale")).context("mkdir home/.codewhale")?;
     std::fs::create_dir_all(home.join(".deepseek")).context("mkdir home/.deepseek")?;
+    let silent_notifications = "[notifications]\nmethod = \"off\"\ncompletion_sound = \"off\"\n";
+    std::fs::write(
+        home.join(".codewhale").join("config.toml"),
+        silent_notifications,
+    )
+    .context("write silent CodeWhale PTY config")?;
+    std::fs::write(
+        home.join(".deepseek").join("config.toml"),
+        silent_notifications,
+    )
+    .context("write silent legacy PTY config")?;
     Ok(SealedWorkspace {
         _tmp: tmp,
         workspace,

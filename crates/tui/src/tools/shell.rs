@@ -2461,6 +2461,7 @@ fn exec_shell_input_starts_detached(input: &serde_json::Value) -> bool {
             || input.get("tty").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_foreground_via_background(
     context: &ToolContext,
     command: &str,
