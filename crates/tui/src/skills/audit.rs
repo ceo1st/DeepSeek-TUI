@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
-use super::install::{DEFAULT_MAX_SIZE_BYTES, INSTALLED_FROM_MARKER, TRUSTED_MARKER};
+use super::install::{INSTALLED_FROM_MARKER, TRUSTED_MARKER};
+use super::package_digest::{self, PackageDigestError};
 use super::roots::{
     SkillRootAccess, SkillRootCatalog, SkillRootDescriptor, SkillRootId, SkillRootKind,
     safe_display_path,
@@ -23,11 +23,13 @@ use super::{SkillRegistry, normalize_skill_name_for_lookup};
 /// Max bytes of `SKILL.md` the auditor will read into memory.
 pub const AUDIT_MAX_SKILL_MD_BYTES: u64 = 512 * 1024;
 /// Max total package bytes considered for digest / integrity.
-pub const AUDIT_MAX_PACKAGE_BYTES: u64 = DEFAULT_MAX_SIZE_BYTES;
+#[allow(dead_code)] // re-exported bound for callers / docs
+pub const AUDIT_MAX_PACKAGE_BYTES: u64 = package_digest::PACKAGE_DIGEST_MAX_BYTES;
 /// Max regular files included in a package digest walk.
-pub const AUDIT_MAX_FILES: usize = 256;
+#[allow(dead_code)]
+pub const AUDIT_MAX_FILES: usize = package_digest::PACKAGE_DIGEST_MAX_FILES;
 /// Max directory depth under a skill package (and under a root when locating packages).
-pub const AUDIT_MAX_DEPTH: usize = 8;
+pub const AUDIT_MAX_DEPTH: usize = package_digest::PACKAGE_DIGEST_MAX_DEPTH;
 
 /// Which roots the auditor visits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +138,7 @@ pub enum ProvenanceState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkillActionKind {
+    Install,
     Import,
     Update,
     Remove,
@@ -567,190 +570,46 @@ struct PackageAnalysis {
     warnings: Vec<String>,
 }
 
-fn analyze_package(package_dir: &Path, _canonical_root: &Path) -> PackageAnalysis {
-    let Ok(canonical_package) = fs::canonicalize(package_dir) else {
-        return PackageAnalysis {
-            digest: DigestState::Unknown(DigestUnknownReason::Unreadable),
-            path_unsafe: true,
-            warnings: vec!["cannot canonicalize skill package".into()],
-        };
-    };
+/// Compute the bounded package content digest used by audit and mutation.
+#[allow(dead_code)] // public wrapper; mutation uses package_digest directly
+pub fn compute_package_digest(package_dir: &Path) -> Result<String, DigestUnknownReason> {
+    package_digest::compute_package_digest(package_dir).map_err(digest_error_to_unknown)
+}
 
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut total_bytes: u64 = 0;
-    let mut visited = HashSet::new();
-    let mut path_unsafe = false;
-    let mut warnings = Vec::new();
-    let mut unknown_reason: Option<DigestUnknownReason> = None;
-
-    fn walk(
-        dir: &Path,
-        package_root: &Path,
-        depth: usize,
-        visited: &mut HashSet<PathBuf>,
-        files: &mut Vec<(String, Vec<u8>)>,
-        total_bytes: &mut u64,
-        path_unsafe: &mut bool,
-        warnings: &mut Vec<String>,
-        unknown_reason: &mut Option<DigestUnknownReason>,
-    ) {
-        if unknown_reason.is_some() {
-            return;
-        }
-        if depth > AUDIT_MAX_DEPTH {
-            *unknown_reason = Some(DigestUnknownReason::TooDeep);
-            warnings.push("package exceeded audit depth limit".into());
-            return;
-        }
-        let Ok(meta) = fs::symlink_metadata(dir) else {
-            *unknown_reason = Some(DigestUnknownReason::Unreadable);
-            return;
-        };
-        if meta.file_type().is_symlink() {
-            *path_unsafe = true;
-            *unknown_reason = Some(DigestUnknownReason::SymlinkPresent);
-            warnings.push(format!("symlink at {}", dir.display()));
-            return;
-        }
-        let Ok(canonical) = fs::canonicalize(dir) else {
-            *unknown_reason = Some(DigestUnknownReason::Unreadable);
-            return;
-        };
-        if !canonical.starts_with(package_root) {
-            *path_unsafe = true;
-            *unknown_reason = Some(DigestUnknownReason::EscapedRoot);
-            return;
-        }
-        if !visited.insert(canonical) {
-            *path_unsafe = true;
-            *unknown_reason = Some(DigestUnknownReason::Cycle);
-            return;
-        }
-
-        let Ok(entries) = fs::read_dir(dir) else {
-            *unknown_reason = Some(DigestUnknownReason::Unreadable);
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-
-            // Symlink check before any name-based skip so management markers
-            // cannot hide escape / TOCTOU via a symlink.
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                *unknown_reason = Some(DigestUnknownReason::Unreadable);
-                return;
-            };
-            if meta.file_type().is_symlink() {
-                *path_unsafe = true;
-                *unknown_reason = Some(DigestUnknownReason::SymlinkPresent);
-                warnings.push(format!("symlink file at {}", path.display()));
-                return;
-            }
-
-            if name == INSTALLED_FROM_MARKER
-                || name == TRUSTED_MARKER
-                || name == ".system-installed-version"
-                || name.ends_with(".bak")
-                || name.ends_with(".tmp")
-            {
-                continue;
-            }
-            // Skip hidden management noise inside packages.
-            if name.starts_with('.') {
-                continue;
-            }
-
-            if meta.is_dir() {
-                walk(
-                    &path,
-                    package_root,
-                    depth + 1,
-                    visited,
-                    files,
-                    total_bytes,
-                    path_unsafe,
-                    warnings,
-                    unknown_reason,
-                );
-                continue;
-            }
-            if !meta.is_file() {
-                continue;
-            }
-            if files.len() >= AUDIT_MAX_FILES {
-                *unknown_reason = Some(DigestUnknownReason::TooManyFiles);
-                warnings.push("package exceeded audit file limit".into());
-                return;
-            }
-            let len = meta.len();
-            if *total_bytes + len > AUDIT_MAX_PACKAGE_BYTES {
-                *unknown_reason = Some(DigestUnknownReason::Oversized);
-                warnings.push("package exceeded audit size limit".into());
-                return;
-            }
-            let bytes = match fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => {
-                    *unknown_reason = Some(DigestUnknownReason::Unreadable);
-                    return;
-                }
-            };
-            *total_bytes += bytes.len() as u64;
-            let rel = path
-                .strip_prefix(package_root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| name.to_string());
-            files.push((rel, bytes));
-        }
-    }
-
-    walk(
-        package_dir,
-        &canonical_package,
-        0,
-        &mut visited,
-        &mut files,
-        &mut total_bytes,
-        &mut path_unsafe,
-        &mut warnings,
-        &mut unknown_reason,
-    );
-
-    if let Some(reason) = unknown_reason {
-        return PackageAnalysis {
-            digest: DigestState::Unknown(reason),
-            path_unsafe,
-            warnings,
-        };
-    }
-
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut hasher = Sha256::new();
-    for (rel, bytes) in &files {
-        hasher.update(rel.as_bytes());
-        hasher.update(b"\0");
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-    let digest = hex_digest(hasher.finalize());
-    PackageAnalysis {
-        digest: DigestState::Known(digest),
-        path_unsafe,
-        warnings,
+fn digest_error_to_unknown(err: PackageDigestError) -> DigestUnknownReason {
+    match err {
+        PackageDigestError::Unreadable => DigestUnknownReason::Unreadable,
+        PackageDigestError::SymlinkPresent => DigestUnknownReason::SymlinkPresent,
+        PackageDigestError::EscapedRoot => DigestUnknownReason::EscapedRoot,
+        PackageDigestError::Cycle => DigestUnknownReason::Cycle,
+        PackageDigestError::Oversized => DigestUnknownReason::Oversized,
+        PackageDigestError::TooManyFiles => DigestUnknownReason::TooManyFiles,
+        PackageDigestError::TooDeep => DigestUnknownReason::TooDeep,
     }
 }
 
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
+fn analyze_package(package_dir: &Path, _canonical_root: &Path) -> PackageAnalysis {
+    match package_digest::compute_package_digest(package_dir) {
+        Ok(digest) => PackageAnalysis {
+            digest: DigestState::Known(digest),
+            path_unsafe: false,
+            warnings: Vec::new(),
+        },
+        Err(err) => {
+            let reason = digest_error_to_unknown(err.clone());
+            let path_unsafe = matches!(
+                err,
+                PackageDigestError::SymlinkPresent
+                    | PackageDigestError::EscapedRoot
+                    | PackageDigestError::Cycle
+            );
+            PackageAnalysis {
+                digest: DigestState::Unknown(reason),
+                path_unsafe,
+                warnings: vec![err.to_string()],
+            }
+        }
     }
-    out
 }
 
 // ── markers ──────────────────────────────────────────────────────────────────

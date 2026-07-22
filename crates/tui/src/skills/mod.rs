@@ -2,6 +2,8 @@
 
 pub mod audit;
 pub mod install;
+pub mod mutation;
+mod package_digest;
 pub mod roots;
 mod system;
 // Re-exports kept for documentation parity and downstream consumers; the

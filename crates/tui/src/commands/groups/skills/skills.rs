@@ -4,8 +4,8 @@ use std::fmt::Write;
 
 use crate::network_policy::NetworkPolicy;
 use crate::skills::install::{
-    self, DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL, InstallOutcome, InstallSource,
-    RegistryFetchResult, SkillSyncOutcome, SyncResult, UpdateResult,
+    self, DEFAULT_MAX_SIZE_BYTES, DEFAULT_REGISTRY_URL, InstallSource, RegistryFetchResult,
+    SkillSyncOutcome, SyncResult,
 };
 use crate::skills::{SkillRegistry, SkillSource};
 use crate::tui::app::{App, AppAction};
@@ -323,7 +323,7 @@ fn run_skill(app: &mut App, name: Option<&str>) -> CommandResult {
         Some(n) => n.trim(),
         None => {
             return CommandResult::error(
-                "Usage: /skill <name>\n\nSubcommands:\n  /skill install <github:owner/repo|https://…|<registry-name>>\n  /skill update <name>\n  /skill uninstall <name>\n  /skill trust <name>",
+                "Usage: /skill <name>\n\nSubcommands:\n  /skill install [--project|--global] <github:owner/repo|https://…|<registry-name>>\n  /skill update [--project|--global] <name>\n  /skill uninstall [--project|--global] <name>\n  /skill trust [--project|--global] <name>",
             );
         }
     };
@@ -343,6 +343,67 @@ fn run_skill(app: &mut App, name: Option<&str>) -> CommandResult {
 
     let task = (!rest.is_empty()).then_some(rest);
     activate_skill_with_task(app, head, task)
+}
+
+/// Parse optional `--project` / `--global` scope prefix from a skill subcommand.
+fn parse_scope_args(
+    args: &str,
+) -> Result<(Option<crate::skills::mutation::SkillTargetScope>, &str), String> {
+    use crate::skills::mutation::SkillTargetScope;
+    let mut scope = None;
+    let mut rest = args.trim();
+    loop {
+        if let Some(next) = rest.strip_prefix("--project") {
+            if scope.is_some() {
+                return Err("specify at most one of --project / --global".into());
+            }
+            scope = Some(SkillTargetScope::Project);
+            rest = next.trim_start();
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix("--global") {
+            if scope.is_some() {
+                return Err("specify at most one of --project / --global".into());
+            }
+            scope = Some(SkillTargetScope::Global);
+            rest = next.trim_start();
+            continue;
+        }
+        break;
+    }
+    Ok((scope, rest.trim()))
+}
+
+fn format_mutation_receipt(receipt: &crate::skills::mutation::SkillMutationReceipt) -> String {
+    use crate::skills::mutation::SkillMutationOutcome;
+    match &receipt.outcome {
+        SkillMutationOutcome::Installed => format!(
+            "Installed skill '{}'.\nLocation: {}\n\nManage skills with /skills.",
+            receipt.name, receipt.safe_target_path
+        ),
+        SkillMutationOutcome::Updated => format!(
+            "Skill '{}' updated.\nLocation: {}",
+            receipt.name, receipt.safe_target_path
+        ),
+        SkillMutationOutcome::NoChange => {
+            format!("Skill '{}': no upstream change.", receipt.name)
+        }
+        SkillMutationOutcome::Removed => format!("Removed skill '{}'.", receipt.name),
+        SkillMutationOutcome::Trusted => format!(
+            "Marked skill '{}' as trusted. The .trusted marker is advisory and digest-bound; it records your review intent but does not sandbox or auto-authorize scripts.",
+            receipt.name
+        ),
+        SkillMutationOutcome::Imported => format!(
+            "Imported skill '{}'.\nLocation: {}",
+            receipt.name, receipt.safe_target_path
+        ),
+        SkillMutationOutcome::AlreadyPresent => format!(
+            "Skill '{}' is already present at {} (exact duplicate).",
+            receipt.name, receipt.safe_target_path
+        ),
+        SkillMutationOutcome::NeedsApproval(host) => needs_approval_message(host),
+        SkillMutationOutcome::NetworkDenied(host) => network_denied_message(host),
+    }
 }
 
 /// Activate a skill and, when the invocation includes a task, send that task
@@ -414,45 +475,62 @@ fn activate_skill(app: &mut App, name: &str) -> CommandResult {
 
 // ─── /skill install ────────────────────────────────────────────────────────
 
-fn install_skill(app: &mut App, spec: &str) -> CommandResult {
+fn install_skill(app: &mut App, args: &str) -> CommandResult {
+    use crate::skills::mutation::{MutationContext, SkillMutationRequest, SkillTargetScope};
+
+    let (scope, spec) = match parse_scope_args(args) {
+        Ok(v) => v,
+        Err(err) => return CommandResult::error(err),
+    };
     if spec.is_empty() {
         return CommandResult::error(
-            "Usage: /skill install <github:owner/repo|https://…|<registry-name>>",
+            "Usage: /skill install [--project|--global] <github:owner/repo|https://…|<registry-name>>",
         );
     }
     let source = match InstallSource::parse(spec) {
         Ok(s) => s,
         Err(err) => return CommandResult::error(format!("Invalid install source: {err}")),
     };
-    let skills_dir = app.skills_dir.clone();
+    // Legacy no-scope install maps to the CodeWhale global owned root.
+    let target = scope.unwrap_or(SkillTargetScope::Global);
+    let workspace = app.workspace.clone();
+    let home = dirs::home_dir();
     let (network, max_size, registry_url) = installer_settings(app);
 
     let outcome = run_async(async move {
-        install::install_with_registry(
-            source,
-            &skills_dir,
+        let ctx = MutationContext {
+            workspace: &workspace,
+            home: home.as_deref(),
+            configured_skills_dir: None,
+            network: &network,
             max_size,
-            &network,
-            false,
-            &registry_url,
+            registry_url: &registry_url,
+        };
+        crate::skills::mutation::execute(
+            SkillMutationRequest::InstallRemote { source, target },
+            &ctx,
         )
         .await
     });
 
     match outcome {
-        Ok(InstallOutcome::Installed(installed)) => {
-            app.refresh_skill_cache();
-            let path_str = path_or_default(&installed.path);
-            CommandResult::message(format!(
-                "Installed skill '{}' from {}.\nLocation: {}\n\nRun /skills to see it in the list.",
-                installed.name, spec, path_str
-            ))
-        }
-        Ok(InstallOutcome::NeedsApproval(host)) => {
-            CommandResult::error(needs_approval_message(&host))
-        }
-        Ok(InstallOutcome::NetworkDenied(host)) => {
-            CommandResult::error(network_denied_message(&host))
+        Ok(receipt) => {
+            if matches!(
+                receipt.outcome,
+                crate::skills::mutation::SkillMutationOutcome::Installed
+            ) {
+                app.refresh_skill_cache();
+            }
+            let message = format_mutation_receipt(&receipt);
+            if matches!(
+                receipt.outcome,
+                crate::skills::mutation::SkillMutationOutcome::NeedsApproval(_)
+                    | crate::skills::mutation::SkillMutationOutcome::NetworkDenied(_)
+            ) {
+                CommandResult::error(message)
+            } else {
+                CommandResult::message(message)
+            }
         }
         Err(err) => CommandResult::error(format!("Install failed: {err:#}")),
     }
@@ -460,32 +538,59 @@ fn install_skill(app: &mut App, spec: &str) -> CommandResult {
 
 // ─── /skill update ─────────────────────────────────────────────────────────
 
-fn update_skill(app: &mut App, name: &str) -> CommandResult {
+fn update_skill(app: &mut App, args: &str) -> CommandResult {
+    use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+
+    let (scope, name) = match parse_scope_args(args) {
+        Ok(v) => v,
+        Err(err) => return CommandResult::error(err),
+    };
     if name.is_empty() {
-        return CommandResult::error("Usage: /skill update <name>");
+        return CommandResult::error("Usage: /skill update [--project|--global] <name>");
     }
-    let skills_dir = app.skills_dir.clone();
+    let workspace = app.workspace.clone();
+    let home = dirs::home_dir();
     let (network, max_size, registry_url) = installer_settings(app);
     let owned_name = name.to_string();
+
     let outcome = run_async(async move {
-        install::update_with_registry(&owned_name, &skills_dir, max_size, &network, &registry_url)
-            .await
+        let ctx = MutationContext {
+            workspace: &workspace,
+            home: home.as_deref(),
+            configured_skills_dir: None,
+            network: &network,
+            max_size,
+            registry_url: &registry_url,
+        };
+        crate::skills::mutation::execute(
+            SkillMutationRequest::UpdateByName {
+                name: owned_name,
+                scope,
+                expected_digest: None,
+            },
+            &ctx,
+        )
+        .await
     });
 
     match outcome {
-        Ok(UpdateResult::NoChange) => {
-            CommandResult::message(format!("Skill '{name}': no upstream change."))
-        }
-        Ok(UpdateResult::Updated(installed)) => CommandResult::message(format!(
-            "Skill '{}' updated. Location: {}",
-            installed.name,
-            path_or_default(&installed.path)
-        )),
-        Ok(UpdateResult::NeedsApproval(host)) => {
-            CommandResult::error(needs_approval_message(&host))
-        }
-        Ok(UpdateResult::NetworkDenied(host)) => {
-            CommandResult::error(network_denied_message(&host))
+        Ok(receipt) => {
+            if matches!(
+                receipt.outcome,
+                crate::skills::mutation::SkillMutationOutcome::Updated
+            ) {
+                app.refresh_skill_cache();
+            }
+            let message = format_mutation_receipt(&receipt);
+            if matches!(
+                receipt.outcome,
+                crate::skills::mutation::SkillMutationOutcome::NeedsApproval(_)
+                    | crate::skills::mutation::SkillMutationOutcome::NetworkDenied(_)
+            ) {
+                CommandResult::error(message)
+            } else {
+                CommandResult::message(message)
+            }
         }
         Err(err) => CommandResult::error(format!("Update failed: {err:#}")),
     }
@@ -493,14 +598,38 @@ fn update_skill(app: &mut App, name: &str) -> CommandResult {
 
 // ─── /skill uninstall ──────────────────────────────────────────────────────
 
-fn uninstall_skill(app: &mut App, name: &str) -> CommandResult {
+fn uninstall_skill(app: &mut App, args: &str) -> CommandResult {
+    use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+
+    let (scope, name) = match parse_scope_args(args) {
+        Ok(v) => v,
+        Err(err) => return CommandResult::error(err),
+    };
     if name.is_empty() {
-        return CommandResult::error("Usage: /skill uninstall <name>");
+        return CommandResult::error("Usage: /skill uninstall [--project|--global] <name>");
     }
-    match install::uninstall(name, &app.skills_dir) {
-        Ok(()) => {
+    let home = dirs::home_dir();
+    let (network, max_size, registry_url) = installer_settings(app);
+    let ctx = MutationContext {
+        workspace: &app.workspace,
+        home: home.as_deref(),
+        configured_skills_dir: None,
+        network: &network,
+        max_size,
+        registry_url: &registry_url,
+    };
+
+    match crate::skills::mutation::execute_sync(
+        SkillMutationRequest::RemoveByName {
+            name: name.to_string(),
+            scope,
+            expected_digest: None,
+        },
+        &ctx,
+    ) {
+        Ok(receipt) => {
             app.refresh_skill_cache();
-            CommandResult::message(format!("Removed skill '{name}'."))
+            CommandResult::message(format_mutation_receipt(&receipt))
         }
         Err(err) => CommandResult::error(format!("Uninstall failed: {err:#}")),
     }
@@ -508,14 +637,36 @@ fn uninstall_skill(app: &mut App, name: &str) -> CommandResult {
 
 // ─── /skill trust ──────────────────────────────────────────────────────────
 
-fn trust_skill(app: &mut App, name: &str) -> CommandResult {
+fn trust_skill(app: &mut App, args: &str) -> CommandResult {
+    use crate::skills::mutation::{MutationContext, SkillMutationRequest};
+
+    let (scope, name) = match parse_scope_args(args) {
+        Ok(v) => v,
+        Err(err) => return CommandResult::error(err),
+    };
     if name.is_empty() {
-        return CommandResult::error("Usage: /skill trust <name>");
+        return CommandResult::error("Usage: /skill trust [--project|--global] <name>");
     }
-    match install::trust(name, &app.skills_dir) {
-        Ok(()) => CommandResult::message(format!(
-            "Marked skill '{name}' as trusted. The .trusted marker is advisory; it records your intent but does not sandbox or auto-authorize scripts."
-        )),
+    let home = dirs::home_dir();
+    let (network, max_size, registry_url) = installer_settings(app);
+    let ctx = MutationContext {
+        workspace: &app.workspace,
+        home: home.as_deref(),
+        configured_skills_dir: None,
+        network: &network,
+        max_size,
+        registry_url: &registry_url,
+    };
+
+    match crate::skills::mutation::execute_sync(
+        SkillMutationRequest::TrustByName {
+            name: name.to_string(),
+            scope,
+            expected_digest: None,
+        },
+        &ctx,
+    ) {
+        Ok(receipt) => CommandResult::message(format_mutation_receipt(&receipt)),
         Err(err) => CommandResult::error(format!("Trust failed: {err:#}")),
     }
 }
@@ -656,6 +807,7 @@ where
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
+#[allow(dead_code)] // retained for sync/remote listing helpers
 fn path_or_default(path: &std::path::Path) -> String {
     path.file_name()
         .map(|n| {
@@ -1280,27 +1432,41 @@ mod tests {
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         let result = run_skill(&mut app, Some("uninstall absent-skill"));
         let msg = result.message.unwrap();
-        assert!(msg.contains("not installed"), "got: {msg}");
+        assert!(
+            msg.contains("not found") || msg.contains("not installed"),
+            "got: {msg}"
+        );
     }
 
     #[test]
     fn test_skill_trust_message_marks_marker_advisory() {
         let tmpdir = TempDir::new().unwrap();
         let _home = IsolatedHome::new(&tmpdir);
-        create_skill_dir(
-            &tmpdir,
-            "trusted-skill",
-            "---\nname: trusted-skill\ndescription: Trust copy\n---\nbody",
-        );
-        let marker = tmpdir
+        // Mutations only touch CodeWhale-owned roots; place under project scope.
+        let skill_dir = tmpdir
             .path()
+            .join(".codewhale")
             .join("skills")
-            .join("trusted-skill")
-            .join(install::INSTALLED_FROM_MARKER);
-        std::fs::write(marker, "github:owner/repo\n").expect("installed marker");
+            .join("trusted-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: trusted-skill\ndescription: Trust copy\n---\nbody",
+        )
+        .unwrap();
+        install::write_installed_from_v2(
+            &skill_dir,
+            "github:owner/repo",
+            None,
+            "src",
+            "placeholder",
+            "trusted-skill",
+        )
+        .unwrap();
 
         let mut app = create_test_app_with_tmpdir(&tmpdir);
-        let result = run_skill(&mut app, Some("trust trusted-skill"));
+        let result = run_skill(&mut app, Some("trust --project trusted-skill"));
+        assert!(!result.is_error, "got: {:?}", result.message);
         let msg = result.message.expect("trust result");
         assert!(msg.contains("advisory"), "got: {msg}");
         assert!(!msg.contains("may now invoke"), "got: {msg}");
