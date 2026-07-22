@@ -1853,6 +1853,345 @@ fn spawn_long_reply_fixture(
     Ok((format!("http://{address}"), handle))
 }
 
+fn read_http_request(stream: &mut std::net::TcpStream) -> anyhow::Result<String> {
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..count]);
+
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        if content_length.is_none_or(|length| request.len() >= header_end + length) {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&request).into_owned())
+}
+
+fn pty_tool_call_sse(id: &str, name: &str, arguments: serde_json::Value) -> String {
+    [
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": format!("chatcmpl-{id}"),
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4-pro",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(&arguments)
+                                .expect("tool arguments JSON")
+                        }
+                    }]},
+                    "finish_reason": null
+                }]
+            })
+        ),
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": format!("chatcmpl-{id}"),
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4-pro",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}
+            })
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .join("")
+}
+
+fn pty_text_sse(content: &str) -> String {
+    [
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-pty-lifecycle-final",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4-pro",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": content},
+                    "finish_reason": null
+                }]
+            })
+        ),
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-pty-lifecycle-final",
+                "object": "chat.completion.chunk",
+                "model": "deepseek-v4-pro",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 24, "completion_tokens": 80, "total_tokens": 104}
+            })
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .join("")
+}
+
+/// Three-turn loopback fixture for the real screen acceptance path:
+/// `work_update` establishes canonical To-do/Work state, then an actual Bash
+/// call waits on a test-owned workspace sentinel, then a long final answer
+/// makes transcript retention and scrolling observable.
+fn spawn_tool_lifecycle_screen_fixture(
+    release_signal: &str,
+    final_answer: String,
+) -> anyhow::Result<(String, std::thread::JoinHandle<anyhow::Result<()>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let shell_command = format!(
+        "printf 'PTY-TOOL-START\\n'; while [ ! -f {release_signal} ]; do sleep 0.05; done; printf 'PTY-TOOL-END\\n'"
+    );
+    let replies = [
+        pty_tool_call_sse(
+            "call_work_pty",
+            "work_update",
+            serde_json::json!({
+                "todos": [{
+                    "content": "PTY lifecycle acceptance",
+                    "status": "in_progress"
+                }]
+            }),
+        ),
+        pty_tool_call_sse(
+            "call_bash_pty",
+            "Bash",
+            serde_json::json!({
+                "action": "run",
+                "command": shell_command,
+                "timeout_ms": 60_000
+            }),
+        ),
+        pty_text_sse(&final_answer),
+    ];
+
+    let handle = std::thread::spawn(move || -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(75);
+        let mut chat_index = 0_usize;
+        while chat_index < replies.len() && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            let request = read_http_request(&mut stream)?;
+            let request_line = request.lines().next().unwrap_or_default();
+            let (content_type, body) =
+                if request_line.starts_with("GET ") && request_line.contains("/models") {
+                    (
+                        "application/json",
+                        serde_json::json!({
+                            "object": "list",
+                            "data": [{"id": "deepseek-v4-pro", "object": "model"}]
+                        })
+                        .to_string(),
+                    )
+                } else if request_line.starts_with("POST ")
+                    && request_line.contains("/chat/completions")
+                {
+                    let request_body = request
+                        .split_once("\r\n\r\n")
+                        .map(|(_, body)| body)
+                        .unwrap_or_default();
+                    let request_json: serde_json::Value = serde_json::from_str(request_body)?;
+                    let request_contract = request_json.to_string();
+                    match chat_index {
+                        0 => anyhow::ensure!(
+                            request_contract.contains("exercise the real PTY tool lifecycle"),
+                            "initial request omitted the user prompt"
+                        ),
+                        1 => anyhow::ensure!(
+                            request_contract.contains("call_work_pty")
+                                && request_contract.contains("\"role\":\"tool\""),
+                            "second request omitted the work_update result"
+                        ),
+                        2 => anyhow::ensure!(
+                            request_contract.contains("call_bash_pty")
+                                && request_contract.contains("PTY-TOOL-END"),
+                            "final request omitted the completed Bash result"
+                        ),
+                        _ => unreachable!("bounded lifecycle fixture"),
+                    }
+                    let body = replies[chat_index].clone();
+                    chat_index += 1;
+                    ("text/event-stream", body)
+                } else {
+                    ("text/plain", "not found".to_string())
+                };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes())?;
+            stream.flush()?;
+        }
+        anyhow::ensure!(
+            chat_index == replies.len(),
+            "fixture served {chat_index}/{} chat requests",
+            replies.len()
+        );
+        Ok(())
+    });
+    Ok((format!("http://{address}"), handle))
+}
+
+fn whale_ansi_signature(frame: &qa_harness::Frame) -> Vec<vt100::Color> {
+    const WHALE_BACK: &str = "▗▄▄▄▄▄▄▄▄▄▄▄▖";
+    let (row, mut col) = frame
+        .find_text(WHALE_BACK)
+        .unwrap_or_else(|| panic!("idle BlueWhale silhouette missing:\n{}", frame.debug_dump()));
+    WHALE_BACK
+        .chars()
+        .filter_map(|ch| {
+            let color = frame.colors_at(row, col).map(|colors| colors.0);
+            col = col.saturating_add(
+                u16::try_from(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1)).unwrap_or(1),
+            );
+            color
+        })
+        .collect()
+}
+
+fn colored_foreground(frame: &qa_harness::Frame, needle: &str) -> vt100::Color {
+    let (row, col) = frame
+        .find_text(needle)
+        .unwrap_or_else(|| panic!("{needle:?} missing:\n{}", frame.debug_dump()));
+    let foreground = frame
+        .colors_at(row, col)
+        .expect("rendered text cell should have ANSI colors")
+        .0;
+    assert_ne!(
+        foreground,
+        vt100::Color::Default,
+        "{needle:?} lost its semantic foreground:\n{}",
+        frame.debug_dump()
+    );
+    foreground
+}
+
+fn phase_marker_for_label(frame: &qa_harness::Frame, label: &str) -> char {
+    let row = visible_row_with_text(frame, label)
+        .unwrap_or_else(|| panic!("phase {label:?} missing:\n{}", frame.debug_dump()));
+    frame
+        .row(row)
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .expect("phase row should contain a marker")
+}
+
+fn horizontal_rule_fills(frame: &qa_harness::Frame, row: u16, cols: u16) -> bool {
+    let text = frame.row(row);
+    UnicodeWidthStr::width(text.as_str()) == usize::from(cols) && text.chars().all(|ch| ch == '─')
+}
+
+/// `Harness::resize` updates the parser dimensions immediately, before the
+/// child has emitted its resized composition. Require the product's full-width
+/// header and composer rules before accepting the frame so a preserved old
+/// frame (or the clear between frames) cannot masquerade as a settled resize.
+fn resize_and_wait_for_composition<F>(
+    h: &mut Harness,
+    rows: u16,
+    cols: u16,
+    mut predicate: F,
+    timeout: Duration,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&qa_harness::Frame) -> bool,
+{
+    let already_sized = {
+        let frame = h.frame();
+        frame.rows() == rows && frame.cols() == cols
+    };
+    if !already_sized {
+        h.resize(rows, cols)?;
+    }
+    h.wait_for(
+        |frame| {
+            let full_width_rules = (0..rows)
+                .filter(|&row| horizontal_rule_fills(frame, row, cols))
+                .count();
+            frame.rows() == rows
+                && frame.cols() == cols
+                && frame.row(0).contains("cw  ")
+                && horizontal_rule_fills(frame, 1, cols)
+                && full_width_rules >= 2
+                && frame.contains(COMPOSER_READY_TEXT)
+                && predicate(frame)
+        },
+        timeout,
+    )
+}
+
+fn assert_running_tool_lifecycle_frame(
+    frame: &qa_harness::Frame,
+    cols: u16,
+    rows: u16,
+) -> (vt100::Color, vt100::Color) {
+    assert_real_pty_frame_geometry(frame, cols, rows);
+    let dump = frame.debug_dump();
+    assert!(
+        frame.row(0).contains("act"),
+        "Act missing from header:\n{dump}"
+    );
+    assert!(
+        frame.row(0).contains("Full Access"),
+        "effective Full Access missing from header:\n{dump}"
+    );
+    assert!(
+        frame.contains("Work ·"),
+        "canonical Work surface missing:\n{dump}"
+    );
+    assert!(
+        frame.contains("PTY lifecycle"),
+        "canonical Work item missing:\n{dump}"
+    );
+    assert!(
+        frame.contains("working"),
+        "statusline did not enter working:\n{dump}"
+    );
+    assert!(
+        frame.contains("run running"),
+        "real Bash card did not remain live:\n{dump}"
+    );
+    assert!(
+        frame.find_text("▗▄▄▄▄▄▄▄▄▄▄▄▖").is_none(),
+        "idle BlueWhale should yield to functional transcript activity:\n{dump}"
+    );
+    let tool_row = visible_row_with_text(frame, "run running").expect("live Bash row");
+    let tool_running = foreground_at_text(frame, tool_row, "running");
+    assert_ne!(
+        tool_running,
+        vt100::Color::Default,
+        "Bash running state lost its semantic foreground:\n{dump}"
+    );
+    (colored_foreground(frame, "working"), tool_running)
+}
+
 enum ScrollDir {
     Up,
     Down,
@@ -1879,6 +2218,34 @@ fn scroll_until(h: &mut Harness, dir: ScrollDir, needle: &str) -> bool {
         }
         let _ = h.wait_for_idle(Duration::from_millis(60), Duration::from_millis(400));
         if h.frame().contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Motion-enabled companion to [`scroll_until`]. The underwater field keeps
+/// emitting real frames while browsing history, so "no PTY bytes arrived" is
+/// not a valid settle signal. Poll the desired rendered state directly after
+/// each bounded input instead.
+fn scroll_until_with_motion(h: &mut Harness, dir: ScrollDir, needle: &str) -> bool {
+    if h.frame().contains(needle) {
+        return true;
+    }
+    for _ in 0..50 {
+        match dir {
+            ScrollDir::Up => {
+                let _ = h.send(keys::key::page_up());
+                let _ = h.send(keys::mouse::wheel_up(10, 10));
+            }
+            ScrollDir::Down => {
+                let _ = h.send(keys::mouse::wheel_down(10, 10));
+                let _ = h.send(keys::mouse::wheel_down(10, 10));
+            }
+        }
+        if h.wait_for(|frame| frame.contains(needle), Duration::from_millis(160))
+            .is_ok()
+        {
             return true;
         }
     }
@@ -1974,5 +2341,307 @@ fn long_output_scrolls_and_restores_follow_tail() -> anyhow::Result<()> {
 
     let _ = h.shutdown();
     server.join().expect("scroll fixture server thread");
+    Ok(())
+}
+
+/// #2886: drive the actual shipped TUI through a Unix PTY and a sealed
+/// provider fixture. The first real tool establishes canonical To-do/Work;
+/// the second is a real Bash process held live by a workspace sentinel so the
+/// running card and statusline can be inspected without a timing race.
+/// Captures, when requested, are parsed PTY frames emitted by the product.
+#[test]
+fn real_tool_lifecycle_crosses_work_status_resize_and_scroll_in_a_unix_pty() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+    const RELEASE_SIGNAL: &str = "pty-tool-release.signal";
+
+    let mut answer_lines = vec!["PTY-LIFECYCLE-HEAD".to_string()];
+    for line in 1..=72 {
+        answer_lines.push(format!("PTY-LIFECYCLE-LINE-{line:03}"));
+    }
+    answer_lines.push("PTY-LIFECYCLE-TAIL".to_string());
+    let (base_url, server) =
+        spawn_tool_lifecycle_screen_fixture(RELEASE_SIGNAL, answer_lines.join("\n"))?;
+
+    let ws = make_sealed_workspace()?;
+    let codewhale_home = ws.home().join(".codewhale");
+    let codex_home = ws.home().join(".codex");
+    std::fs::create_dir_all(&codex_home)?;
+    std::fs::write(
+        codewhale_home.join("config.toml"),
+        "allow_shell = true\nreasoning_effort = \"low\"\n\n[retry]\nenabled = false\n\n[update]\ncheck_for_updates = false\n",
+    )?;
+    std::fs::write(
+        codewhale_home.join("settings.toml"),
+        "theme = \"dark\"\nlocale = \"en\"\ndefault_mode = \"agent\"\npermission_posture = \"full-access\"\nlow_motion = false\nfancy_animations = true\ncomposer_border = true\n",
+    )?;
+    std::fs::write(
+        codex_home.join("models_cache.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "fetched_at": chrono::Utc::now(),
+            "models": [{"slug": "deepseek-v4-pro", "priority": 1}]
+        }))?,
+    )?;
+
+    let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(ws.workspace())
+        .clear_env()
+        .seal_home(ws.home())
+        .env("CODEWHALE_HOME", codewhale_home.to_string_lossy())
+        .env(
+            "DEEPSEEK_CONFIG_PATH",
+            codewhale_home.join("config.toml").to_string_lossy(),
+        )
+        .env("CODEX_HOME", codex_home.to_string_lossy())
+        .env("CODEWHALE_PROVIDER", "deepseek")
+        .env("DEEPSEEK_API_KEY", "deepseek-local-test-key")
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("CODEWHALE_BASE_URL", &base_url)
+        .env("DEEPSEEK_MODEL", "deepseek-v4-pro")
+        .env("CODEWHALE_MODEL", "deepseek-v4-pro")
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            ws.workspace().to_str().expect("utf-8 workspace path"),
+            "--no-project-config",
+            "--skip-onboarding",
+            "--mouse-capture",
+            "--yolo",
+        ])
+        .size(24, 80)
+        .spawn()?;
+    enter_launch_session(&mut h)?;
+
+    // The authored BlueWhale is part of the real idle composition, with ANSI
+    // ink emitted by the terminal renderer. Its text silhouette is stable;
+    // the opt-in caustic shimmer changes cell colors without moving the mark.
+    let initial_whale = whale_ansi_signature(h.frame());
+    assert!(
+        initial_whale
+            .iter()
+            .any(|color| *color != vt100::Color::Default),
+        "idle BlueWhale lost its ANSI ink:\n{}",
+        h.frame().debug_dump()
+    );
+    let shimmer_deadline = Instant::now() + Duration::from_secs(5);
+    let mut shimmer_observed = false;
+    while Instant::now() < shimmer_deadline {
+        std::thread::sleep(Duration::from_millis(80));
+        h.pump();
+        if whale_ansi_signature(h.frame()) != initial_whale {
+            shimmer_observed = true;
+            break;
+        }
+    }
+    assert!(
+        shimmer_observed,
+        "animated idle BlueWhale never changed ANSI cells:\n{}",
+        h.frame().debug_dump()
+    );
+
+    for (cols, rows) in [(80_u16, 24_u16), (100, 30), (140, 40)] {
+        resize_and_wait_for_composition(
+            &mut h,
+            rows,
+            cols,
+            |frame| {
+                frame.rows() == rows
+                    && frame.cols() == cols
+                    && frame.find_text("▗▄▄▄▄▄▄▄▄▄▄▄▖").is_some()
+            },
+            KEY_TIMEOUT,
+        )?;
+        let frame = h.frame();
+        assert_real_pty_frame_geometry(frame, cols, rows);
+        assert_empty_state_hierarchy(frame, false);
+        assert!(
+            whale_ansi_signature(frame)
+                .iter()
+                .any(|color| *color != vt100::Color::Default),
+            "BlueWhale ANSI ink missing at {cols}x{rows}:\n{}",
+            frame.debug_dump()
+        );
+        write_real_pty_evidence(
+            &format!("tool-lifecycle-idle-{cols}x{rows}"),
+            &format!(
+                "size={cols}x{rows}\nphase=idle\nreal_pty=true\nprovider=loopback\nbluewhale=true"
+            ),
+            frame,
+        )?;
+    }
+
+    resize_and_wait_for_composition(
+        &mut h,
+        24,
+        80,
+        |frame| frame.rows() == 24 && frame.cols() == 80,
+        KEY_TIMEOUT,
+    )?;
+    let prompt = "exercise the real PTY tool lifecycle";
+    h.paste(prompt)?;
+    h.wait_for_text(prompt, KEY_TIMEOUT)?;
+    std::thread::sleep(Duration::from_millis(180));
+    h.pump();
+    h.send(keys::key::enter())?;
+    h.wait_for(
+        |frame| {
+            frame.contains("working")
+                && frame.contains("run running")
+                && frame.contains("PTY lifecycle")
+        },
+        Duration::from_secs(15),
+    )?;
+
+    // Working liveness belongs to the phase strip once transcript activity
+    // replaces the idle BlueWhale. Prove the actual emitted marker advances;
+    // do not relabel the decorative idle silhouette as a running tool row.
+    let initial_working_marker = phase_marker_for_label(h.frame(), "working");
+    let marker_deadline = Instant::now() + Duration::from_secs(2);
+    let mut working_marker_moved = false;
+    while Instant::now() < marker_deadline {
+        std::thread::sleep(Duration::from_millis(80));
+        h.pump();
+        if phase_marker_for_label(h.frame(), "working") != initial_working_marker {
+            working_marker_moved = true;
+            break;
+        }
+    }
+    assert!(
+        working_marker_moved,
+        "working phase marker never advanced in the real PTY:\n{}",
+        h.frame().debug_dump()
+    );
+
+    let mut live_colors = None;
+    for (cols, rows) in [(80_u16, 24_u16), (100, 30), (140, 40)] {
+        resize_and_wait_for_composition(
+            &mut h,
+            rows,
+            cols,
+            |frame| {
+                frame.rows() == rows
+                    && frame.cols() == cols
+                    && frame.contains("working")
+                    && frame.contains("run running")
+                    && frame.contains("PTY lifecycle")
+            },
+            KEY_TIMEOUT,
+        )?;
+        let frame = h.frame();
+        let colors = assert_running_tool_lifecycle_frame(frame, cols, rows);
+        if let Some(expected) = live_colors {
+            assert_eq!(
+                colors,
+                expected,
+                "working/tool ANSI roles changed at {cols}x{rows}:\n{}",
+                frame.debug_dump()
+            );
+        } else {
+            live_colors = Some(colors);
+        }
+        write_real_pty_evidence(
+            &format!("tool-lifecycle-running-{cols}x{rows}"),
+            &format!("size={cols}x{rows}\nphase=working\nreal_tool=Bash\nwork_surface=Work"),
+            frame,
+        )?;
+    }
+
+    // Release the real shell process only after every live-size assertion.
+    std::fs::write(ws.workspace().join(RELEASE_SIGNAL), "release\n")?;
+    h.wait_for_text("PTY-LIFECYCLE-TAIL", Duration::from_secs(20))?;
+    h.wait_for(
+        |frame| frame.contains("✓ done") && !frame.contains("run running"),
+        Duration::from_secs(10),
+    )?;
+    {
+        let frame = h.frame();
+        let dump = frame.debug_dump();
+        assert_real_pty_frame_geometry(frame, 140, 40);
+        assert!(
+            frame.contains("PTY-LIFECYCLE-TAIL"),
+            "tail not followed:\n{dump}"
+        );
+        assert!(
+            !frame.contains("PTY-LIFECYCLE-HEAD"),
+            "long settled transcript did not exceed the viewport:\n{dump}"
+        );
+        assert!(
+            frame.contains("Work ·"),
+            "Work vanished after settlement:\n{dump}"
+        );
+        let done_row = visible_row_with_text(frame, "✓ done").expect("done phase row");
+        let done_color = foreground_at_text(frame, done_row, "done");
+        assert_ne!(done_color, vt100::Color::Default, "done lost ANSI role");
+        assert_ne!(
+            done_color,
+            live_colors.expect("live colors").0,
+            "done and working collapsed to one ANSI role"
+        );
+        write_real_pty_evidence(
+            "tool-lifecycle-settled-140x40",
+            "size=140x40\nphase=done\ntranscript=settled\nfollow_tail=true",
+            frame,
+        )?;
+    }
+
+    assert!(
+        scroll_until_with_motion(&mut h, ScrollDir::Up, "PTY-LIFECYCLE-HEAD"),
+        "settled transcript head is not reviewable at 140x40:\n{}",
+        h.frame().debug_dump()
+    );
+    for (cols, rows) in [(100_u16, 30_u16), (80, 24)] {
+        resize_and_wait_for_composition(
+            &mut h,
+            rows,
+            cols,
+            |frame| frame.rows() == rows && frame.cols() == cols,
+            KEY_TIMEOUT,
+        )?;
+        assert!(
+            h.frame().contains("PTY-LIFECYCLE-HEAD")
+                || scroll_until_with_motion(&mut h, ScrollDir::Up, "PTY-LIFECYCLE-HEAD"),
+            "transcript head was lost after reflow to {cols}x{rows}:\n{}",
+            h.frame().debug_dump()
+        );
+        assert_real_pty_frame_geometry(h.frame(), cols, rows);
+    }
+    assert!(
+        scroll_until_with_motion(&mut h, ScrollDir::Up, "run done"),
+        "settled real Bash card is not retained in the transcript:\n{}",
+        h.frame().debug_dump()
+    );
+    assert!(
+        !h.frame().contains("run running"),
+        "settled Bash card reverted to live state:\n{}",
+        h.frame().debug_dump()
+    );
+    assert!(
+        scroll_until_with_motion(&mut h, ScrollDir::Down, "PTY-LIFECYCLE-TAIL"),
+        "follow-tail is not restorable at 80x24:\n{}",
+        h.frame().debug_dump()
+    );
+
+    for (cols, rows) in [(100_u16, 30_u16), (140, 40)] {
+        resize_and_wait_for_composition(
+            &mut h,
+            rows,
+            cols,
+            |frame| frame.rows() == rows && frame.cols() == cols,
+            KEY_TIMEOUT,
+        )?;
+        assert!(
+            h.frame().contains("PTY-LIFECYCLE-TAIL")
+                || scroll_until_with_motion(&mut h, ScrollDir::Down, "PTY-LIFECYCLE-TAIL"),
+            "follow-tail was lost after reflow to {cols}x{rows}:\n{}",
+            h.frame().debug_dump()
+        );
+        let frame = h.frame();
+        assert_real_pty_frame_geometry(frame, cols, rows);
+        assert!(frame.contains("Work ·"), "Work missing at {cols}x{rows}");
+    }
+
+    let _ = h.shutdown();
+    server
+        .join()
+        .expect("tool lifecycle fixture server thread")?;
     Ok(())
 }
