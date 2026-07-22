@@ -644,6 +644,49 @@ pub const MATRIX_UI_THEME: UiTheme = UiTheme {
     tool_failed: Color::Rgb(0xb4, 0, 0),
 };
 
+pub const UWU_UI_THEME: UiTheme = UiTheme {
+    name: "uwu",
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Rgb(0x16, 0x12, 0x1c),
+    panel_bg: Color::Rgb(0x1f, 0x18, 0x28),
+    elevated_bg: Color::Rgb(0x2c, 0x22, 0x38),
+    composer_bg: Color::Rgb(0x1f, 0x18, 0x28),
+    selection_bg: Color::Rgb(0x3d, 0x2e, 0x4e),
+    header_bg: Color::Rgb(0x12, 0x0e, 0x18),
+    footer_bg: Color::Rgb(0x12, 0x0e, 0x18),
+    text_dim: Color::Rgb(0x6e, 0x60, 0x7a),
+    text_hint: Color::Rgb(0x8a, 0x7c, 0x98),
+    text_muted: Color::Rgb(0xb8, 0xaa, 0xc8),
+    text_body: Color::Rgb(0xf7, 0xf0, 0xf8),
+    text_soft: Color::Rgb(0xe8, 0xdc, 0xee),
+    border: Color::Rgb(0x4a, 0x3a, 0x5c),
+    accent_primary: Color::Rgb(0xff, 0x9e, 0xcd),
+    accent_secondary: Color::Rgb(0x9a, 0xec, 0xe0),
+    accent_action: Color::Rgb(0xff, 0xd6, 0x9a),
+    error_fg: Color::Rgb(0xff, 0x6b, 0x8a),
+    error_hover: Color::Rgb(0xff, 0x8f, 0xa8),
+    error_surface: Color::Rgb(0x3a, 0x18, 0x28),
+    error_border: Color::Rgb(0xff, 0x6b, 0x8a),
+    error_text: Color::Rgb(0xff, 0xc8, 0xd6),
+    warning: Color::Rgb(0xff, 0xe0, 0x8a),
+    success: Color::Rgb(0x9a, 0xef, 0xc0),
+    info: Color::Rgb(0xb8, 0xc8, 0xff),
+    mode_agent: Color::Rgb(0xc4, 0xa8, 0xff),
+    mode_yolo: Color::Rgb(0xff, 0x55, 0x77),
+    mode_plan: Color::Rgb(0xff, 0xb4, 0xe8),
+    mode_operate: Color::Rgb(0x8a, 0xd4, 0xff),
+    status_ready: Color::Rgb(0x8a, 0x7c, 0x98),
+    status_working: Color::Rgb(0x9a, 0xec, 0xe0),
+    status_warning: Color::Rgb(0xff, 0xe0, 0x8a),
+    diff_added_fg: Color::Rgb(0x9a, 0xef, 0xc0),
+    diff_deleted_fg: Color::Rgb(0xff, 0x6b, 0x8a),
+    diff_added_bg: Color::Rgb(0x1a, 0x2a, 0x24),
+    diff_deleted_bg: Color::Rgb(0x3a, 0x18, 0x28),
+    tool_running: Color::Rgb(0x9a, 0xec, 0xe0),
+    tool_success: Color::Rgb(0x8a, 0x7c, 0x98),
+    tool_failed: Color::Rgb(0xff, 0x6b, 0x8a),
+};
+
 /// Stable identifiers for the named themes the user can select. `System`
 /// defers to `PaletteMode::detect()` (terminal-driven dark/light). Each
 /// dark/light id resolves to a single fixed `UiTheme`.
@@ -661,6 +704,7 @@ pub enum ThemeId {
     Claude,
     Matrix,
     SolarizedLight,
+    Uwu,
 }
 
 impl ThemeId {
@@ -682,6 +726,7 @@ impl ThemeId {
             "claude" => Some(Self::Claude),
             "matrix" => Some(Self::Matrix),
             "solarized-light" => Some(Self::SolarizedLight),
+            "uwu" => Some(Self::Uwu),
             _ => None,
         }
     }
@@ -703,6 +748,7 @@ impl ThemeId {
             Self::Claude => "claude",
             Self::Matrix => "matrix",
             Self::SolarizedLight => "solarized-light",
+            Self::Uwu => "uwu",
         }
     }
 
@@ -722,6 +768,7 @@ impl ThemeId {
             Self::Claude => "Claude",
             Self::Matrix => "Matrix",
             Self::SolarizedLight => "Solarized Light",
+            Self::Uwu => "Uwu",
         }
     }
 
@@ -743,6 +790,7 @@ impl ThemeId {
             Self::SolarizedLight => {
                 "Solarized light — Light, calming palette on warm ivory — easy on the eyes"
             }
+            Self::Uwu => "Soft kawaii night — sakura, mint, and peach",
         }
     }
 
@@ -765,6 +813,7 @@ impl ThemeId {
             Self::Claude => CLAUDE_UI_THEME,
             Self::Matrix => MATRIX_UI_THEME,
             Self::SolarizedLight => SOLARIZED_LIGHT_UI_THEME,
+            Self::Uwu => UWU_UI_THEME,
         }
     }
 }
@@ -783,6 +832,7 @@ pub const SELECTABLE_THEMES: &[ThemeId] = &[
     ThemeId::Claude,
     ThemeId::Matrix,
     ThemeId::SolarizedLight,
+    ThemeId::Uwu,
 ];
 
 impl UiTheme {
@@ -831,6 +881,7 @@ pub fn normalize_theme_name(value: &str) -> Option<&'static str> {
         "claude" => Some("claude"),
         "matrix" | "hacker" => Some("matrix"),
         "solarized-light" | "solarized" => Some("solarized-light"),
+        "uwu" | "owo" | "kawaii" => Some("uwu"),
         _ => None,
     }
 }
@@ -905,10 +956,13 @@ mod tests {
                 "claude",
                 "matrix",
                 "solarized-light",
+                "uwu",
             ]
         );
         assert_eq!(normalize_theme_name("default"), Some("system"));
         assert_eq!(normalize_theme_name("whale"), Some("dark"));
+        assert_eq!(normalize_theme_name("owo"), Some("uwu"));
+        assert_eq!(normalize_theme_name("kawaii"), Some("uwu"));
     }
 
     #[test]

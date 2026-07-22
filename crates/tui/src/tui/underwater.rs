@@ -281,6 +281,14 @@ const IDLE_WHALE_ROWS: [&str; 3] = [
     " ▐██·███████████▙━━━━▞",
     "  ▝▀▀▀▀▀▀▀▀▀▀▀▀▘",
 ];
+
+const UWU_IDLE_WHALE_SPOUT_ROW: &str = "   ˚✦";
+const UWU_IDLE_WHALE_ROWS: [&str; 3] = [
+    " ▗▄▄▄▄▄▄▄▄▄▄▄▖    ▚▞",
+    "▐█░·░█████████▙▄▄▞",
+    " ▝▀▀▀▀▀▀▀▀▀▀▀▘",
+];
+
 const IDLE_SHIMMER_CYCLE_MS: u128 = 4_000;
 const IDLE_SHIMMER_SWEEP_FRACTION: f32 = 0.32;
 const IDLE_SHIMMER_BAND_HALF_WIDTH: f32 = 0.38;
@@ -1003,6 +1011,26 @@ fn idle_mark_color(base: Color, highlight: Color, opacity: f32) -> Color {
     }
 }
 
+fn idle_whale_is_uwu(app: &App) -> bool {
+    app.ui_theme.name == "uwu"
+}
+
+fn idle_whale_spout_row(app: &App) -> &'static str {
+    if idle_whale_is_uwu(app) {
+        UWU_IDLE_WHALE_SPOUT_ROW
+    } else {
+        IDLE_WHALE_SPOUT_ROW
+    }
+}
+
+fn idle_whale_rows(app: &App) -> [&'static str; 3] {
+    if idle_whale_is_uwu(app) {
+        UWU_IDLE_WHALE_ROWS
+    } else {
+        IDLE_WHALE_ROWS
+    }
+}
+
 fn idle_whale_row_spans(
     text: &'static str,
     row: usize,
@@ -1024,7 +1052,8 @@ fn idle_whale_row_spans(
 
     for (column, ch) in text.chars().enumerate() {
         let diagonal = (column as f32 + (rows - 1.0 - row as f32)) / (cols + rows);
-        let color = if ch == '·' {
+        let color = if matches!(ch, '·' | '░' | '✦') {
+            // Soft uwu blush/sparkle use the eye/sakura channel; classic only has ·.
             eye
         } else if animated {
             idle_mark_color(
@@ -1054,11 +1083,17 @@ fn idle_whale_row_spans(
 
 #[must_use]
 fn idle_whale_block_width() -> usize {
-    std::iter::once(IDLE_WHALE_SPOUT_ROW)
+    let classic = std::iter::once(IDLE_WHALE_SPOUT_ROW)
         .chain(IDLE_WHALE_ROWS.iter().copied())
         .map(UnicodeWidthStr::width)
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let uwu = std::iter::once(UWU_IDLE_WHALE_SPOUT_ROW)
+        .chain(UWU_IDLE_WHALE_ROWS.iter().copied())
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
+    classic.max(uwu)
 }
 
 pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
@@ -1071,11 +1106,19 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     if empty_state_mark_visible(area) {
         let animated = idle_mark_animation_enabled(app);
         let elapsed_ms = app.ocean_started_at.elapsed().as_millis();
+        let spout = idle_whale_spout_row(app);
+        let rows = idle_whale_rows(app);
         let mut mark = vec![vec![Span::styled(
-            IDLE_WHALE_SPOUT_ROW,
+            spout,
             Style::default().fg(app.ui_theme.accent_secondary),
         )]];
-        mark.extend(IDLE_WHALE_ROWS.iter().enumerate().map(|(row, text)| {
+        // Soft uwu: sakura blush/sparkle glyphs; classic keeps body peach + text eye.
+        let highlight = if idle_whale_is_uwu(app) {
+            app.ui_theme.accent_primary
+        } else {
+            app.ui_theme.text_body
+        };
+        mark.extend(rows.iter().enumerate().map(|(row, text)| {
             idle_whale_row_spans(
                 text,
                 row,
@@ -1083,7 +1126,7 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
                 animated,
                 app.ui_theme.accent_action,
                 app.ui_theme.text_body,
-                app.ui_theme.text_body,
+                highlight,
             )
         }));
         // The spout, head, belly, peduncle, and flukes are one drawing. Give

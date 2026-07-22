@@ -211,6 +211,7 @@ pub enum UiThemeValue {
     Dracula,
     GruvboxDark,
     Matrix,
+    Uwu,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -896,6 +897,7 @@ impl UiThemeValue {
             Self::Dracula => "dracula",
             Self::GruvboxDark => "gruvbox-dark",
             Self::Matrix => "matrix",
+            Self::Uwu => "uwu",
         }
     }
 
@@ -1461,7 +1463,8 @@ background_color = "#1A1B26"
                 "tokyo-night",
                 "dracula",
                 "gruvbox-dark",
-                "matrix"
+                "matrix",
+                "uwu"
             ])
         );
     }
