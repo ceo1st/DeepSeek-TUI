@@ -390,8 +390,9 @@ impl SkillsManagerView {
             };
             let mark = if selected { "›" } else { " " };
             let line = format!(
-                "{mark} {}  {}  {}",
-                truncate_view_text(&skill.name, 22),
+                "{mark} {:<6} {}  {}  {}",
+                skill_tier_label(skill),
+                truncate_view_text(&skill.name, 15),
                 precedence_label(&skill.precedence),
                 source_label(skill.source_kind),
             );
@@ -431,6 +432,7 @@ impl SkillsManagerView {
             )),
             Line::from(""),
             kv_line("Path", &skill.safe_display_path),
+            kv_line("Tier", skill_tier_label(skill)),
             kv_line("Source", source_label(skill.source_kind)),
             kv_line("Status", &precedence_label(&skill.precedence)),
             kv_line("Integrity", integrity_label(&skill.integrity)),
@@ -546,6 +548,14 @@ fn source_label(kind: SkillSourceKind) -> &'static str {
         SkillSourceKind::ReviewedPluginSnapshot => "plugin",
         SkillSourceKind::RegistryCache => "cache",
     }
+}
+
+fn skill_tier_label(skill: &AuditedSkill) -> &'static str {
+    if skill.source_kind != SkillSourceKind::BuiltIn {
+        return "custom";
+    }
+    crate::skills::bundled_skill_tier(&skill.name)
+        .map_or("custom", crate::skills::BundledSkillTier::label)
 }
 
 fn precedence_label(state: &PrecedenceState) -> String {
@@ -904,6 +914,37 @@ mod tests {
             }
         }
         assert!(found, "expected Skills title on 80x24 surface");
+    }
+
+    #[test]
+    fn manager_labels_exact_built_ins_by_tier_and_user_skills_as_custom() {
+        let tmp = TempDir::new().unwrap();
+        let _home = IsolatedHome::new(&tmp);
+        let mut app = app_in(&tmp);
+        app.skills_dir = tmp.path().join("home").join(".codewhale").join("skills");
+        crate::skills::install_system_skills(&app.skills_dir).unwrap();
+        write_skill_pkg(&app.skills_dir.join("my-workflow"), "my-workflow", "mine");
+
+        let view = SkillsManagerView::new(&app);
+        let best = view
+            .skills
+            .iter()
+            .find(|skill| skill.name == "best-of-n")
+            .expect("best-of-n row");
+        let pdf = view
+            .skills
+            .iter()
+            .find(|skill| skill.name == "pdf")
+            .expect("pdf row");
+        let custom = view
+            .skills
+            .iter()
+            .find(|skill| skill.name == "my-workflow")
+            .expect("custom row");
+
+        assert_eq!(skill_tier_label(best), "core");
+        assert_eq!(skill_tier_label(pdf), "tools");
+        assert_eq!(skill_tier_label(custom), "custom");
     }
 
     #[test]

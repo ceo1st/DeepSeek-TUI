@@ -247,11 +247,8 @@ fn list_skills(app: &mut App, arg: Option<&str>) -> CommandResult {
             let _ = writeln!(output, "  /{} - {}", skill.name, skill.description);
         }
     } else {
-        // Unfiltered view: partition into user-created and built-in so a
-        // workspace skill at the top of the list isn't pushed off-screen
-        // by 10+ bundled descriptions. User skills always render with
-        // their full description; bundled skills render compactly when
-        // numerous so the whole menu fits in a typical terminal viewport.
+        // Unfiltered view: keep user-created skills prominent, then split the
+        // shipped catalog into its two curated product tiers.
         let (user_skills, bundled_skills): (
             Vec<&&crate::skills::Skill>,
             Vec<&&crate::skills::Skill>,
@@ -270,24 +267,39 @@ fn list_skills(app: &mut App, arg: Option<&str>) -> CommandResult {
         }
 
         if !bundled_skills.is_empty() {
-            let _ = writeln!(output, "Built-in skills ({}):", bundled_skills.len());
-            // When there are user skills to surface, keep built-ins compact
-            // (single-line names list) so they never crowd the viewport.
-            // When there are no user skills, render full descriptions —
-            // there is nothing else competing for space and the user is
-            // likely getting their first look at the catalog.
-            if user_skills.is_empty() {
-                for skill in &bundled_skills {
-                    let _ = writeln!(output, "  /{} - {}", skill.name, skill.description);
+            use crate::skills::{BundledSkillTier, bundled_skill_tier};
+
+            let (core, tooling): (Vec<&&crate::skills::Skill>, Vec<&&crate::skills::Skill>) =
+                bundled_skills.into_iter().partition(|skill| {
+                    bundled_skill_tier(&skill.name) == Some(BundledSkillTier::CoreAgentic)
+                });
+            for (group_idx, (tier, skills)) in [
+                (BundledSkillTier::CoreAgentic, core),
+                (BundledSkillTier::FormatTooling, tooling),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if skills.is_empty() {
+                    continue;
                 }
-            } else {
-                let names: Vec<String> = bundled_skills
-                    .iter()
-                    .map(|s| format!("/{}", s.name))
-                    .collect();
-                output.push_str("  ");
-                output.push_str(&names.join(", "));
-                output.push('\n');
+                if group_idx > 0 {
+                    output.push('\n');
+                }
+                let _ = writeln!(output, "{} ({}):", tier.heading(), skills.len());
+                if user_skills.is_empty() {
+                    for skill in skills {
+                        let _ = writeln!(output, "  /{} - {}", skill.name, skill.description);
+                    }
+                } else {
+                    let names: Vec<String> = skills
+                        .iter()
+                        .map(|skill| format!("/{}", skill.name))
+                        .collect();
+                    let _ = writeln!(output, "  {}", names.join(", "));
+                }
+            }
+            if !user_skills.is_empty() {
                 output.push_str("  (run /skills <name> for details on a built-in)\n");
             }
         }
@@ -1276,6 +1288,27 @@ mod tests {
         // Each entry on its own line with the description inline.
         assert!(msg.contains("/alpha-skill - First skill"), "got: {msg}");
         assert!(msg.contains("/beta-skill - Second skill"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_list_skills_tiers_bundled_catalog_and_omits_false_image_capability() {
+        let tmpdir = TempDir::new().unwrap();
+        let _home = IsolatedHome::new(&tmpdir);
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+        crate::skills::install_system_skills(&app.skills_dir).unwrap();
+
+        let result = list_skills(&mut app, Some(""));
+        let msg = result.message.unwrap();
+        let core = msg.find("Core agentic").expect("core tier");
+        let best = msg.find("/best-of-n").expect("best-of-n skill");
+        let tooling = msg.find("Format & tooling").expect("tooling tier");
+        let pdf = msg.find("/pdf").expect("pdf skill");
+
+        assert!(core < best && best < tooling && tooling < pdf, "got: {msg}");
+        assert!(
+            !msg.contains("/imagine"),
+            "catalog must not advertise an unavailable image-generation tool: {msg}"
+        );
     }
 
     #[test]

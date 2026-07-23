@@ -92,6 +92,22 @@ The view never calls install helpers or touches the filesystem. It emits a
 mutation request; the host runs the controller, shows a receipt, and rebuilds
 the inventory.
 
+## Bundled catalog tiers
+
+Codewhale presents its shipped skills in two compact tiers so agentic workflows
+are not buried under document and integration helpers:
+
+- **Core agentic** — planning, implementation, debugging, review, verification,
+  delegation, Fleet, release, and `best-of-n` comparison workflows.
+- **Format & tooling** — document formats, data visualization, frontend and web
+  testing, and skill/plugin/MCP authoring helpers.
+
+Workspace, user, and compatible-harness skills stay labeled **custom**; Codewhale
+does not guess their intent from their name. The shipped pack also does not
+advertise capabilities the runtime lacks. In particular, image understanding
+is available, but an image-generation skill is not bundled until a real
+image-generation tool exists.
+
 ## Audit statuses
 
 Each audited row carries precedence and relationship flags:

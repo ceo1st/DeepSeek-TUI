@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 /// Bundled catalog generation for the default CodeWhale skill pack (#4691).
-const BUNDLED_SKILL_VERSION: &str = "5";
+const BUNDLED_SKILL_VERSION: &str = "6";
 
 // ── system & extension (meta) ───────────────────────────────────────────────
 const SKILL_CREATOR_BODY: &str = include_str!("../../assets/skills/skill-creator/SKILL.md");
@@ -16,6 +16,7 @@ const MCP_BUILDER_BODY: &str = include_str!("../../assets/skills/mcp-builder/SKI
 const FLEET_MANAGER_BODY: &str = include_str!("../../assets/skills/fleet-manager/SKILL.md");
 
 // ── end-user workflows ──────────────────────────────────────────────────────
+const BEST_OF_N_BODY: &str = include_str!("../../assets/skills/best-of-n/SKILL.md");
 const INTERVIEW_BODY: &str = include_str!("../../assets/skills/interview/SKILL.md");
 const PLAN_BODY: &str = include_str!("../../assets/skills/plan/SKILL.md");
 const IMPLEMENT_BODY: &str = include_str!("../../assets/skills/implement/SKILL.md");
@@ -89,7 +90,12 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
         body: FLEET_MANAGER_BODY,
         introduced_in: 4,
     },
-    // End-user workflows (v5)
+    // End-user workflows
+    BundledSkill {
+        name: "best-of-n",
+        body: BEST_OF_N_BODY,
+        introduced_in: 6,
+    },
     BundledSkill {
         name: "interview",
         body: INTERVIEW_BODY,
@@ -213,6 +219,52 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
         introduced_in: 5,
     },
 ];
+
+/// Product-facing grouping for the bundled catalog.
+///
+/// User and compatible skills remain outside these two buckets. The grouping
+/// is deliberately attached to the shipped catalog instead of inferred from
+/// arbitrary community metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BundledSkillTier {
+    CoreAgentic,
+    FormatTooling,
+}
+
+impl BundledSkillTier {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CoreAgentic => "core",
+            Self::FormatTooling => "tools",
+        }
+    }
+
+    #[must_use]
+    pub const fn heading(self) -> &'static str {
+        match self {
+            Self::CoreAgentic => "Core agentic",
+            Self::FormatTooling => "Format & tooling",
+        }
+    }
+}
+
+/// Return the curated tier for a bundled skill name.
+#[must_use]
+pub fn bundled_skill_tier(name: &str) -> Option<BundledSkillTier> {
+    if !is_bundled_skill_name(name) {
+        return None;
+    }
+    let tier = match name {
+        "skill-creator" | "plugin-creator" | "skill-installer" | "mcp-builder"
+        | "frontend-design" | "webapp-testing" | "document" | "dataviz" | "docx" | "pdf"
+        | "pptx" | "xlsx" | "documents" | "presentations" | "spreadsheets" => {
+            BundledSkillTier::FormatTooling
+        }
+        _ => BundledSkillTier::CoreAgentic,
+    };
+    Some(tier)
+}
 
 /// Legacy v4-best-practices body digest helper (not in BUNDLED_SKILLS).
 fn v4_best_practices_body() -> &'static str {
@@ -442,6 +494,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bundled_catalog_has_two_complete_truthful_tiers() {
+        for skill in BUNDLED_SKILLS {
+            assert!(
+                bundled_skill_tier(skill.name).is_some(),
+                "{} must have a picker tier",
+                skill.name
+            );
+        }
+        assert_eq!(
+            bundled_skill_tier("best-of-n"),
+            Some(BundledSkillTier::CoreAgentic)
+        );
+        assert_eq!(
+            bundled_skill_tier("pdf"),
+            Some(BundledSkillTier::FormatTooling)
+        );
+        assert_eq!(bundled_skill_tier("user-created"), None);
+        assert!(
+            !is_bundled_skill_name("imagine"),
+            "do not advertise image generation without an image-generation tool"
+        );
+    }
+
     // ── idempotence ───────────────────────────────────────────────────────────
 
     #[test]
@@ -519,7 +595,7 @@ mod tests {
     fn outdated_marker_triggers_reinstall_of_existing_skills() {
         let tmp = TempDir::new().unwrap();
         // Exact shipped bodies present with old marker: refresh is allowed and
-        // new v5 skills are added. Non-matching user content is preserved
+        // newer skills are added. Non-matching user content is preserved
         // elsewhere (see upgrade_preserves_user_modified_bundled_skill_body).
         for skill in BUNDLED_SKILLS.iter().filter(|s| s.introduced_in <= 4) {
             fs::create_dir_all(skill_dir(&tmp, skill.name)).unwrap();
@@ -574,6 +650,24 @@ mod tests {
         }
         let ver = fs::read_to_string(marker_file(&tmp)).unwrap();
         assert_eq!(ver.trim(), BUNDLED_SKILL_VERSION);
+    }
+
+    #[test]
+    fn version_bump_from_v5_adds_best_of_n_without_recreating_deleted_skills() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(marker_file(&tmp), "5").unwrap();
+
+        install_system_skills(tmp.path()).unwrap();
+
+        assert!(skill_file(&tmp, "best-of-n").is_file());
+        assert!(
+            !skill_file(&tmp, "delegate").exists(),
+            "an intentionally absent older skill must stay absent"
+        );
+        assert_eq!(
+            fs::read_to_string(marker_file(&tmp)).unwrap().trim(),
+            BUNDLED_SKILL_VERSION
+        );
     }
 
     #[test]
@@ -653,7 +747,7 @@ mod tests {
         assert!(skill_file(&tmp, "debug").exists());
         assert!(skill_file(&tmp, "docx").exists());
         assert!(skill_file(&tmp, "release").exists());
-        // Feishu is optional — not auto-installed by v5.
+        // Feishu is optional — not auto-installed by the default pack.
         assert!(
             !skill_dir(&tmp, "feishu").exists(),
             "feishu must not be universally installed"
