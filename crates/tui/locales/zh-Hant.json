@@ -116,7 +116,7 @@
     "CtxInspCacheFriendly": "快取友好",
     "CtxInspChangesByTurn": "按會話/輪次變化",
     "CtxInspStablePrefixOnly": "僅穩定前綴",
-    "CtxInspCacheTip": "提示：穩定前綴區塊符合 DeepSeek V4 前綴快取條件。易變工作集的更改僅會破壞快取尾部。",
+    "CtxInspCacheTip": "提示：當目前的提供者支援前綴快取時，穩定前綴區塊可被快取。易變工作集的更改僅會破壞快取尾部。",
     "ConfigSectionProvider": "提供商",
     "ConfigSectionModel": "模型",
     "ConfigSectionPermissions": "權限",

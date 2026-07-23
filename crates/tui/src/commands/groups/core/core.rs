@@ -4,9 +4,8 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::config::{
-    ApiProvider, COMMON_DEEPSEEK_MODELS, DEFAULT_KIMI_CODE_BASE_URL,
-    KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL, normalize_custom_model_id,
-    normalize_model_name_for_provider,
+    ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+    normalize_custom_model_id, normalize_model_name_for_provider,
 };
 use crate::localization::{Locale, MessageId, tr};
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
@@ -231,8 +230,8 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         } else {
             let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
                 return CommandResult::error(format!(
-                    "Invalid model '{name}'. Expected auto or a model for the active provider. Common DeepSeek models: {}",
-                    COMMON_DEEPSEEK_MODELS.join(", ")
+                    "Invalid model '{name}'. Expected auto or a model for the active provider ({}).",
+                    app.api_provider.as_str()
                 ));
             };
             model_id
@@ -1329,8 +1328,8 @@ mod tests {
         let msg = result.message.unwrap();
         assert!(msg.contains("Invalid model"));
         assert!(msg.contains("active provider"));
-        assert!(msg.contains("deepseek-v4-pro"));
-        assert!(msg.contains("deepseek-v4-flash"));
+        assert!(msg.contains("deepseek"));
+        assert!(!msg.contains("Common DeepSeek models"));
         assert!(result.action.is_none());
     }
 

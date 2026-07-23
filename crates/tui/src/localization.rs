@@ -472,6 +472,7 @@ pub enum MessageId {
     OnboardApiKeyPlaceholder,
     OnboardApiKeyLabel,
     OnboardApiKeyFooter,
+    OnboardApiKeyRejectedEnv,
     // Onboarding screens — workspace trust prompt.
     OnboardTrustTitle,
     OnboardTrustQuestion,
@@ -1586,6 +1587,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::OnboardApiKeyPlaceholder,
     MessageId::OnboardApiKeyLabel,
     MessageId::OnboardApiKeyFooter,
+    MessageId::OnboardApiKeyRejectedEnv,
     MessageId::OnboardTrustTitle,
     MessageId::OnboardTrustQuestion,
     MessageId::OnboardTrustLocationPrefix,

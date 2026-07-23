@@ -7782,8 +7782,17 @@ pub(crate) fn apply_engine_error_to_app(
         app.offline_mode = true;
         app.onboarding_needs_api_key = true;
         app.onboarding = OnboardingState::Provider;
+        let provider = app.api_provider;
+        let config_path = crate::config::resolve_load_config_path(app.config_path.clone())
+            .map_or_else(
+                || "~/.codewhale/config.toml".to_string(),
+                |path| path.display().to_string(),
+            );
         app.status_message = Some(
-            "The API key from DEEPSEEK_API_KEY was rejected. Paste a valid key to save it to ~/.codewhale/config.toml, or update the environment variable.".to_string(),
+            tr(app.ui_locale, MessageId::OnboardApiKeyRejectedEnv)
+                .replace("{provider}", provider.as_str())
+                .replace("{env}", &provider.env_vars_label())
+                .replace("{path}", &config_path),
         );
         return;
     }

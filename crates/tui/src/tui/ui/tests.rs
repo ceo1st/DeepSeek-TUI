@@ -15857,6 +15857,8 @@ fn non_recoverable_engine_error_enters_offline_mode() {
 fn env_only_auth_failure_reopens_provider_onboarding() {
     use crate::error_taxonomy::ErrorEnvelope;
     let mut app = create_test_app();
+    app.api_provider = crate::config::ApiProvider::Anthropic;
+    app.config_path = Some(std::path::PathBuf::from("/tmp/codewhale-phase2.toml"));
     app.api_key_env_only = true;
     app.onboarding = crate::tui::app::OnboardingState::None;
     app.onboarding_needs_api_key = false;
@@ -15879,9 +15881,12 @@ fn env_only_auth_failure_reopens_provider_onboarding() {
         .as_deref()
         .expect("auth recovery should explain the env key source");
     assert!(
-        status.contains("DEEPSEEK_API_KEY"),
-        "expected env-specific recovery hint, got {status:?}"
+        status.contains("anthropic")
+            && status.contains("ANTHROPIC_API_KEY")
+            && status.contains("/tmp/codewhale-phase2.toml"),
+        "expected active-provider/env/path recovery hint, got {status:?}"
     );
+    assert!(!status.contains("DEEPSEEK_API_KEY"), "{status}");
 }
 
 // ---- Issue #208: in-flight input routing ----
