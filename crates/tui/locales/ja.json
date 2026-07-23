@@ -227,7 +227,7 @@
     "CmdCacheHeader": "キャッシュテレメトリ — 直近 {count} / {total} ターン（モデル: {model}）\n",
     "CmdCacheNoData": "キャッシュ履歴: まだターンを記録していません。\n\nDeepSeek は対応モデル (V4 系) の各 API ターンで `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` を返します。1 ターン実行してから /cache を再度試してください。",
     "CmdCacheTotals": "Σ 入力: {sum_in}   Σ ヒット: {sum_hit}   Σ ミス: {sum_miss}   平均ヒット率: {avg}\n",
-    "CmdCostReport": "セッション費用:\n─────────────────────────────\n累計概算: {cost}\n\n費用は概算値。プロバイダの使用量テレメトリがあれば優先して使用します。\n\nDeepSeek API 料金:\n─────────────────────────────\n本 CLI には詳細な料金表は組み込まれていません。",
+    "CmdCostReport": "セッション費用:\n─────────────────────────────\n累計概算: {cost}\n\n費用は概算値。プロバイダの使用量テレメトリがあれば優先して使用します。\n\nプロバイダー API 料金:\n─────────────────────────────\n本 CLI には詳細な料金表は組み込まれていません。",
     "CmdTokensCacheBoth": "ヒット {hit} / ミス {miss}",
     "CmdTokensCacheHitOnly": "ヒット {hit} / ミスは未報告",
     "CmdTokensCacheMissOnly": "ヒットは未報告 / ミス {miss}",

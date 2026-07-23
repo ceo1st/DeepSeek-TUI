@@ -227,7 +227,7 @@
     "CmdCacheHeader": "Thông tin cache — {count} lượt gần nhất trong tổng số {total} lượt (mô hình: {model})\n",
     "CmdCacheNoData": "Lịch sử bộ nhớ đệm: chưa có lượt nào được ghi nhận.\n\n DeepSeek cung cấp `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` trên mỗi lượt API mà mô hình hỗ trợ (dòng V4). Hãy chạy một lượt và thử lại lệnh /cache.",
     "CmdCacheTotals": "Σ vào: {sum_in}   Σ hit: {sum_hit}   Σ miss: {sum_miss}   tỷ lệ hit trung bình: {avg}\n",
-    "CmdCostReport": "Chi Phí Phiên Làm Việc:\n─────────────────────────────\nTổng chi tiêu ước tính: {cost}\n\nCác ước tính chi phí mang tính xấp xỉ và sử dụng dữ liệu viễn trắc từ nhà cung cấp nếu có.\n\nBảng Giá API DeepSeek:\n─────────────────────────────\nThông tin chi tiết về giá chưa được cấu hình trong CLI này.",
+    "CmdCostReport": "Chi Phí Phiên Làm Việc:\n─────────────────────────────\nTổng chi tiêu ước tính: {cost}\n\nCác ước tính chi phí mang tính xấp xỉ và sử dụng dữ liệu viễn trắc từ nhà cung cấp nếu có.\n\nBảng giá API của nhà cung cấp:\n─────────────────────────────\nThông tin chi tiết về giá chưa được cấu hình trong CLI này.",
     "CmdTokensCacheBoth": "{hit} hit / {miss} miss",
     "CmdTokensCacheHitOnly": "{hit} hit / không báo cáo miss",
     "CmdTokensCacheMissOnly": "không báo cáo hit / {miss} miss",

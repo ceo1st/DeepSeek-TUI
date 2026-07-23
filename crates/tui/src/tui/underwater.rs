@@ -335,11 +335,11 @@ impl ShellPhase {
             }
             return Self::Working;
         }
-        if matches!(app.runtime_turn_status.as_deref(), Some("completed")) {
-            return Self::Done;
-        }
         if !app.input.is_empty() {
             return Self::Typing;
+        }
+        if matches!(app.runtime_turn_status.as_deref(), Some("completed")) {
+            return Self::Done;
         }
         Self::Idle
     }
@@ -1933,5 +1933,16 @@ mod tests {
         let (marker, label) = phase_marker(&app, ShellPhase::Done);
         assert_eq!(marker, "✓");
         assert_eq!(label, "done");
+    }
+
+    #[test]
+    fn draft_phase_beats_stale_completion_status() {
+        let mut app = test_app();
+        app.runtime_turn_status = Some("completed".to_string());
+
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Done);
+
+        app.input = "next task".to_string();
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Typing);
     }
 }

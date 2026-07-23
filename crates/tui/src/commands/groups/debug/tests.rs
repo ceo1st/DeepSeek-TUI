@@ -121,6 +121,8 @@ fn test_cost_shows_spending_info() {
     assert!(msg.contains("Approx total spent:"));
     assert!(msg.contains("approximate"));
     assert!(msg.contains("$0.1234"));
+    assert!(msg.contains("Provider API Pricing"));
+    assert!(!msg.contains("DeepSeek API Pricing"));
 }
 
 #[test]

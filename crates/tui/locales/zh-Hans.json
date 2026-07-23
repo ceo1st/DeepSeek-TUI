@@ -227,7 +227,7 @@
     "CmdCacheHeader": "缓存遥测 —— 最近 {count} / {total} 轮（模型：{model}）\n",
     "CmdCacheNoData": "缓存历史：尚未记录任何轮次。\n\nDeepSeek 在受支持的模型（V4 系列）每个 API 轮次都会返回 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`。请先运行一个轮次再试 /cache。",
     "CmdCacheTotals": "Σ 输入：{sum_in}   Σ 命中：{sum_hit}   Σ 未命中：{sum_miss}   平均命中率：{avg}\n",
-    "CmdCostReport": "会话费用：\n─────────────────────────────\n预估累计消耗：{cost}\n\n费用为估算值；如有提供方用量遥测会优先使用。\n\nDeepSeek API 计费：\n─────────────────────────────\n此 CLI 中未配置详细计费规则。",
+    "CmdCostReport": "会话费用：\n─────────────────────────────\n预估累计消耗：{cost}\n\n费用为估算值；如有提供方用量遥测会优先使用。\n\n提供商 API 计费：\n─────────────────────────────\n此 CLI 中未配置详细计费规则。",
     "CmdTokensCacheBoth": "命中 {hit} / 未命中 {miss}",
     "CmdTokensCacheHitOnly": "命中 {hit} / 未命中未上报",
     "CmdTokensCacheMissOnly": "命中未上报 / 未命中 {miss}",

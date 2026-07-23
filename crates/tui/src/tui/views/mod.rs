@@ -2428,7 +2428,7 @@ fn experimental_feature_value(effective: bool, default_enabled: bool, configured
 fn config_label_for_key(key: &str) -> String {
     let static_label = match key {
         "provider" => "Active provider",
-        "base_url" => "DeepSeek API URL",
+        "base_url" => "Provider API URL (DeepSeek route)",
         "provider_url" => "Provider API URL",
         "model" => "Active provider model",
         "fast_model" => "Fast model (derived)",
@@ -4967,6 +4967,10 @@ max_spawn_depth = 2
             .iter()
             .find(|row| row.key == "base_url")
             .expect("base_url row missing");
+        assert_eq!(
+            config_label_for_key(&row.key),
+            "Provider API URL (DeepSeek route)"
+        );
         assert_eq!(row.value, "https://ui-config-view.local/v1");
     }
 

@@ -4558,7 +4558,7 @@ fn active_tool_status_label_summarizes_live_tool_group() {
     assert!(label.contains("cargo test"));
     assert!(label.contains("1 active"));
     assert!(label.contains("1 done"));
-    assert!(label.contains(crate::tui::key_shortcuts::tool_details_shortcut_label()));
+    assert!(label.contains(crate::tui::key_shortcuts::tool_details_shortcut_label().as_ref()));
     assert!(label.contains("opens details"));
 }
 

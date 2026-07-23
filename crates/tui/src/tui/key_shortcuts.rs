@@ -7,6 +7,8 @@
 //! keeps the composer / transcript event loops in `ui.rs` short and
 //! lets us add a new platform without touching the call sites.
 
+use std::borrow::Cow;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub(super) fn has_control_like_modifier(modifiers: KeyModifiers) -> bool {
@@ -58,8 +60,8 @@ pub(super) fn is_file_tree_toggle_shortcut(key: &KeyEvent) -> bool {
     ctrl_shift_e || cmd_shift_e
 }
 
-pub(super) fn tool_details_shortcut_label() -> &'static str {
-    "v"
+pub(super) fn tool_details_shortcut_label() -> Cow<'static, str> {
+    crate::tui::shell_key_routing::tool_details_chord()
 }
 
 pub(super) fn tool_details_shortcut_action_hint(noun: &str) -> String {
@@ -267,5 +269,17 @@ mod tests {
         let plain_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(!is_select_all_shortcut(&alt_a));
         assert!(!is_select_all_shortcut(&plain_a));
+    }
+
+    #[test]
+    fn tool_details_hint_uses_the_routed_chord_not_plain_typing() {
+        let label = tool_details_shortcut_label();
+
+        assert_eq!(label, crate::tui::shell_key_routing::tool_details_chord());
+        assert_ne!(label, "v");
+        assert_eq!(
+            tool_details_shortcut_action_hint("full output"),
+            format!("{label} opens full output")
+        );
     }
 }

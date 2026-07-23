@@ -90,7 +90,8 @@ fn truncate_to_width(text: &str, width: usize) -> String {
     result
 }
 
-/// Compact working detail for the phase band: `×N · 12s`.
+/// Compact working detail for the phase band: `×N` for tools or `12s` while
+/// the model is thinking.
 /// Kept quieter than the classic footer's verbose tool-status line so the
 /// transcript owns the ledger and the strip only names the live pulse.
 fn working_detail(app: &App, activity: LiveActivity) -> Option<String> {
@@ -100,7 +101,7 @@ fn working_detail(app: &App, activity: LiveActivity) -> Option<String> {
         .map(|started| started.elapsed().as_secs());
     match (running, secs) {
         (0, Some(secs)) if secs > 0 => Some(format!("{secs}s")),
-        (n, Some(secs)) if n > 0 => Some(format!("×{n} · {secs}s")),
+        (n, Some(_)) if n > 0 => Some(format!("×{n}")),
         (n, None) if n > 0 => Some(format!("×{n}")),
         _ => None,
     }
@@ -385,7 +386,11 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("using tool"), "{text}");
-        assert!(text.contains("×1 · 12s"), "{text}");
+        assert!(text.contains("×1"), "{text}");
+        assert!(
+            !text.contains("12s"),
+            "tool elapsed time belongs to the live tool row: {text}"
+        );
         assert!(
             !text.contains("run ×1"),
             "detail repeated the tool verb: {text}"
@@ -442,6 +447,17 @@ mod tests {
         assert!(
             !text.contains("12s"),
             "compact strip leaked timing detail: {text}"
+        );
+    }
+
+    #[test]
+    fn working_band_keeps_elapsed_time_when_model_is_thinking() {
+        let mut app = test_app();
+        app.turn_started_at = Some(Instant::now() - Duration::from_secs(12));
+
+        assert_eq!(
+            working_detail(&app, LiveActivity::from_app(&app)).as_deref(),
+            Some("12s")
         );
     }
 

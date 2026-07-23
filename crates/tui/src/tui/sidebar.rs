@@ -6196,8 +6196,8 @@ mod tests {
             "repeated polling should collapse into one row: {text:?}"
         );
         assert!(
-            text.iter()
-                .any(|line| line.contains(crate::tui::key_shortcuts::tool_details_shortcut_label())),
+            text.iter().any(|line| line
+                .contains(crate::tui::key_shortcuts::tool_details_shortcut_label().as_ref())),
             "collapsed CI row should point to details: {text:?}"
         );
         assert!(

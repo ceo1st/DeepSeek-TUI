@@ -227,7 +227,7 @@
     "CmdCacheHeader": "캐시 텔레메트리 — 최근 {count}/{total}턴 (모델: {model})\n",
     "CmdCacheNoData": "캐시 기록: 아직 기록된 턴이 없습니다.\n\n DeepSeek은 모델이 지원하는 모든 API 턴(V4 계열)에서 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`를 제공합니다. 턴을 실행한 뒤 /cache를 다시 시도해보세요.",
     "CmdCacheTotals": "Σ 입력: {sum_in}   Σ 적중: {sum_hit}   Σ 실패: {sum_miss}   평균 적중률: {avg}\n",
-    "CmdCostReport": "세션 비용:\n ─────────────────────────────\n 대략적인 총 지출: {cost}\n\n 비용 추정치는 근사값이며, 가능한 경우 프로바이더의 사용량 텔레메트리를 사용합니다.\n\n DeepSeek API 요금:\n ─────────────────────────────\n 이 CLI에는 요금 정보가 설정되어 있지 않습니다.",
+    "CmdCostReport": "세션 비용:\n ─────────────────────────────\n 대략적인 총 지출: {cost}\n\n 비용 추정치는 근사값이며, 가능한 경우 프로바이더의 사용량 텔레메트리를 사용합니다.\n\n 프로바이더 API 요금:\n ─────────────────────────────\n 이 CLI에는 요금 정보가 설정되어 있지 않습니다.",
     "CmdTokensCacheBoth": "{hit} 적중 / {miss} 실패",
     "CmdTokensCacheHitOnly": "{hit} 적중 / 실패 미보고",
     "CmdTokensCacheMissOnly": "적중 미보고 / {miss} 실패",

@@ -227,7 +227,7 @@
     "CmdCacheHeader": "Telemetría del caché — últimos {count} de {total} turno(s) (modelo: {model})\n",
     "CmdCacheNoData": "Historial del caché: ningún turno registrado todavía.\n\nDeepSeek expone `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` en cada turno de la API donde el modelo lo soporta (familia V4). Ejecuta un turno y prueba /cache de nuevo.",
     "CmdCacheTotals": "Σ entrada: {sum_in}   Σ hit: {sum_hit}   Σ miss: {sum_miss}   tasa promedio de hit: {avg}\n",
-    "CmdCostReport": "Costo de la sesión:\n─────────────────────────────\nTotal aproximado: {cost}\n\nLas estimaciones de costo son aproximadas y usan la telemetría de uso del proveedor cuando está disponible.\n\n Precios de la API DeepSeek:\n─────────────────────────────\nLos detalles de precio no están configurados en esta CLI.",
+    "CmdCostReport": "Costo de la sesión:\n─────────────────────────────\nTotal aproximado: {cost}\n\nLas estimaciones de costo son aproximadas y usan la telemetría de uso del proveedor cuando está disponible.\n\n Precios de la API del proveedor:\n─────────────────────────────\nLos detalles de precio no están configurados en esta CLI.",
     "CmdTokensCacheBoth": "{hit} hit / {miss} miss",
     "CmdTokensCacheHitOnly": "{hit} hit / miss no reportado",
     "CmdTokensCacheMissOnly": "hit no reportado / {miss} miss",
