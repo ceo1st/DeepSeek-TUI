@@ -189,6 +189,11 @@ pub fn is_help_shortcut(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('?')) && key_shortcuts::alt_nav_modifiers(key.modifiers)
 }
 
+#[must_use]
+pub fn is_settings_shortcut(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(2)) && key.modifiers.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +285,22 @@ mod tests {
         )));
         let inverted_question = KeyEvent::new(KeyCode::Char('\u{00bf}'), KeyModifiers::NONE);
         assert!(!is_help_shortcut(&inverted_question));
+    }
+
+    #[test]
+    fn settings_accepts_only_plain_f2() {
+        assert!(is_settings_shortcut(&KeyEvent::new(
+            KeyCode::F(2),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_settings_shortcut(&KeyEvent::new(
+            KeyCode::F(2),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_settings_shortcut(&KeyEvent::new(
+            KeyCode::F(1),
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]

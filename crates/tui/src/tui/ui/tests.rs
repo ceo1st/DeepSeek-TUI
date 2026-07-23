@@ -62,6 +62,25 @@ fn permission_cycle_shortcut_accepts_both_shift_tab_encodings() {
 }
 
 #[test]
+fn settings_toggle_opens_and_closes_without_stacking_duplicates() {
+    let _lock = crate::test_support::lock_test_env();
+    let mut app = create_test_app();
+
+    toggle_settings_view(&mut app);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Config));
+
+    app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Help));
+    toggle_settings_view(&mut app);
+    assert!(app.view_stack.is_empty());
+
+    toggle_settings_view(&mut app);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Config));
+    toggle_settings_view(&mut app);
+    assert!(app.view_stack.is_empty());
+}
+
+#[test]
 fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
     let mut app = create_test_app();
     app.api_provider = crate::config::ApiProvider::Deepseek;

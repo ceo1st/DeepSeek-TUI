@@ -56,7 +56,7 @@ static SIDEBAR_INFO: CommandInfo = CommandInfo {
 static SETTINGS_INFO: CommandInfo = CommandInfo {
     name: "settings",
     aliases: &[],
-    usage: "/settings",
+    usage: "/settings [text]",
     description_id: MessageId::CmdSettingsDescription,
 };
 static STATUS_INFO: CommandInfo = CommandInfo {
@@ -163,7 +163,7 @@ pub(in crate::commands) fn dispatch(
             _ => CommandResult::error("Usage: /auth xai-device"),
         },
         "sidebar" => config::sidebar(app, arg),
-        "settings" => config::show_settings(app),
+        "settings" => config::settings_command(app, arg),
         "status" => status::status(app),
         "statusline" => config::status_line(app),
         "mode" => config::mode(app, arg),

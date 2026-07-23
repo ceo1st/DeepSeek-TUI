@@ -205,6 +205,11 @@ pub const KEYBINDINGS: &[KeybindingEntry] = &[
         section: KeybindingSection::Submission,
     },
     KeybindingEntry {
+        chord: "F2",
+        description_id: crate::localization::MessageId::KbSettings,
+        section: KeybindingSection::Submission,
+    },
+    KeybindingEntry {
         chord: "Ctrl+X (Activity sidebar)",
         description_id: crate::localization::MessageId::KbCancelBackgroundShellJobs,
         section: KeybindingSection::Submission,

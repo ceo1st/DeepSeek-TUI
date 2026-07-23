@@ -388,7 +388,17 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
     }
 }
 
-/// Show persistent settings
+/// Open the typed settings editor. `text` preserves the legacy diagnostic
+/// output for scripts and terminals that cannot render the modal.
+pub fn settings_command(app: &mut App, arg: Option<&str>) -> CommandResult {
+    match arg.map(str::trim).filter(|value| !value.is_empty()) {
+        None => CommandResult::action(AppAction::OpenConfigView),
+        Some("text" | "show" | "diagnostic" | "diagnostics") => show_settings(app),
+        Some(_) => CommandResult::error("Usage: /settings [text]"),
+    }
+}
+
+/// Show persistent settings as plain text (legacy compatibility path).
 pub fn show_settings(app: &mut App) -> CommandResult {
     match Settings::load() {
         Ok(settings) => CommandResult::message(settings.display(app.ui_locale)),
@@ -2942,6 +2952,23 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         let result = show_settings(&mut app);
         // Settings should load (may use defaults if file doesn't exist)
         assert!(result.message.is_some());
+    }
+
+    #[test]
+    fn settings_command_opens_typed_editor_and_preserves_text_mode() {
+        let _lock = lock_test_env();
+        let mut app = create_test_app();
+
+        let modal = settings_command(&mut app, None);
+        assert!(modal.message.is_none());
+        assert!(matches!(modal.action, Some(AppAction::OpenConfigView)));
+
+        let text = settings_command(&mut app, Some("text"));
+        let message = text.message.as_deref().expect("settings diagnostic text");
+        assert!(message.contains("Settings:"), "{message}");
+        assert!(message.contains("provider_models:"), "{message}");
+        assert!(message.contains("Config file:"), "{message}");
+        assert!(text.action.is_none());
     }
 
     #[test]

@@ -2240,6 +2240,15 @@ fn should_fetch_deepseek_balance(app: &App) -> bool {
         )
 }
 
+fn toggle_settings_view(app: &mut App) {
+    if app.view_stack.contains_kind(ModalKind::Config) {
+        app.view_stack.pop_through_kind(ModalKind::Config);
+    } else {
+        app.view_stack.push(ConfigView::new_for_app(app));
+    }
+    app.needs_redraw = true;
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_event_loop(
     terminal: &mut AppTerminal,
@@ -4916,6 +4925,14 @@ async fn run_event_loop(
                     let help = HelpView::new_for_shortcuts(app.ui_locale, &app.workspace);
                     app.view_stack.push(help);
                 }
+                continue;
+            }
+
+            // F2 is the shell-global typed settings route. Keep it available
+            // from onboarding and modal surfaces just like Help; pressing it
+            // again closes the editor without applying an in-progress value.
+            if crate::tui::shell_key_routing::is_settings_shortcut(&key) {
+                toggle_settings_view(app);
                 continue;
             }
 

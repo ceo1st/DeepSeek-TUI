@@ -46,3 +46,18 @@ let layout = SettingsPickerLayout::resolve(area, 34, controller.selected_option(
 
 Matrix coverage lives in `settings_picker` unit tests: normal, narrow, disabled,
 filtered, previewed, and reverted.
+
+## Typed Settings editor
+
+The complete application Settings editor is `ConfigView` in
+`crates/tui/src/tui/views/mod.rs`. It is reachable through `F2`, bare
+`/settings`, bare `/config`, and command discovery. `/settings text` preserves
+the legacy plain-text diagnostic for headless and compatibility use.
+
+Its `SettingsRegistry` classifies every row as Boolean, choice, integer, text,
+action, or read-only while retaining the row's category and session/saved
+scope. Boolean rows toggle with Space or Enter; bounded choices use the chooser;
+provider/model actions open their full pickers; integer/text rows use the inline
+editor. Typing filters the full list, and mouse selection/activation mirrors the
+keyboard paths. Setting labels come from the locale packs; raw config keys stay
+visible in edit/detail surfaces for diagnostics and compatibility.

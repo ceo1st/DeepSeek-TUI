@@ -990,6 +990,21 @@ impl ViewStack {
         self.views.last().map(|view| view.kind())
     }
 
+    pub fn contains_kind(&self, kind: ModalKind) -> bool {
+        self.views.iter().any(|view| view.kind() == kind)
+    }
+
+    /// Close the named view and any child modal opened above it. This keeps a
+    /// shell-global toggle from stacking a duplicate parent behind its picker.
+    pub fn pop_through_kind(&mut self, kind: ModalKind) -> bool {
+        while let Some(view) = self.pop() {
+            if view.kind() == kind {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn top_occupied_region(&self, area: Rect) -> Option<Rect> {
         self.views.last().map(|view| view.occupied_region(area))
     }
@@ -1133,6 +1148,59 @@ struct ConfigRow {
     value: String,
     editable: bool,
     scope: ConfigScope,
+}
+
+/// Editor behavior for one Settings entry. This is intentionally independent
+/// from where the value is stored: category/scope describe ownership, while
+/// kind determines the interaction and validation surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingKind {
+    Boolean,
+    Choice,
+    Integer,
+    Text,
+    Action,
+    ReadOnly,
+}
+
+#[derive(Debug, Clone)]
+struct SettingMeta {
+    kind: SettingKind,
+    category: ConfigSection,
+    choices: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SettingsRegistry {
+    provider: ApiProvider,
+}
+
+impl SettingsRegistry {
+    fn new(provider: ApiProvider) -> Self {
+        Self { provider }
+    }
+
+    fn meta(self, row: &ConfigRow) -> SettingMeta {
+        let choices = config_choice_values(&row.key, self.provider);
+        let kind = if !row.editable {
+            SettingKind::ReadOnly
+        } else if matches!(row.key.as_str(), "provider" | "model") {
+            SettingKind::Action
+        } else if config_boolean_key(&row.key) {
+            SettingKind::Boolean
+        } else if choices.is_some() {
+            SettingKind::Choice
+        } else if config_integer_key(&row.key) {
+            SettingKind::Integer
+        } else {
+            SettingKind::Text
+        };
+        SettingMeta {
+            kind,
+            category: row.section,
+            choices,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1787,9 +1855,10 @@ impl ConfigView {
             return true;
         }
 
-        let section = row.section.label(self.locale).to_lowercase();
-        let section_en = row.section.label(Locale::En).to_lowercase();
-        let label = config_label_for_key(&row.key).to_lowercase();
+        let meta = SettingsRegistry::new(self.api_provider).meta(row);
+        let section = meta.category.label(self.locale).to_lowercase();
+        let section_en = meta.category.label(Locale::En).to_lowercase();
+        let label = config_label_for_key_for_locale(self.locale, &row.key).to_lowercase();
         let key = row.key.to_lowercase();
         let raw_value = row.value.to_lowercase();
         let value = self.row_display_value(row).to_lowercase();
@@ -1840,7 +1909,10 @@ impl ConfigView {
     fn key_column_width(&self) -> usize {
         self.rows
             .iter()
-            .map(|row| config_label_for_key(&row.key).chars().count())
+            .map(|row| {
+                let label = config_label_for_key_for_locale(self.locale, &row.key);
+                UnicodeWidthStr::width(label.as_str())
+            })
             .max()
             .unwrap_or(CONFIG_MIN_KEY_COLUMN_WIDTH)
             .max(CONFIG_MIN_KEY_COLUMN_WIDTH)
@@ -1952,7 +2024,7 @@ impl ConfigView {
 
     fn toggle_selected_boolean(&self) -> Option<ViewAction> {
         let row = self.rows.get(self.selected_row_index()?)?;
-        if !row.editable || !config_boolean_key(&row.key) {
+        if SettingsRegistry::new(self.api_provider).meta(row).kind != SettingKind::Boolean {
             return None;
         }
         let value = if canonical_config_choice(&row.key, &row.value) == "true" {
@@ -2209,7 +2281,8 @@ impl ConfigView {
             _ => original_value.clone(),
         };
 
-        let choices = config_choice_values(&key, self.api_provider);
+        let meta = SettingsRegistry::new(self.api_provider).meta(row);
+        let choices = meta.choices;
         let selected_choice = choices
             .as_ref()
             .and_then(|choices| {
@@ -2281,7 +2354,11 @@ impl ConfigView {
             return row.value.clone();
         }
 
-        if config_choice_values(&row.key, self.api_provider).is_some() {
+        if SettingsRegistry::new(self.api_provider)
+            .meta(row)
+            .choices
+            .is_some()
+        {
             if config_default_placeholder_message(&row.key).is_some_and(|message_id| {
                 row.value == tr(self.locale, message_id) || row.value == tr(Locale::En, message_id)
             }) {
@@ -2297,19 +2374,23 @@ impl ConfigView {
     fn selected_row_hint(&self) -> Option<String> {
         let row_idx = self.selected_row_index()?;
         let row = self.rows.get(row_idx)?;
-        let label = config_label_for_key(&row.key);
+        let meta = SettingsRegistry::new(self.api_provider).meta(row);
+        let label = config_label_for_key_for_locale(self.locale, &row.key);
         let hint = config_hint_for_key(&row.key);
-        let action = if row.key == "provider" {
-            "Enter opens provider picker"
-        } else if config_boolean_key(&row.key) {
-            "Enter/Space toggles"
-        } else if config_choice_values(&row.key, self.api_provider).is_some() {
-            "Enter opens choices"
-        } else if row.editable {
-            "Enter edits"
+        let action_id = if row.key == "provider" {
+            MessageId::ConfigActionOpenProvider
+        } else if row.key == "model" {
+            MessageId::ConfigActionOpenModel
+        } else if meta.kind == SettingKind::Boolean {
+            MessageId::ConfigActionToggle
+        } else if meta.kind == SettingKind::Choice {
+            MessageId::ConfigActionChoose
+        } else if matches!(meta.kind, SettingKind::Integer | SettingKind::Text) {
+            MessageId::ConfigActionEdit
         } else {
-            "read only"
+            MessageId::ConfigActionReadOnly
         };
+        let action = self.tr(action_id);
         if !hint.is_empty() {
             return Some(format!("{label}: {hint} · {action}"));
         }
@@ -2425,71 +2506,80 @@ fn experimental_feature_value(effective: bool, default_enabled: bool, configured
     }
 }
 
+fn config_label_message(key: &str) -> Option<MessageId> {
+    Some(match key {
+        "provider" => MessageId::ConfigLabelProvider,
+        "base_url" => MessageId::ConfigLabelBaseUrlDeepseek,
+        "provider_url" => MessageId::ConfigLabelProviderUrl,
+        "model" => MessageId::ConfigLabelModel,
+        "fast_model" => MessageId::ConfigLabelFastModel,
+        "default_model" => MessageId::ConfigLabelDefaultModel,
+        "reasoning_effort" => MessageId::ConfigLabelReasoningEffort,
+        "approval_mode" => MessageId::ConfigLabelApprovalMode,
+        "permission_posture" => MessageId::ConfigLabelPermissionPosture,
+        "approval_policy" => MessageId::ConfigLabelApprovalPolicy,
+        "managed_approval_policy" => MessageId::ConfigLabelManagedApprovalPolicy,
+        "default_mode" => MessageId::ConfigLabelDefaultMode,
+        "allow_shell" => MessageId::ConfigLabelAllowShell,
+        "managed_allow_shell" => MessageId::ConfigLabelManagedAllowShell,
+        "stream_chunk_timeout_secs" => MessageId::ConfigLabelStreamTimeout,
+        "theme" => MessageId::ConfigLabelTheme,
+        "locale" => MessageId::ConfigLabelLocale,
+        "background_color" => MessageId::ConfigLabelBackground,
+        "ocean_treatment" => MessageId::ConfigLabelOceanTreatment,
+        "work_surface_placement" => MessageId::ConfigLabelWorkSurfacePlacement,
+        "work_surface_top_height" => MessageId::ConfigLabelTopHeight,
+        "work_surface_side_width" => MessageId::ConfigLabelSideWidth,
+        "calm_mode" => MessageId::ConfigLabelCalmMode,
+        "low_motion" => MessageId::ConfigLabelLowMotion,
+        "fancy_animations" => MessageId::ConfigLabelFancyAnimations,
+        "launch_screen" => MessageId::ConfigLabelLaunchScreen,
+        "show_thinking" => MessageId::ConfigLabelShowThinking,
+        "show_tool_details" => MessageId::ConfigLabelShowToolDetails,
+        "inline_diffs" => MessageId::ConfigLabelInlineDiffs,
+        "status_indicator" => MessageId::ConfigLabelStatusIndicator,
+        "synchronized_output" => MessageId::ConfigLabelSynchronizedOutput,
+        "cost_currency" => MessageId::ConfigLabelCostCurrency,
+        "transcript_spacing" => MessageId::ConfigLabelTranscriptSpacing,
+        "tool_collapse" => MessageId::ConfigLabelToolCollapse,
+        "composer_density" => MessageId::ConfigLabelComposerDensity,
+        "composer_border" => MessageId::ConfigLabelComposerBorder,
+        "composer_vim_mode" => MessageId::ConfigLabelComposerVimMode,
+        "bracketed_paste" => MessageId::ConfigLabelBracketedPaste,
+        "paste_burst_detection" => MessageId::ConfigLabelPasteBurstDetection,
+        "mention_menu_limit" => MessageId::ConfigLabelMentionMenuLimit,
+        "mention_menu_behavior" => MessageId::ConfigLabelMentionMenuBehavior,
+        "mention_walk_depth" => MessageId::ConfigLabelMentionWalkDepth,
+        "workspace_follow_symlinks" => MessageId::ConfigLabelWorkspaceFollowSymlinks,
+        "sidebar_width" => MessageId::ConfigLabelSidebarWidth,
+        "sidebar_focus" => MessageId::ConfigLabelSidebarFocus,
+        "context_panel" => MessageId::ConfigLabelContextPanel,
+        "auto_compact" => MessageId::ConfigLabelAutoCompact,
+        "auto_compact_threshold_percent" => MessageId::ConfigLabelAutoCompactThreshold,
+        "max_history" => MessageId::ConfigLabelMaxHistory,
+        "prefer_external_pdftotext" => MessageId::ConfigLabelPreferExternalPdftotext,
+        "mcp_config_path" => MessageId::ConfigLabelMcpConfigPath,
+        "fleet.exec.max_spawn_depth" => MessageId::ConfigLabelFleetSpawnDepth,
+        "goal_command" => MessageId::ConfigLabelGoalCommand,
+        "workflow" => MessageId::ConfigLabelWorkflow,
+        _ => return None,
+    })
+}
+
+fn config_label_for_key_for_locale(locale: Locale, key: &str) -> String {
+    if let Some(message) = config_label_message(key) {
+        return tr(locale, message).to_string();
+    }
+    let humanized = humanize_config_key(key.strip_prefix("features.").unwrap_or(key));
+    if key.starts_with("features.") {
+        tr(locale, MessageId::ConfigLabelFeaturePrefix).replace("{name}", &humanized)
+    } else {
+        humanized
+    }
+}
+
 fn config_label_for_key(key: &str) -> String {
-    let static_label = match key {
-        "provider" => "Active provider",
-        "base_url" => "Provider API URL (DeepSeek route)",
-        "provider_url" => "Provider API URL",
-        "model" => "Active provider model",
-        "fast_model" => "Fast model (derived)",
-        "default_model" => "Legacy fallback model (DeepSeek routes only)",
-        "reasoning_effort" => "Reasoning level",
-        "approval_mode" => "This session's permission",
-        "permission_posture" => "New sessions' permission",
-        "approval_policy" => "New sessions' permission (config)",
-        "managed_approval_policy" => "New sessions' permission (managed)",
-        "default_mode" => "Startup mode",
-        "allow_shell" => "Shell access",
-        "managed_allow_shell" => "Shell access (managed)",
-        "stream_chunk_timeout_secs" => "Stream timeout",
-        "theme" => "Theme",
-        "locale" => "Language",
-        "background_color" => "Background",
-        "ocean_treatment" => "Ocean treatment",
-        "work_surface_placement" => "Sidebar position",
-        "work_surface_top_height" => "Top bar height",
-        "work_surface_side_width" => "Side bar width",
-        "calm_mode" => "Quiet transcript",
-        "low_motion" => "Reduce motion",
-        "fancy_animations" => "Live UI motion",
-        "launch_screen" => "Launch screen",
-        "show_thinking" => "Model reasoning in chat",
-        "show_tool_details" => "Tool detail level",
-        "inline_diffs" => "Inline file changes",
-        "status_indicator" => "Status indicator",
-        "synchronized_output" => "Output pacing",
-        "cost_currency" => "Cost currency",
-        "transcript_spacing" => "Transcript spacing",
-        "tool_collapse" => "Tool cards",
-        "composer_density" => "Composer density",
-        "composer_border" => "Composer border",
-        "composer_vim_mode" => "Composer Vim mode",
-        "bracketed_paste" => "Bracketed paste",
-        "paste_burst_detection" => "Paste detection",
-        "mention_menu_limit" => "Mention menu limit",
-        "mention_menu_behavior" => "Mention menu behavior",
-        "mention_walk_depth" => "File mention depth",
-        "workspace_follow_symlinks" => "Follow symlinks",
-        "sidebar_width" => "Sidebar width",
-        "sidebar_focus" => "Sidebar focus",
-        "context_panel" => "Context panel",
-        "auto_compact" => "Auto compact",
-        "auto_compact_threshold_percent" => "Compact threshold",
-        "max_history" => "Input history",
-        "prefer_external_pdftotext" => "PDF text extractor",
-        "mcp_config_path" => "MCP config path",
-        "fleet.exec.max_spawn_depth" => "Fleet recursion depth",
-        "goal_command" => "Goal command",
-        "workflow" => "Workflow",
-        _ => {
-            if let Some(feature) = key.strip_prefix("features.") {
-                return format!("Feature: {}", humanize_config_key(feature));
-            } else {
-                return humanize_config_key(key);
-            }
-        }
-    };
-    static_label.to_string()
+    config_label_for_key_for_locale(Locale::En, key)
 }
 
 fn humanize_config_key(key: &str) -> String {
@@ -2623,6 +2713,21 @@ fn config_boolean_key(key: &str) -> bool {
             | "context_panel"
             | "auto_compact"
             | "prefer_external_pdftotext"
+    )
+}
+
+fn config_integer_key(key: &str) -> bool {
+    matches!(
+        key,
+        "stream_chunk_timeout_secs"
+            | "work_surface_top_height"
+            | "work_surface_side_width"
+            | "mention_menu_limit"
+            | "mention_walk_depth"
+            | "sidebar_width"
+            | "auto_compact_threshold_percent"
+            | "max_history"
+            | "fleet.exec.max_spawn_depth"
     )
 }
 
@@ -3043,7 +3148,7 @@ impl ModalView for ConfigView {
             // terminals (#40x12).
             let spacious = usize::from(inner.height).saturating_sub(reserved_footer_lines) >= 8;
             let mut lines: Vec<Line> = Vec::new();
-            let edit_label = config_label_for_key(&edit.key);
+            let edit_label = config_label_for_key_for_locale(self.locale, &edit.key);
             let edit_title = if edit_label == edit.key {
                 format!("{}{}", self.tr(MessageId::ConfigEditTitlePrefix), edit.key)
             } else {
@@ -3250,13 +3355,19 @@ impl ModalView for ConfigView {
                     search_line,
                     Line::from(""),
                     Line::from(format!(
-                        "  {:<key_width$} {:<value_width$} {:<scope_width$}",
-                        "Setting",
-                        "Value",
-                        "Scope",
-                        key_width = key_column_width,
-                        value_width = value_column_width,
-                        scope_width = scope_column_width
+                        "  {} {} {}",
+                        fit_config_column(
+                            &self.tr(MessageId::ConfigColumnSetting),
+                            key_column_width
+                        ),
+                        fit_config_column(
+                            &self.tr(MessageId::ConfigColumnValue),
+                            value_column_width
+                        ),
+                        fit_config_column(
+                            &self.tr(MessageId::ConfigColumnScope),
+                            scope_column_width
+                        )
                     )),
                     Line::from(format!(
                         "  {}",
@@ -3294,15 +3405,13 @@ impl ModalView for ConfigView {
                         } else {
                             Style::default().fg(palette::TEXT_PRIMARY)
                         };
-                        let label = config_label_for_key(&row.key);
-                        let key = truncate_view_text(&label, key_column_width);
+                        let label = config_label_for_key_for_locale(self.locale, &row.key);
+                        let key = fit_config_column(&label, key_column_width);
                         let value =
-                            truncate_view_text(&self.row_display_value(row), value_column_width);
+                            fit_config_column(&self.row_display_value(row), value_column_width);
                         let scope =
-                            truncate_view_text(&row.scope.label(self.locale), scope_column_width);
-                        let mut line = Line::from(format!(
-                            "  {key:<key_column_width$} {value:<value_column_width$} {scope:<scope_column_width$}"
-                        ));
+                            fit_config_column(&row.scope.label(self.locale), scope_column_width);
+                        let mut line = Line::from(format!("  {key} {value} {scope}"));
                         line.style = style;
                         lines.push(line);
                     }
@@ -3938,14 +4047,22 @@ fn truncate_view_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn fit_config_column(text: &str, width: usize) -> String {
+    let mut fitted = crate::tui::ui_text::truncate_line_to_width(text, width);
+    let padding = width.saturating_sub(crate::tui::ui_text::text_display_width(&fitted));
+    fitted.push_str(&" ".repeat(padding));
+    fitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ActionHint, ConfigListItem, ConfigScope, ConfigView, EmptyState, HelpView,
-        ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, ViewStack,
-        action_footer_lines, canonical_config_choice, centered_modal_area, config_choice_values,
-        config_label_for_key, render_modal_footer_with_gutter, render_underwater_surface,
-        subagent_view_agents, truncate_view_text,
+        ListDetailLayout, ModalKind, ModalView, SettingKind, SettingsRegistry, ViewAction,
+        ViewEvent, ViewStack, action_footer_lines, canonical_config_choice, centered_modal_area,
+        config_choice_values, config_label_for_key, config_label_for_key_for_locale,
+        render_modal_footer_with_gutter, render_underwater_surface, subagent_view_agents,
+        truncate_view_text,
     };
     use crate::config::Config;
     use crate::localization::{Locale, MessageId, tr};
@@ -5285,17 +5402,17 @@ base_url = "https://api.xiaomimimo.com/v1"
 
         let dump = buffer_text(&buf, area);
         assert!(
-            dump.contains("Paste detection"),
-            "friendly config labels should stay readable:\n{dump}"
+            dump.contains("粘 贴 检 测"),
+            "localized config labels should stay readable:\n{dump}"
         );
-        let scope_columns = dump
-            .lines()
-            .filter(|line| {
-                line.contains("Composer")
-                    || line.contains("Bracketed paste")
-                    || line.contains("Paste detection")
+        let scope_columns = (area.y..area.y.saturating_add(area.height))
+            .filter(|y| {
+                let line = buffer_row_text(&buf, area, *y);
+                line.contains("comfortable") || line.contains("normal") || line.contains("fuzzy")
             })
-            .filter_map(|line| line.find('已'))
+            .filter_map(|y| {
+                (area.x..area.x.saturating_add(area.width)).find(|x| buf[(*x, y)].symbol() == "已")
+            })
             .collect::<Vec<_>>();
         assert!(
             scope_columns.len() >= 3,
@@ -5305,7 +5422,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             scope_columns
                 .iter()
                 .all(|column| *column == scope_columns[0]),
-            "scope column should stay aligned even for long keys:\n{dump}"
+            "scope column should stay aligned even for long keys ({scope_columns:?}):\n{dump}"
         );
     }
 
@@ -5473,6 +5590,74 @@ base_url = "https://api.xiaomimimo.com/v1"
             }
             other => panic!("expected startup choice update, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_registry_types_every_config_row() {
+        let app = create_test_app();
+        let view = ConfigView::new_for_app(&app);
+        let registry = SettingsRegistry::new(app.api_provider);
+
+        let kind_for = |key: &str| {
+            let row = view
+                .rows
+                .iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("missing config row {key}"));
+            registry.meta(row).kind
+        };
+
+        assert_eq!(kind_for("provider"), SettingKind::Action);
+        assert_eq!(kind_for("model"), SettingKind::Action);
+        assert_eq!(kind_for("low_motion"), SettingKind::Boolean);
+        assert_eq!(kind_for("default_mode"), SettingKind::Choice);
+        assert_eq!(kind_for("mention_menu_limit"), SettingKind::Integer);
+        assert_eq!(kind_for("mcp_config_path"), SettingKind::Text);
+        assert_eq!(kind_for("fast_model"), SettingKind::ReadOnly);
+
+        for row in &view.rows {
+            let meta = registry.meta(row);
+            assert_eq!(meta.category, row.section);
+            assert_eq!(
+                meta.kind == SettingKind::Choice || meta.kind == SettingKind::Boolean,
+                meta.choices.is_some(),
+                "choice metadata drifted for {}",
+                row.key
+            );
+        }
+    }
+
+    #[test]
+    fn config_labels_are_consumed_from_complete_locale_packs() {
+        for locale in Locale::shipped_complete() {
+            assert_eq!(
+                config_label_for_key_for_locale(*locale, "provider"),
+                tr(*locale, MessageId::ConfigLabelProvider)
+            );
+            assert_eq!(
+                config_label_for_key_for_locale(*locale, "features.mcp"),
+                tr(*locale, MessageId::ConfigLabelFeaturePrefix).replace("{name}", "Mcp")
+            );
+        }
+        assert_ne!(
+            config_label_for_key_for_locale(Locale::Ja, "provider"),
+            config_label_for_key_for_locale(Locale::En, "provider")
+        );
+    }
+
+    #[test]
+    fn model_row_hint_names_the_model_picker() {
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        view.selected = view
+            .rows
+            .iter()
+            .position(|row| row.key == "model")
+            .expect("model row");
+
+        let hint = view.selected_row_hint().expect("model row hint");
+        assert!(hint.contains("Enter opens model picker"), "{hint}");
+        assert!(!hint.contains("Enter opens provider picker"), "{hint}");
     }
 
     #[test]

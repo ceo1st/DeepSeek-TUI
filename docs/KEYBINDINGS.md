@@ -9,6 +9,7 @@ Global key chords are not yet user-configurable — tracked for a future release
 | Chord                | Action                                                        |
 |----------------------|---------------------------------------------------------------|
 | `F1` or `Ctrl-/`     | Toggle the help overlay                                       |
+| `F2`                 | Toggle the typed Settings editor                              |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
 | `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
 | `Ctrl-B`             | Move a supported foreground shell wait into `/jobs` so the turn can continue; use `/jobs` or `Bash` with `action: "wait"` to inspect it |
