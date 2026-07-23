@@ -1277,6 +1277,13 @@ impl ConfigTab {
         }
     }
 
+    fn for_section(section: ConfigSection) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|tab| tab.contains(section))
+            .unwrap_or(Self::General)
+    }
+
     fn next(self) -> Self {
         match self {
             ConfigTab::General => ConfigTab::Models,
@@ -1912,6 +1919,7 @@ impl ConfigView {
     /// a setting to the live app.
     pub(crate) fn focus_key(&mut self, key: &str) {
         if let Some(index) = self.rows.iter().position(|row| row.key == key) {
+            self.active_tab = ConfigTab::for_section(self.rows[index].section);
             self.selected = index;
             self.adjust_scroll(self.visible_rows_cached());
         }
@@ -1963,10 +1971,15 @@ impl ConfigView {
     }
 
     fn matching_row_indices(&self) -> Vec<usize> {
+        let filtering = !self.filter.is_empty();
         self.rows
             .iter()
             .enumerate()
-            .filter_map(|(idx, row)| self.row_matches_filter(row).then_some(idx))
+            .filter_map(|(idx, row)| {
+                (self.row_matches_filter(row)
+                    && (filtering || self.active_tab.contains(row.section)))
+                .then_some(idx)
+            })
             .collect()
     }
 
@@ -3430,37 +3443,53 @@ impl ModalView for ConfigView {
             // rows do: compact keeps one search/count line — the surface
             // hairline already owns the title — and cedes the rest to the
             // rows the room exists to edit.
-            const FULL_HEADER_LINES: usize = 5;
+            const FULL_HEADER_LINES: usize = 4;
             const FULL_BOTTOM_LINES: usize = 1;
             let full_rows =
                 content_height.saturating_sub(FULL_HEADER_LINES + FULL_BOTTOM_LINES + footer_lines);
             let compact = full_rows < 4;
-            let header_lines = if compact { 1 } else { FULL_HEADER_LINES };
+            let header_lines = if compact { 2 } else { FULL_HEADER_LINES };
             let bottom_lines = if compact {
                 usize::from(self.status.is_some())
             } else {
                 FULL_BOTTOM_LINES
             };
-            let visible_rows = content_height
-                .saturating_sub(header_lines + bottom_lines + footer_lines)
+            let description_lines = if compact { 0 } else { 4 };
+            let list_line_budget = content_height
+                .saturating_sub(header_lines + bottom_lines + description_lines + footer_lines)
                 .max(1);
-            self.last_visible_rows.set(visible_rows);
+            self.last_visible_rows.set(list_line_budget);
 
             // The stored scroll can predate this frame's geometry (a resize
             // shrinks the window before any key recomputes it), so anchor the
             // visible window to the selection here: the row being manipulated
             // is always rendered.
-            let max_scroll = items.len().saturating_sub(visible_rows);
-            let mut start = self.scroll.min(max_scroll);
-            if let Some(pos) = self.selected_display_position(&items) {
-                if pos < start {
-                    start = pos;
-                } else if pos >= start + visible_rows {
-                    start = pos + 1 - visible_rows;
+            let item_line_cost = |item: &ConfigListItem| match item {
+                ConfigListItem::Section(_) => 2usize,
+                ConfigListItem::Row(_) => 1usize,
+            };
+            let visible_end = |start: usize| {
+                let mut used = 0usize;
+                let mut end = start;
+                while end < items.len() {
+                    let cost = item_line_cost(&items[end]);
+                    if end > start && used.saturating_add(cost) > list_line_budget {
+                        break;
+                    }
+                    used = used.saturating_add(cost);
+                    end += 1;
+                }
+                end
+            };
+            let mut start = self.scroll.min(items.len().saturating_sub(1));
+            if let Some(selected_pos) = self.selected_display_position(&items) {
+                start = start.min(selected_pos);
+                while selected_pos >= visible_end(start) && start < selected_pos {
+                    start += 1;
                 }
             }
-            let end = (start + visible_rows).min(items.len());
-            let scrollable = items.len() > visible_rows;
+            let end = visible_end(start);
+            let scrollable = start > 0 || end < items.len();
             let search_value = if self.filter.is_empty() {
                 self.tr(MessageId::ConfigSearchPlaceholder).to_string()
             } else {
@@ -3519,7 +3548,7 @@ impl ModalView for ConfigView {
             };
             let mut row_hitboxes = Vec::new();
 
-            for item in items.iter().skip(start).take(visible_rows) {
+            for item in &items[start..end] {
                 match item {
                     ConfigListItem::Section(section) => {
                         lines.push(Line::from(""));
@@ -3579,7 +3608,7 @@ impl ModalView for ConfigView {
             }
 
             // Description pane for the selected setting.
-            if let Some(row) = self.rows.get(self.selected) {
+            if !compact && let Some(row) = self.rows.get(self.selected) {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "────────────────────────────────────────",
@@ -4235,7 +4264,7 @@ fn fit_config_column(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionHint, ConfigListItem, ConfigScope, ConfigView, EmptyState, HelpView,
+        ActionHint, ConfigListItem, ConfigScope, ConfigTab, ConfigView, EmptyState, HelpView,
         ListDetailLayout, ModalKind, ModalView, SettingKind, SettingsRegistry, ViewAction,
         ViewEvent, ViewStack, action_footer_lines, canonical_config_choice, centered_modal_area,
         config_choice_values, config_label_for_key, config_label_for_key_for_locale,
@@ -4741,20 +4770,7 @@ mod tests {
         let view = create_config_view(Locale::En);
         assert_eq!(
             visible_section_labels(&view),
-            vec![
-                "Provider",
-                "Model",
-                "Permissions",
-                "Network",
-                "Display",
-                "Composer",
-                "Sidebar",
-                "History",
-                "MCP",
-                "Fleet",
-                "Experimental",
-                "Fleet",
-            ]
+            vec!["Provider", "Network", "Composer", "Sidebar", "History"]
         );
     }
 
@@ -4925,11 +4941,7 @@ consent_version = 1
                 .iter()
                 .all(|row| row.key != "permission_posture")
         );
-        explicit.selected = explicit
-            .rows
-            .iter()
-            .position(|row| row.key == "approval_policy")
-            .expect("approval row index");
+        explicit.focus_key("approval_policy");
         explicit.start_edit();
         let use_tui_default = explicit
             .editing
@@ -5040,11 +5052,7 @@ api_key_env = "ACME_API_KEY"
     fn config_view_active_model_uses_picker_and_fallback_is_diagnostic_only() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
-        view.selected = view
-            .rows
-            .iter()
-            .position(|row| row.key == "model")
-            .expect("active model row");
+        view.focus_key("model");
 
         match view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
             ViewAction::Emit(ViewEvent::CommandPaletteSelected {
@@ -5397,11 +5405,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             ("reasoning_effort", MessageId::ConfigDefaultReasoning),
             ("background_color", MessageId::ConfigDefaultValue),
         ] {
-            view.selected = view
-                .rows
-                .iter()
-                .position(|row| row.key == key)
-                .unwrap_or_else(|| panic!("{key} row missing"));
+            view.focus_key(key);
             view.start_edit();
 
             let edit = view.editing.as_ref().expect("editing should start");
@@ -5490,7 +5494,7 @@ base_url = "https://api.xiaomimimo.com/v1"
 
     #[test]
     fn config_view_renders_friendly_setting_labels() {
-        let view = create_config_view(Locale::En);
+        let mut view = create_config_view(Locale::En);
         let area = Rect::new(0, 0, 100, 40);
         let mut buf = Buffer::empty(area);
 
@@ -5501,11 +5505,17 @@ base_url = "https://api.xiaomimimo.com/v1"
             dump.contains("Active provider"),
             "missing provider label:\n{dump}"
         );
+        assert!(dump.contains("General"), "missing settings tabs:\n{dump}");
+
+        view.active_tab = ConfigTab::Permissions;
+        view.select_first_visible_row();
+        let mut permission_buf = Buffer::empty(area);
+        view.render(area, &mut permission_buf);
+        let permission_dump = buffer_text(&permission_buf, area);
         assert!(
-            dump.contains("Shell access"),
-            "missing shell label:\n{dump}"
+            permission_dump.contains("Shell access"),
+            "missing shell label:\n{permission_dump}"
         );
-        assert!(dump.contains("Setting"), "missing table heading:\n{dump}");
     }
 
     #[test]
@@ -5519,10 +5529,7 @@ base_url = "https://api.xiaomimimo.com/v1"
         view.render(area, &mut buf);
 
         let dump = buffer_text(&buf, area);
-        assert!(
-            dump.contains("Configuração") || dump.contains("Configura"),
-            "missing localized config title:\n{dump}"
-        );
+        assert!(dump.contains("Provedor"), "missing localized rows:\n{dump}");
         assert!(
             !dump.contains("MISSING"),
             "missing-key marker leaked:\n{dump}"
@@ -5537,6 +5544,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             .iter()
             .position(|row| row.key == "theme")
             .expect("theme row");
+        view.active_tab = ConfigTab::Display;
         view.adjust_scroll(8);
         let area = Rect::new(0, 0, 100, 24);
         let mut buf = Buffer::empty(area);
@@ -5589,11 +5597,13 @@ base_url = "https://api.xiaomimimo.com/v1"
                 line.contains("comfortable") || line.contains("normal") || line.contains("fuzzy")
             })
             .filter_map(|y| {
-                (area.x..area.x.saturating_add(area.width)).find(|x| buf[(*x, y)].symbol() == "已")
+                let line = buffer_row_text(&buf, area, y);
+                line.find("saved")
+                    .map(|byte| crate::tui::ui_text::text_display_width(&line[..byte]))
             })
             .collect::<Vec<_>>();
         assert!(
-            scope_columns.len() >= 3,
+            scope_columns.len() >= 2,
             "expected composer config rows with scopes:\n{dump}"
         );
         assert!(
@@ -5700,11 +5710,7 @@ base_url = "https://api.xiaomimimo.com/v1"
     fn config_view_boolean_rows_toggle_without_text_editing() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
-        view.selected = view
-            .rows
-            .iter()
-            .position(|row| row.key == "low_motion")
-            .expect("low_motion row");
+        view.focus_key("low_motion");
         let expected =
             if canonical_config_choice("low_motion", &view.rows[view.selected].value) == "true" {
                 "false"
@@ -5733,11 +5739,7 @@ base_url = "https://api.xiaomimimo.com/v1"
     fn config_view_enum_rows_use_a_bounded_choice_list() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
-        view.selected = view
-            .rows
-            .iter()
-            .position(|row| row.key == "default_mode")
-            .expect("default_mode row");
+        view.focus_key("default_mode");
 
         let start = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(start, ViewAction::None));
@@ -5855,11 +5857,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             "wheel should move the settings list"
         );
 
-        view.selected = view
-            .rows
-            .iter()
-            .position(|row| row.key == "default_mode")
-            .expect("default_mode row");
+        view.focus_key("default_mode");
         view.start_edit();
         view.editing
             .as_mut()
@@ -5884,6 +5882,8 @@ base_url = "https://api.xiaomimimo.com/v1"
     fn config_view_mouse_click_selects_row() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
+        view.active_tab = ConfigTab::Models;
+        view.select_first_visible_row();
         let area = Rect::new(0, 0, 100, 30);
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
@@ -6186,11 +6186,7 @@ base_url = "https://api.xiaomimimo.com/v1"
     #[test]
     fn config_view_compact_edit_surface_keeps_value_line_visible() {
         let mut view = create_config_view(Locale::En);
-        view.selected = view
-            .rows
-            .iter()
-            .position(|row| row.key == "approval_mode")
-            .expect("approval_mode row");
+        view.focus_key("approval_mode");
         view.start_edit();
         assert!(view.editing.is_some(), "approval_mode should be editable");
         let area = Rect::new(0, 0, 40, 12);
