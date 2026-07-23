@@ -339,6 +339,13 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   verifying the v0.9.1 input path already contains the needed global binding
   (PR #4477).
 
+### Security
+
+- Harden the public community-site boundary: scheduled review drafts now use
+  one canonical freshness namespace, admin discard is restricted to validated
+  draft objects, public feed requests cannot spend the server-held GitHub
+  token, and maintainer login bodies are type- and size-bounded before parsing.
+
 ## [0.9.0] - 2026-07-16
 
 Codewhale v0.9.0 replaces the default terminal shell with the underwater
